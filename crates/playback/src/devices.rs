@@ -107,6 +107,11 @@ pub fn audio_systems() -> Vec<AudioSystem> {
 }
 
 /// The chosen audio system, else the default one.
+///
+/// When the user has not chosen a system, prefer an ASIO host over the platform default: on
+/// Windows the default is WASAPI, which routes through the system mixer and ignores the buffer
+/// size, so a recording interface is effectively unusable for tracking. ASIO is the path that
+/// actually puts the interface's inputs and outputs under the DAW's control.
 pub(crate) fn host(cfg: &AudioConfig) -> cpal::Host {
     cfg.system
         .as_deref()
@@ -116,11 +121,22 @@ pub(crate) fn host(cfg: &AudioConfig) -> cpal::Host {
             if let Some(s) = &cfg.system {
                 log::warn!("audio system `{s}` is not available; using the default");
             }
+            if cfg.system.is_none()
+                && let Some(asio) = cpal::available_hosts().into_iter().find(|id| id.name().eq_ignore_ascii_case("ASIO"))
+                && let Ok(h) = cpal::host_from_id(asio)
+            {
+                log::info!("no audio system chosen; using ASIO (an ASIO driver is installed)");
+                return h;
+            }
             cpal::default_host()
         })
 }
 
 /// The named output (or input) device of `host`, else its default device.
+///
+/// ASIO has no concept of a default device, so cpal returns the first one it finds — which is
+/// whatever the registry lists first, often a third-party driver rather than the recording
+/// interface. When no device is named, prefer a Focusrite driver when one is installed.
 pub(crate) fn device(host: &cpal::Host, name: Option<&str>, output: bool) -> Option<cpal::Device> {
     if let Some(want) = name {
         let found = if output { host.output_devices().ok() } else { host.input_devices().ok() }
@@ -129,6 +145,11 @@ pub(crate) fn device(host: &cpal::Host, name: Option<&str>, output: bool) -> Opt
             return found;
         }
         log::warn!("audio device `{want}` is not available; using the default");
+    } else if host.id().name() == "ASIO"
+        && let Some(mut devs) = (if output { host.output_devices().ok() } else { host.input_devices().ok() })
+        && let Some(d) = devs.find(|d| device_name(d).is_some_and(|n| n.to_lowercase().contains("focusrite")))
+    {
+        return Some(d);
     }
     if output { host.default_output_device() } else { host.default_input_device() }
 }

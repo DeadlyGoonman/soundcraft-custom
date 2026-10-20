@@ -422,6 +422,26 @@ fn audio_systems(ctx: &egui::Context, refresh: bool) -> Arc<Vec<AudioSystem>> {
     s
 }
 
+/// The path to the chosen driver's control panel, when it is an ASIO driver. The panel is where
+/// you route physical channels; SoundCraft just picks the driver.
+fn asio_control_panel(cfg: &AudioConfig) -> Option<String> {
+    let name = cfg.system.as_deref().filter(|s| s.eq_ignore_ascii_case("ASIO"))?;
+    let key = format!("HKLM\\SOFTWARE\\ASIO\\{name}");
+    let out = std::process::Command::new("reg").args(["query", &key, "/v", "CLSID"]).output().ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let clsid = stdout.lines().find_map(|l| l.trim().strip_prefix("REG_SZ")).map(|s| s.trim().to_string()).unwrap_or_default();
+    if clsid.is_empty() {
+        return None;
+    }
+    let dll = std::process::Command::new("reg").args(["query", &format!("HKCR\\CLSID\\{clsid}\\InprocServer32"), "/v", "(default)"]).output().ok()?;
+    let dll = String::from_utf8_lossy(&dll.stdout);
+    let dll = dll.lines().find_map(|l| l.trim().strip_prefix("REG_SZ")).map(|s| s.trim().to_string()).unwrap_or_default();
+    if dll.is_empty() {
+        return None;
+    }
+    Some(format!("\"{dll}\""))
+}
+
 /// The system a config means (its own, else the default one) in an enumeration.
 fn chosen_system<'a>(systems: &'a [AudioSystem], cfg: &AudioConfig) -> Option<&'a AudioSystem> {
     cfg.system
@@ -468,12 +488,16 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
     let mut refresh = false;
     let mut apply = false;
     let systems = audio_systems(ctx, false);
-    win(ctx, &mut open, "Playback Engine", vec2(460.0, 360.0), |ui| {
+    win(ctx, &mut open, "Playback Engine", vec2(460.0, 420.0), |ui| {
         let t = Tokens::current();
         egui::Grid::new("pe").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
             ui.label("Audio system");
             let def = systems.iter().find(|s| s.is_default).map_or("none".to_string(), |s| s.name.clone());
-            let shown = draft.system.clone().unwrap_or_else(|| format!("Default ({def})"));
+            // No system chosen yet: show ASIO first when a driver is installed, since it is the
+            // path that puts a recording interface under the DAW's control (see `devices::host`).
+            let shown = draft.system.clone().unwrap_or_else(|| {
+                systems.iter().find(|s| s.name.eq_ignore_ascii_case("ASIO")).map_or_else(|| format!("Default ({def})"), |_| "ASIO".to_string())
+            });
             egui::ComboBox::from_id_salt("pe-system").width(300.0).selected_text(shown).show_ui(ui, |ui| {
                 let before = draft.system.clone();
                 ui.selectable_value(&mut draft.system, None, format!("Default ({def})"));
@@ -491,8 +515,14 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
             ui.label("Output device");
             device_combo(ui, "pe-out", &mut draft.output, sys.map_or(&[][..], |s| &s.outputs));
             ui.end_row();
+            // The input is tied to the output: an audio interface's inputs come from the same
+            // driver, so there is no separate input choice to get wrong.
             ui.label("Input device");
-            device_combo(ui, "pe-in", &mut draft.input, sys.map_or(&[][..], |s| &s.inputs));
+            let inp = draft
+                .output
+                .clone()
+                .unwrap_or_else(|| sys.and_then(|s| s.outputs.iter().find(|d| d.is_default)).map(|d| d.name.clone()).unwrap_or_default());
+            ui.label(egui::RichText::new(format!("{inp} (tied to output)").to_string()).small().color(t.text_dim));
             ui.end_row();
             let out = sys.and_then(|s| chosen_device(&s.outputs, draft.output.as_deref()));
             ui.label("Sample rate");
@@ -516,6 +546,13 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
                 draft = app.ui.audio.clone();
             }
         });
+        ui.separator();
+        ui.label(egui::RichText::new("Open the driver's own control panel to route physical channels.").small().color(t.text_dim));
+        if let Some(panel) = asio_control_panel(&draft)
+            && ui.button("Open ASIO Control Panel").clicked()
+        {
+            let _ = std::process::Command::new("cmd").args(["/C", &panel]).spawn();
+        }
         ui.separator();
         egui::Grid::new("pe-state").num_columns(2).show(ui, |ui| {
             ui.label("Output");
@@ -577,12 +614,15 @@ pub fn audio_device_command(app: &mut SoundApp, p: &serde_json::Value) -> Result
     use serde_json::Value;
     let mut changed = false;
     let mut cfg = app.ui.audio.clone();
-    for (key, slot) in [("system", &mut cfg.system), ("output", &mut cfg.output), ("input", &mut cfg.input)] {
+    for (key, slot) in [("system", &mut cfg.system), ("output", &mut cfg.output)] {
         if let Some(v) = p.get(key) {
             *slot = v.as_str().map(str::to_string).filter(|s| !s.is_empty());
             changed = true;
         }
     }
+    // The input comes from the same driver as the output: an audio interface's inputs are on the
+    // same device, so there is no separate input choice to get wrong.
+    cfg.input = cfg.output.clone();
     for (key, slot, range) in [("sample_rate", &mut cfg.sample_rate, 8_000..=768_000u64), ("buffer_size", &mut cfg.buffer_size, 16..=8192u64)] {
         if let Some(v) = p.get(key) {
             *slot = match v {

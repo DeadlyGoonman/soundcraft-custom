@@ -34,6 +34,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
                 edit_modes(app, ui);
                 zoom_group(app, ui);
                 tools(app, ui);
+                plugin_editor_button(app, ui);
                 counters(app, ui);
                 grid_nudge(app, ui);
                 transport(app, ui);
@@ -432,5 +433,44 @@ fn output_meter(app: &mut SoundApp, ui: &mut Ui) {
     for c in 0..2 {
         let rr = Rect::from_min_size(pos2(r.min.x + 2.0 + c as f32 * (w + 2.0), r.min.y), vec2(w, r.height()));
         crate::widgets::meter(ui, rr, m.level[c], m.hold[c], m.clip);
+    }
+}
+
+/// Open the plugin editor of the selected track's instrument or first active insert. A hosted
+/// plugin (CLAP/VST3/AU) gets its own GUI; a built-in opens its parameter window instead.
+fn plugin_editor_button(app: &mut SoundApp, ui: &mut Ui) {
+    let t = Tokens::current();
+    let resp = icon_button(ui, vec2(26.0, 26.0), "gear", false, "Open plugin editor (selected track)");
+    let r = resp.rect;
+    ui.painter().text(pos2(r.center().x, r.max.y + 2.0), Align2::CENTER_TOP, "Plugin", bold(9.0), t.text_dim);
+    if resp.clicked() {
+        let sel = app.engine.session().edit.selected_tracks.iter().copied().next();
+        let Some(track) = sel.and_then(|id| app.engine.session().track(id)) else {
+            app.ui.status = "Select a track to open its plugin editor".to_string();
+            return;
+        };
+        // Prefer the instrument slot (an instrument track's instrument), else the first active insert.
+        let instrument = track.kind == soundcraft_model::TrackKind::Instrument;
+        let slot = if instrument {
+            Some(soundcraft_mix::INSTRUMENT_SLOT)
+        } else {
+            track.mixer.inserts.iter().position(|i| i.as_ref().is_some_and(|i| !i.bypass))
+        };
+        let Some(slot) = slot else {
+            app.ui.status = format!("{} has no plugin to open", track.name);
+            return;
+        };
+        let id = track.id;
+        if let Some(p) = app.player.as_ref() {
+            if p.has_editor(id, slot) {
+                if let Err(e) = p.open_editor(id, slot) {
+                    app.ui.status = e;
+                }
+            } else if !app.ui.plugin_windows.contains(&(id, slot)) {
+                app.ui.plugin_windows.push((id, slot));
+            }
+        } else if !app.ui.plugin_windows.contains(&(id, slot)) {
+            app.ui.plugin_windows.push((id, slot));
+        }
     }
 }

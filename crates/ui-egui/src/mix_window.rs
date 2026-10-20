@@ -130,6 +130,13 @@ fn section_label(ui: &Ui, r: Rect, text: &str, narrow: bool) {
     p.galley(Align2::CENTER_CENTER.anchor_size(pos2(r.center().x, r.min.y + 7.0), galley.size()).min, galley, color);
 }
 
+/// Pro Tools draws the track's colour down the whole strip — the PREAMP, INSERTS, SENDS and I/O
+/// sections all sit on it, so tracks are easy to tell apart at a glance. A 3 px bar down the
+/// strip's left edge does the same here without stealing space from the controls.
+fn color_band(p: &egui::Painter, r: Rect, color: [u8; 3]) {
+    p.rect_filled(Rect::from_min_size(pos2(r.min.x, r.min.y), vec2(3.0, r.height())), 0.0, rgb(color));
+}
+
 pub(crate) fn route_name(app: &SoundApp, r: &Route) -> String {
     match r {
         Route::None => "no output".into(),
@@ -161,6 +168,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     let bg = if selected { t.strip_selected } else { t.strip_bg };
     vgradient(ui.painter(), r, shade(bg, 0.06), bg);
     ui.painter().vline(r.min.x + 0.5, r.y_range(), Stroke::new(1.0, t.edge_light));
+    color_band(ui.painter(), r, track.color);
     let mut y = r.min.y + 4.0;
     let inner_w = w - 8.0;
     let x0 = r.min.x + 4.0;
@@ -503,10 +511,28 @@ pub(crate) fn instrument_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, r:
         None => empty_slot(ui.painter(), r, resp.hovered(), Mark::Dot),
     }
     let hosted = ins.is_some_and(|i| soundcraft_mix::is_third_party(&i.plugin));
-    if resp.clicked() && hosted && !app.ui.plugin_windows.contains(&(id, slot)) {
-        app.ui.plugin_windows.push((id, slot));
+    if resp.clicked() && hosted {
+        if let Some(p) = app.player.as_ref()
+            && p.has_editor(id, slot)
+        {
+            // A hosted instrument keeps its sounds in its own editor: open it on click.
+            if let Err(e) = p.open_editor(id, slot) {
+                app.ui.status = format!("{}: {e}", info.map_or("instrument", |i| i.name));
+            }
+        } else if !app.ui.plugin_windows.contains(&(id, slot)) {
+            app.ui.plugin_windows.push((id, slot));
+        }
     }
-    let menu_resp = if hosted { resp.clone().on_hover_text("Click: open instrument · right-click: change") } else { resp.clone() };
+    let menu_resp = if hosted {
+        let tip = if app.player.as_ref().is_some_and(|p| p.has_editor(id, slot)) {
+            "Click: open the instrument's editor · right-click: change".to_string()
+        } else {
+            "Click: open instrument · right-click: change".to_string()
+        };
+        resp.clone().on_hover_text(tip)
+    } else {
+        resp.clone()
+    };
     let popup = if hosted { egui::Popup::context_menu(&menu_resp) } else { egui::Popup::menu(&menu_resp) };
     let popup = popup.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
     popup.show(|ui| instrument_menu(app, ui, id));
@@ -602,12 +628,23 @@ pub(crate) fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: 
     if resp.clicked() && ins.is_some() {
         if ui.input(|i| i.modifiers.command) {
             let _ = app.run("mix.insert_bypass", json!({"track": id.0, "slot": slot}));
+        } else if let Some(p) = app.player.as_ref()
+            && p.has_editor(id, slot)
+        {
+            // A hosted plugin's own editor opens on click, not its parameter menu.
+            if let Err(e) = p.open_editor(id, slot) {
+                app.ui.status = format!("{}: {e}", name);
+            }
         } else if !app.ui.plugin_windows.contains(&(id, slot)) {
             app.ui.plugin_windows.push((id, slot));
         }
     }
     let cmd = if ui.ctx().os().is_mac() { "⌘" } else { "Ctrl+" };
-    let tip = format!("{name}: click to open · {cmd}click to bypass · right-click to change");
+    let tip = if ins.is_some() && app.player.as_ref().is_some_and(|p| p.has_editor(id, slot)) {
+        format!("{name}: click to open the plugin's editor · {cmd}click to bypass · right-click to change")
+    } else {
+        format!("{name}: click to open · {cmd}click to bypass · right-click to change")
+    };
     let menu_resp = if ins.is_none() { resp.clone() } else { resp.clone().on_hover_text(tip) };
     let popup = if ins.is_none() { egui::Popup::menu(&menu_resp) } else { egui::Popup::context_menu(&menu_resp) };
     let popup = popup.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);

@@ -142,7 +142,18 @@ fn stalled(seen: &mut Option<(u64, std::time::Instant)>, beats: u64, playing: bo
 /// transport stops, rather than the panic taking the app down.
 fn guarded_block(fault: &Fault, shared: &Shared, out: &mut [f32], fill: impl FnOnce(&mut [f32])) {
     fault.beats.fetch_add(1, Ordering::Relaxed);
-    if fault.failed.load(Ordering::Relaxed) || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fill(out))).is_err() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fill(out)));
+    if fault.failed.load(Ordering::Relaxed) || result.is_err() {
+        // A panic in the mix callback used to die silently: the block went quiet, the watchdog
+        // stopped the transport, and nothing in the log said why. Say what happened.
+        if let Err(p) = result {
+            let msg = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic".to_string());
+            log::error!("audio callback panicked: {msg}");
+        }
         fault.failed.store(true, Ordering::Relaxed);
         shared.playing.store(false, Ordering::Relaxed);
         out.fill(0.0);
