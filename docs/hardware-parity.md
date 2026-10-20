@@ -1,6 +1,6 @@
 # Hardware parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-20 · **Change:** minor (ASIO is now the preferred host and device when none is chosen; the input is tied to the output driver; the driver's control panel opens from the Playback Engine; audio output trouble is reported in the UI) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-20 · **Change:** minor (ASIO is now the preferred host and device when none is chosen; the input is tied to the output driver; the driver's control panel opens from the Playback Engine; audio output trouble is reported in the UI; the control-panel lookup is cached so opening the window no longer freezes) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 A DAW is judged by how it drives audio interfaces, MIDI gear, control surfaces and sync. This is
 SoundCraft's weakest dimension. Ours is measured from `crates/playback` (cpal) and the absence of

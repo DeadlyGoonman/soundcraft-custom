@@ -102,6 +102,11 @@ instead of discarding the right side. Surround mixes average both sides of the I
 fold-down. Regression tests cover right-only and left-only audio, equal and opposite-polarity
 channels, clipping order, centered mono tracks, each 5.1 channel and 1-, 37- and 512-frame callbacks.
 
+**Fixed (2026-10-20):** Opening Setup › Playback Engine with an ASIO system froze the app: the
+control-panel lookup launched two `reg query` subprocesses on **every UI frame**, and a subprocess
+spawn on the UI thread blocks the whole program. The lookup is now cached per system name in
+`egui` context storage, so it runs once per open.
+
 Open on 2026-10-10 (several have PRs open):
 editing #3, #5, #140, #144; clip/session #86 (PR #123), #88 (PR #130), #91 (PR #124), #92 (PR #132);
 automation #104 (PR #134); mix/bounce #59 (PR #131), #103 (PR #133), #152; playback #101 (PR #129);
@@ -222,6 +227,7 @@ missing. Out of scope unless the owner decides otherwise.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-20 | minor | G-01: ASIO auto-preference, input tied to output, driver control panel, audio trouble reported in the UI; plugin editor button added |
+| 2026-10-20 | minor | G-04: Playback Engine froze with an ASIO system (two `reg query` subprocesses per frame); the control-panel lookup is now cached |
 | 2026-10-18 | trivial | G-04: mono device stereo/surround fold-down fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: master volume automation block boundaries fixed and regression-tested; estimates unchanged |
 | 2026-10-16 | trivial | G-04: failed aux/folder/master inserts excluded from latency compensation after containment; estimates unchanged |
