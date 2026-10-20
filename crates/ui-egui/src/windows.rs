@@ -423,9 +423,20 @@ fn audio_systems(ctx: &egui::Context, refresh: bool) -> Arc<Vec<AudioSystem>> {
 }
 
 /// The path to the chosen driver's control panel, when it is an ASIO driver. The panel is where
-/// you route physical channels; SoundCraft just picks the driver.
-fn asio_control_panel(cfg: &AudioConfig) -> Option<String> {
+/// you route physical channels; SoundCraft just picks the driver. Looking it up runs two
+/// `reg query` subprocesses, so the result is cached per system name instead of every frame.
+fn asio_control_panel(ctx: &egui::Context, cfg: &AudioConfig) -> Option<String> {
     let name = cfg.system.as_deref().filter(|s| s.eq_ignore_ascii_case("ASIO"))?;
+    let id = egui::Id::new(("asio_control_panel", name));
+    if let Some(p) = ctx.data(|d| d.get_temp::<Option<String>>(id)) {
+        return p.clone();
+    }
+    let panel = compute_asio_control_panel(name);
+    ctx.data_mut(|d| d.insert_temp(id, panel.clone()));
+    panel
+}
+
+fn compute_asio_control_panel(name: &str) -> Option<String> {
     let key = format!("HKLM\\SOFTWARE\\ASIO\\{name}");
     let out = std::process::Command::new("reg").args(["query", &key, "/v", "CLSID"]).output().ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -548,7 +559,7 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
         });
         ui.separator();
         ui.label(egui::RichText::new("Open the driver's own control panel to route physical channels.").small().color(t.text_dim));
-        if let Some(panel) = asio_control_panel(&draft)
+        if let Some(panel) = asio_control_panel(ctx, &draft)
             && ui.button("Open ASIO Control Panel").clicked()
         {
             let _ = std::process::Command::new("cmd").args(["/C", &panel]).spawn();
