@@ -1,7 +1,8 @@
 use egui::{Color32, Event, FullOutput, Rect, Shape, pos2, vec2};
 use egui_kittest::kittest::Queryable;
 use serde_json::json;
-use soundcraft_ui_egui::{Services, SoundApp, theme::ThemeMode};
+use soundcraft_ui_egui::theme::{TRACK_TINT_EMPTY, TRACK_TINT_FACE, ThemeMode, track_tint};
+use soundcraft_ui_egui::{Services, SoundApp};
 
 #[derive(Debug)]
 struct Slot {
@@ -94,6 +95,8 @@ fn populated_mix_instrument_uses_readable_palette_in_real_frames() {
         app.run("view.mix_section", json!({"section": section})).unwrap();
     }
     let session = app.engine.session().clone();
+    let track_color = session.track(instrument).unwrap().color;
+    let empty_track_color = session.track(empty).unwrap().color;
     assert!(!session.pool.is_empty(), "the fixture must include decoded audio");
     let proof_dir = std::env::var_os("SOUNDCRAFT_MIX_PROOF_DIR").map(std::path::PathBuf::from);
     let mut builder = egui_kittest::Harness::builder().with_size(vec2(1600.0, 1000.0)).with_pixels_per_point(2.0);
@@ -124,12 +127,14 @@ fn populated_mix_instrument_uses_readable_palette_in_real_frames() {
         let ordinary = slot(harness.output(), "SubSynth");
         let insert = slot(harness.output(), "EQ7");
         let palette = if light { soundcraft_ui_egui::theme::Tokens::LIGHT } else { soundcraft_ui_egui::theme::Tokens::DARK };
-        let face = palette.slot_face;
+        // Used and empty cells take a faint tint of their track colour (the instrument track here).
+        let face = palette.slot_face.map(|c| track_tint(c, track_color, TRACK_TINT_FACE));
+        let empty_fill = track_tint(palette.slot_empty, empty_track_color, TRACK_TINT_EMPTY);
         assert!(near(insert.faces, face), "{name}: insert faces {:?}", insert.faces);
         // The empty instrument track's slot sits beside the populated one, drawn as an empty cell.
         let row = ordinary.rect.center().y;
         let empty = harness.output().shapes.iter().any(|shape| {
-            matches!(&shape.shape, Shape::Rect(rect) if rect.fill == palette.slot_empty
+            matches!(&shape.shape, Shape::Rect(rect) if rect.fill == empty_fill
                 && rect.rect.y_range().contains(row)
                 && rect.rect.min.x > ordinary.rect.max.x)
         });

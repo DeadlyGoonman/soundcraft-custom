@@ -1,7 +1,7 @@
 //! The Mix window: one channel strip per track.
 
 use crate::SoundApp;
-use crate::theme::{Tokens, bold, regular, rgb};
+use crate::theme::{TRACK_TINT_EMPTY, TRACK_TINT_FACE, TRACK_TINT_SECTION, Tokens, bold, regular, rgb, track_tint};
 use crate::widgets::{
     PannerEdit, PannerSpeaker, db_text, fader, fader_slot, groove, inset, meter, meter_scale, multi_meter, pan_knob, pan_text, raised_key,
     rec_toggle, selector_box, selector_box_with_tooltip, shade, surround_panner, text_toggle, vgradient,
@@ -169,6 +169,8 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     vgradient(ui.painter(), r, shade(bg, 0.06), bg);
     ui.painter().vline(r.min.x + 0.5, r.y_range(), Stroke::new(1.0, t.edge_light));
     color_band(ui.painter(), r, track.color);
+    // Every section from PREAMP down to I/O takes the track's colour faintly.
+    let sec_bg = track_tint(t.strip_section, track.color, TRACK_TINT_SECTION);
     let mut y = r.min.y + 4.0;
     let inner_w = w - 8.0;
     let x0 = r.min.x + 4.0;
@@ -181,7 +183,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     if all || has("mic_preamps") {
         // Input gain stage ahead of the inserts (the track's trim).
         let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 34.0));
-        inset(ui.painter(), sec, t.strip_section);
+        inset(ui.painter(), sec, sec_bg);
         section_label(ui, sec, "PREAMP", narrow);
         if has_input {
             let kr = Rect::from_min_size(pos2(x0 + 6.0, sec.min.y + 15.0), vec2(inner_w - 12.0, 16.0));
@@ -199,7 +201,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     }
     if all || has("instruments") {
         let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 34.0));
-        inset(ui.painter(), sec, t.strip_section);
+        inset(ui.painter(), sec, sec_bg);
         section_label(ui, sec, "INSTRUMENT", narrow);
         let sr = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 16.0), vec2(inner_w - 4.0, 15.0));
         let slot = track.mixer.inserts.iter().position(|i| i.as_ref().is_some_and(|i| plugin_info(&i.plugin).is_some_and(|p| p.is_instrument)));
@@ -235,7 +237,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
             continue;
         }
         let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 16.0 + 5.0 * 17.0));
-        inset(ui.painter(), sec, t.strip_section);
+        inset(ui.painter(), sec, sec_bg);
         section_label(ui, sec, title, narrow);
         for k in 0..5 {
             let sr = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 15.0 + k as f32 * 17.0), vec2(inner_w - 4.0, 15.0));
@@ -249,7 +251,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     }
     if all || has("eq_curve") {
         let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 40.0));
-        ui.painter().rect_filled(sec, 2.0, Color32::from_rgb(14, 18, 22));
+        ui.painter().rect_filled(sec, 2.0, track_tint(Color32::from_rgb(14, 18, 22), track.color, TRACK_TINT_SECTION));
         let eq = track.mixer.inserts.iter().flatten().find(|i| i.plugin == "eq_7band" || i.plugin == "eq_1band");
         if let Some(ins) = eq {
             let n = 40;
@@ -288,7 +290,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     }
     if all || has("io") {
         let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 16.0 + 2.0 * 18.0 + 30.0));
-        inset(ui.painter(), sec, t.strip_section);
+        inset(ui.painter(), sec, sec_bg);
         section_label(ui, sec, "I / O", narrow);
         let in_r = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 15.0), vec2(inner_w - 4.0, 16.0));
         let out_r = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 33.0), vec2(inner_w - 4.0, 16.0));
@@ -507,8 +509,8 @@ pub(crate) fn instrument_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, r:
     let resp = ui.interact(r, ui.id().with(("instrument", id.0)), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Instrument"));
     match info {
-        Some(info) => used_slot(ui.painter(), r, t.slot_face, Mark::Dot, info.short_name, t.text, None),
-        None => empty_slot(ui.painter(), r, resp.hovered(), Mark::Dot),
+        Some(info) => used_slot(ui.painter(), r, track_faces(t.slot_face, track.color), Mark::Dot, info.short_name, t.text, None),
+        None => empty_slot(ui.painter(), r, resp.hovered(), Mark::Dot, track_tint(t.slot_empty, track.color, TRACK_TINT_EMPTY)),
     }
     let hosted = ins.is_some_and(|i| soundcraft_mix::is_third_party(&i.plugin));
     if resp.clicked() && hosted {
@@ -569,9 +571,9 @@ fn draw_mark(p: &egui::Painter, r: Rect, mark: Mark, color: Color32) {
     }
 }
 
-fn empty_slot(p: &egui::Painter, r: Rect, hovered: bool, mark: Mark) {
+fn empty_slot(p: &egui::Painter, r: Rect, hovered: bool, mark: Mark, fill: Color32) {
     let t = Tokens::current();
-    p.rect_filled(r, 2.0, if hovered { shade(t.slot_empty, 0.06) } else { t.slot_empty });
+    p.rect_filled(r, 2.0, if hovered { shade(fill, 0.06) } else { fill });
     let color = if matches!(mark, Mark::Letter(_)) { t.slot_mark.lerp_to_gamma(t.text, 0.55) } else { t.slot_mark };
     draw_mark(p, r, mark, color);
 }
@@ -613,17 +615,40 @@ pub(crate) fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: 
     let t = Tokens::current();
     let id = track.id;
     let ins = track.mixer.inserts.get(slot).cloned().flatten();
-    let resp = ui.interact(r, ui.id().with(("ins", id.0, slot)), Sense::click());
+    let resp = ui.interact(r, ui.id().with(("ins", id.0, slot)), Sense::click_and_drag());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Insert {}", (b'A' + slot as u8) as char)));
     let info = ins.as_ref().and_then(|i| plugin_info(&i.plugin));
     let name = ins.as_ref().map(|i| info.map_or(i.plugin.as_str(), |p| p.short_name)).unwrap_or_default();
     match &ins {
-        None => empty_slot(ui.painter(), r, resp.hovered(), Mark::Dot),
+        None => empty_slot(ui.painter(), r, resp.hovered(), Mark::Dot, track_tint(t.slot_empty, track.color, TRACK_TINT_EMPTY)),
         Some(i) => {
-            let faces = if i.bypass { t.slot_bypassed } else { t.slot_face };
+            // A bypassed insert keeps its blue face: that colour means bypassed.
+            let faces = if i.bypass { t.slot_bypassed } else { track_faces(t.slot_face, track.color) };
             let color = if info.is_some() { t.text } else { t.text_dim };
             used_slot(ui.painter(), r, faces, Mark::Dot, name, color, None);
         }
+    }
+    // Pro Tools-style reorder: drag a used insert onto another insert of the same track to swap them.
+    if ins.is_some() {
+        resp.dnd_set_drag_payload(InsertDrag { track: id, slot });
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            if let Some(p) = ui.ctx().pointer_latest_pos() {
+                drag_label(ui.ctx(), p, name);
+            }
+        }
+    }
+    if let Some(d) = resp.dnd_hover_payload::<InsertDrag>()
+        && d.track == id
+        && d.slot != slot
+    {
+        ui.painter().rect_stroke(r.expand(1.0), 2.0, Stroke::new(2.0, t.accent), StrokeKind::Outside);
+    }
+    if let Some(d) = resp.dnd_release_payload::<InsertDrag>()
+        && d.track == id
+        && d.slot != slot
+    {
+        move_insert(app, id, d.slot, slot);
     }
     if resp.clicked() && ins.is_some() {
         if ui.input(|i| i.modifiers.command) {
@@ -649,6 +674,54 @@ pub(crate) fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: 
     let popup = if ins.is_none() { egui::Popup::menu(&menu_resp) } else { egui::Popup::context_menu(&menu_resp) };
     let popup = popup.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
     popup.show(|ui| plugin_menu(app, ui, id, slot, ins.is_some()));
+}
+
+/// An insert being dragged to reorder its track's inserts. Only another insert of the same track
+/// accepts it.
+#[derive(Clone, Copy)]
+pub(crate) struct InsertDrag {
+    pub track: TrackId,
+    pub slot: usize,
+}
+
+/// A used insert's two faces, pulled faintly toward its track's colour.
+fn track_faces(faces: [Color32; 2], track: [u8; 3]) -> [Color32; 2] {
+    faces.map(|c| track_tint(c, track, TRACK_TINT_FACE))
+}
+
+/// The name of the insert being dragged, following the pointer.
+fn drag_label(ctx: &egui::Context, at: egui::Pos2, name: &str) {
+    egui::Area::new(egui::Id::new("insert_drag_label")).order(egui::Order::Tooltip).interactable(false).fixed_pos(at + vec2(12.0, 8.0)).show(
+        ctx,
+        |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(egui::RichText::new(name).font(bold(10.0)));
+            });
+        },
+    );
+}
+
+/// Swaps two inserts of one track (drag to reorder, one undo step). Live third-party plugins keep
+/// their settings: their states go into the session first, so the moved instances are rebuilt
+/// with them. Their editor windows close and the plugin windows follow their plugins.
+fn move_insert(app: &mut SoundApp, id: TrackId, from: usize, to: usize) {
+    app.capture_plugin_states();
+    match app.run("mix.insert_move", json!({"track": id.0, "from": from, "to": to})) {
+        Ok(_) => {
+            if let Some(p) = app.player.as_ref() {
+                p.close_editor(id, from);
+                p.close_editor(id, to);
+            }
+            for w in app.ui.plugin_windows.iter_mut().filter(|w| w.0 == id) {
+                if w.1 == from {
+                    w.1 = to;
+                } else if w.1 == to {
+                    w.1 = from;
+                }
+            }
+        }
+        Err(e) => app.ui.status = e,
+    }
 }
 
 /// An insert's menu: a search field that takes typing at once, then (until something is typed)
@@ -970,7 +1043,8 @@ pub(crate) fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: us
             let name = route_name(app, &s.target);
             let level = soundcraft_model::fader_db_to_pos(s.level_db);
             let color = if s.mute { t.mute } else { t.text };
-            used_slot(ui.painter(), r, t.slot_face, mark, &name, color, Some(level));
+            let faces = track_faces(t.slot_face, track.color);
+            used_slot(ui.painter(), r, faces, mark, &name, color, Some(level));
             let which = (b'A' + slot as u8) as char;
             let shown = app.ui.send_window == Some((id, slot));
             let level_resp = ui.interact(level_r, ui.id().with(("send-value", id.0, slot)), Sense::click_and_drag());
@@ -999,7 +1073,7 @@ pub(crate) fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: us
             ));
             level_resp.context_menu(|ui| send_options_menu(app, ui, id, slot, s));
         }
-        None => empty_slot(ui.painter(), r, ui.rect_contains_pointer(r), mark),
+        None => empty_slot(ui.painter(), r, ui.rect_contains_pointer(r), mark, track_tint(t.slot_empty, track.color, TRACK_TINT_EMPTY)),
     }
     if let Some(send) = &snd {
         egui::Popup::menu(&route_resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {

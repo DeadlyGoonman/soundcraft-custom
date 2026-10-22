@@ -437,6 +437,20 @@ pub fn rgb(c: [u8; 3]) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
 }
 
+/// How far a track's colour pulls a surface toward itself (0 = the plain surface, 1 = the colour).
+/// Strip sections and Edit-window columns.
+pub const TRACK_TINT_SECTION: f32 = 0.22;
+/// Empty insert and send cells.
+pub const TRACK_TINT_EMPTY: f32 = 0.16;
+/// Used (not bypassed) insert and send faces. Kept faint so their names stay readable.
+pub const TRACK_TINT_FACE: f32 = 0.12;
+
+/// `base` pulled toward the track's colour by `amount`: the track's identity without losing the
+/// surface's contrast for text.
+pub fn track_tint(base: Color32, track: [u8; 3], amount: f32) -> Color32 {
+    base.lerp_to_gamma(rgb(track), amount)
+}
+
 pub fn bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("bold".into()))
 }

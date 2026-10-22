@@ -19,7 +19,6 @@ const KNOWN_UNREACHED: &[&str] = &[
     "markers.previous",
     "mix.clear_mutes",
     "mix.clear_solos",
-    "mix.insert_move",
     "mix.phase_invert",
     "mix.send_surround_pan",
     "mix.solo_safe",
