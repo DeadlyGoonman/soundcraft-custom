@@ -7,7 +7,7 @@ use serde_json::json;
 use soundcraft_model::{AutomationMode, ClipContent};
 use soundcraft_playback::AudioConfig;
 use soundcraft_playback::devices::{AudioSystem, DeviceInfo};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     audio_health(app, ctx);
@@ -410,47 +410,103 @@ fn configurations(app: &mut SoundApp, ctx: &egui::Context) {
     app.ui.show_configurations = open;
 }
 
-/// The audio systems as last enumerated (enumerating probes devices: done when the window opens
-/// and on Refresh, not every frame).
-fn audio_systems(ctx: &egui::Context, refresh: bool) -> Arc<Vec<AudioSystem>> {
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A device scan, run on its own thread: enumerating probes every ASIO driver, which can block.
+#[derive(Default)]
+enum Scan {
+    #[default]
+    Idle,
+    Running,
+    Done(Arc<Vec<AudioSystem>>),
+}
+
+type ScanSlot = Arc<Mutex<Scan>>;
+
+/// The ASIO control panel, opened on a worker: the driver's panel is modal and blocks until closed.
+#[derive(Default)]
+struct PanelState {
+    busy: bool,
+    error: Option<String>,
+}
+
+type PanelSlot = Arc<Mutex<PanelState>>;
+
+/// The audio systems as last enumerated, or `None` while the scan runs. A scan starts on the first
+/// call after the window opens and on Refresh (`refresh`), never every frame; the scan wakes the UI
+/// when it lands.
+fn audio_systems(ctx: &egui::Context, refresh: bool) -> Option<Arc<Vec<AudioSystem>>> {
     let id = egui::Id::new("audio_systems");
-    if !refresh && let Some(s) = ctx.data(|d| d.get_temp::<Arc<Vec<AudioSystem>>>(id)) {
-        return s;
+    let slot: ScanSlot = match ctx.data(|d| d.get_temp::<ScanSlot>(id)) {
+        Some(slot) => slot,
+        None => {
+            let slot = ScanSlot::default();
+            ctx.data_mut(|d| d.insert_temp(id, Arc::clone(&slot)));
+            slot
+        }
+    };
+    let mut state = lock(&slot);
+    match &*state {
+        Scan::Done(systems) if !refresh => return Some(Arc::clone(systems)),
+        Scan::Running => return None,
+        _ => {}
     }
-    let s = Arc::new(soundcraft_playback::devices::audio_systems());
-    ctx.data_mut(|d| d.insert_temp(id, Arc::clone(&s)));
-    s
+    *state = Scan::Running;
+    drop(state);
+    let (worker, repaint) = (Arc::clone(&slot), ctx.clone());
+    let spawned = std::thread::Builder::new().name("audio-scan".into()).spawn(move || {
+        let systems = Arc::new(soundcraft_playback::devices::audio_systems());
+        *lock(&worker) = Scan::Done(systems);
+        repaint.request_repaint();
+    });
+    if let Err(e) = spawned {
+        log::warn!("cannot start the device scan: {e}");
+        *lock(&slot) = Scan::Done(Arc::new(Vec::new()));
+    }
+    None
 }
 
-/// The path to the chosen driver's control panel, when it is an ASIO driver. The panel is where
-/// you route physical channels; SoundCraft just picks the driver. Looking it up runs two
-/// `reg query` subprocesses, so the result is cached per system name instead of every frame.
-fn asio_control_panel(ctx: &egui::Context, cfg: &AudioConfig) -> Option<String> {
-    let name = cfg.system.as_deref().filter(|s| s.eq_ignore_ascii_case("ASIO"))?;
-    let id = egui::Id::new(("asio_control_panel", name));
-    if let Some(p) = ctx.data(|d| d.get_temp::<Option<String>>(id)) {
-        return p.clone();
+/// The ASIO control panel's state for this window, kept while the window is open.
+fn asio_panel_slot(ctx: &egui::Context) -> PanelSlot {
+    let id = egui::Id::new("asio_panel");
+    match ctx.data(|d| d.get_temp::<PanelSlot>(id)) {
+        Some(slot) => slot,
+        None => {
+            let slot = PanelSlot::default();
+            ctx.data_mut(|d| d.insert_temp(id, Arc::clone(&slot)));
+            slot
+        }
     }
-    let panel = compute_asio_control_panel(name);
-    ctx.data_mut(|d| d.insert_temp(id, panel.clone()));
-    panel
 }
 
-fn compute_asio_control_panel(name: &str) -> Option<String> {
-    let key = format!("HKLM\\SOFTWARE\\ASIO\\{name}");
-    let out = std::process::Command::new("reg").args(["query", &key, "/v", "CLSID"]).output().ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let clsid = stdout.lines().find_map(|l| l.trim().strip_prefix("REG_SZ")).map(|s| s.trim().to_string()).unwrap_or_default();
-    if clsid.is_empty() {
-        return None;
+/// Opens the driver's control panel on a worker thread; its failure is left in `panel` for the
+/// window to show.
+fn start_asio_panel(ctx: &egui::Context, panel: &PanelSlot, driver: String) {
+    {
+        let mut state = lock(panel);
+        if state.busy {
+            return;
+        }
+        state.busy = true;
     }
-    let dll = std::process::Command::new("reg").args(["query", &format!("HKCR\\CLSID\\{clsid}\\InprocServer32"), "/v", "(default)"]).output().ok()?;
-    let dll = String::from_utf8_lossy(&dll.stdout);
-    let dll = dll.lines().find_map(|l| l.trim().strip_prefix("REG_SZ")).map(|s| s.trim().to_string()).unwrap_or_default();
-    if dll.is_empty() {
-        return None;
+    let (slot, repaint) = (Arc::clone(panel), ctx.clone());
+    let spawned = std::thread::Builder::new().name("asio-panel".into()).spawn(move || {
+        let result = soundcraft_playback::asio_control_panel(&driver);
+        let mut state = lock(&slot);
+        state.busy = false;
+        if let Err(e) = result {
+            state.error = Some(format!("The ASIO control panel did not open: {e}"));
+        }
+        drop(state);
+        repaint.request_repaint();
+    });
+    if let Err(e) = spawned {
+        let mut state = lock(panel);
+        state.busy = false;
+        state.error = Some(format!("The ASIO control panel did not open: {e}"));
     }
-    Some(format!("\"{dll}\""))
 }
 
 /// The system a config means (its own, else the default one) in an enumeration.
@@ -498,9 +554,15 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
     let mut draft = ctx.data(|d| d.get_temp::<AudioConfig>(draft_id)).unwrap_or_else(|| app.ui.audio.clone());
     let mut refresh = false;
     let mut apply = false;
-    let systems = audio_systems(ctx, false);
+    let scan = audio_systems(ctx, false);
+    let scanning = scan.is_none();
+    let systems = scan.unwrap_or_default();
+    let panel = asio_panel_slot(ctx);
     win(ctx, &mut open, "Playback Engine", vec2(460.0, 420.0), |ui| {
         let t = Tokens::current();
+        if scanning {
+            ui.label(egui::RichText::new("Scanning audio devices…").small().color(t.text_dim));
+        }
         egui::Grid::new("pe").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
             ui.label("Audio system");
             let def = systems.iter().find(|s| s.is_default).map_or("none".to_string(), |s| s.name.clone());
@@ -559,10 +621,20 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
         });
         ui.separator();
         ui.label(egui::RichText::new("Open the driver's own control panel to route physical channels.").small().color(t.text_dim));
-        if let Some(panel) = asio_control_panel(ctx, &draft)
-            && ui.button("Open ASIO Control Panel").clicked()
+        // The ASIO driver: the one picked as output, else the one the open player runs.
+        let asio_selected =
+            draft.system.as_deref().map_or_else(|| systems.iter().any(|s| s.name.eq_ignore_ascii_case("ASIO")), |s| s.eq_ignore_ascii_case("ASIO"));
+        let driver = draft.output.clone().or_else(|| app.player.as_ref().filter(|p| p.input_tap().is_some()).map(|p| p.device_name.clone()));
+        if let Some(driver) = driver
+            && soundcraft_playback::asio_available()
+            && asio_selected
         {
-            let _ = std::process::Command::new("cmd").args(["/C", &panel]).spawn();
+            let busy = lock(&panel).busy;
+            if busy {
+                ui.label(egui::RichText::new("ASIO control panel open…").small().color(t.text_dim));
+            } else if ui.button("Open ASIO Control Panel").clicked() {
+                start_asio_panel(ui.ctx(), &panel, driver);
+            }
         }
         ui.separator();
         egui::Grid::new("pe-state").num_columns(2).show(ui, |ui| {
@@ -590,6 +662,16 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
                 .map_or(String::new(), |_| " (resampled to the device rate)".to_string());
             ui.label(format!("{sr} Hz{note}"));
             ui.end_row();
+            // What the driver reports, in milliseconds at the device rate (ASIO only).
+            if let Some(p) = app.player.as_ref().filter(|p| !p.silent)
+                && let Some((input, output)) = p.device_latency
+            {
+                let ms = |frames: u32| f64::from(frames) * 1000.0 / f64::from(p.device_rate.max(1));
+                let buffer = p.device_buffer.unwrap_or(0);
+                ui.label("Latency");
+                ui.label(format!("buffer {:.1} ms · input {:.1} ms · output {:.1} ms", ms(buffer), ms(input), ms(output)));
+                ui.end_row();
+            }
         });
         ui.label(egui::RichText::new("The mix runs in 512-sample blocks; the buffer size sets the device's own latency.").small().color(t.text_dim));
         let mut dc = app.engine.session().edit.delay_compensation;
@@ -603,6 +685,9 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
     if refresh {
         audio_systems(ctx, true);
     }
+    if let Some(e) = lock(&panel).error.take() {
+        app.ui.status = e;
+    }
     if apply && let Err(e) = app.apply_audio_config(draft.clone()) {
         app.ui.status = e;
     }
@@ -612,7 +697,8 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
         // Closing discards unapplied edits and the device list (re-read on the next open).
         ctx.data_mut(|d| {
             d.remove_temp::<AudioConfig>(draft_id);
-            d.remove_temp::<Arc<Vec<AudioSystem>>>(egui::Id::new("audio_systems"));
+            d.remove_temp::<ScanSlot>(egui::Id::new("audio_systems"));
+            d.remove_temp::<PanelSlot>(egui::Id::new("asio_panel"));
         });
     }
     app.ui.show_playback_engine = open;

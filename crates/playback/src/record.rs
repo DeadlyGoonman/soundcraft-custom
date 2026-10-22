@@ -122,12 +122,68 @@ impl Shared {
     }
 }
 
+/// An input that is fed from outside the cpal streams (the ASIO duplex callback). The owner
+/// installs an [`InputSink`] with [`Recorder::attach`]; the callback feeds it with `try_lock` only.
+#[derive(Default)]
+pub struct InputTap {
+    sink: Mutex<Option<InputSink>>,
+    /// Frames per driver buffer, set before attaching: it bounds the monitoring backlog.
+    buffer_frames: AtomicU32,
+}
+
+impl InputTap {
+    /// Records the driver's buffer size, which sizes the monitoring backlog of recorders attached
+    /// afterwards.
+    pub fn set_buffer_frames(&self, frames: u32) {
+        self.buffer_frames.store(frames, Ordering::Relaxed);
+    }
+
+    /// One block of the driver's input, from the audio thread: skipped (never waited for) while the
+    /// UI thread holds the sink.
+    #[cfg(all(windows, feature = "asio"))]
+    pub(crate) fn feed(&self, samples: &[f32]) {
+        if let Ok(mut sink) = self.sink.try_lock()
+            && let Some(s) = sink.as_mut()
+        {
+            s.feed(samples);
+        }
+    }
+}
+
+/// What the input callback does with each block: monitor it, and capture it while armed.
+pub(crate) struct InputSink {
+    shared: Arc<Shared>,
+    monitor: Arc<InputRing>,
+    /// Samples owed as silence (they did not fit in the ring), see `Shared::capture`.
+    owed: usize,
+}
+
+impl InputSink {
+    /// One block of interleaved input (the input's channel count wide). Called on the audio
+    /// thread: it pushes into the monitor ring and, while armed, into the capture ring.
+    pub(crate) fn feed(&mut self, samples: &[f32]) {
+        // Through `guarded`, like the cpal input: it counts the block as a beat (so a recording
+        // input is not reported as stalled) and turns a panic into a broken input, not a crash.
+        let Self { shared, monitor, owed } = self;
+        shared.guarded(|| {
+            monitor.push(samples);
+            if shared.armed.load(Ordering::Acquire) {
+                shared.capture(samples, owed);
+            } else {
+                *owed = 0;
+            }
+        });
+    }
+}
+
 pub struct Recorder {
     shared: Arc<Shared>,
     /// Live input for monitoring (always fed while the input stream runs).
     pub monitor: Arc<InputRing>,
     #[cfg(not(target_os = "freebsd"))]
     _stream: Option<cpal::Stream>,
+    /// The tap this recorder feeds, when it is attached to an ASIO input instead of a cpal stream.
+    tap: Option<Arc<InputTap>>,
     pub device_name: String,
     pub sample_rate: u32,
     pub channels: usize,
@@ -153,10 +209,9 @@ where
     use cpal::Sample;
     use cpal::traits::DeviceTrait;
     let (sh, errors) = (Arc::clone(shared), Arc::clone(shared));
-    let mon = Arc::clone(monitor);
+    let mut sink = InputSink { shared: Arc::clone(shared), monitor: Arc::clone(monitor), owed: 0 };
     let mut scratch = vec![0.0f32; 8192 * usize::from(config.channels).max(1)];
     let chunk = scratch.len();
-    let mut owed = 0;
     device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
@@ -167,12 +222,7 @@ where
                     for (o, x) in s.iter_mut().zip(part) {
                         *o = f32::from_sample(*x);
                     }
-                    mon.push(s);
-                    if sh.armed.load(Ordering::Acquire) {
-                        sh.capture(s, &mut owed);
-                    } else {
-                        owed = 0;
-                    }
+                    sink.feed(s);
                 }
             });
         },
@@ -245,12 +295,45 @@ impl Recorder {
         };
         stream.play().map_err(|e| e.to_string())?;
         let seen = (0, Instant::now());
-        Ok(Recorder { monitor, shared, _stream: Some(stream), device_name: name, sample_rate: config.sample_rate.0, channels, writer: None, seen })
+        Ok(Recorder {
+            monitor,
+            shared,
+            _stream: Some(stream),
+            tap: None,
+            device_name: name,
+            sample_rate: config.sample_rate.0,
+            channels,
+            writer: None,
+            seen,
+        })
     }
 
     #[cfg(target_os = "freebsd")]
     pub fn open_with(_audio: &crate::AudioConfig) -> Result<Recorder, String> {
         Err("recording is not supported on this platform yet".into())
+    }
+
+    /// A recorder fed by `tap` (an ASIO duplex stream's input) instead of a cpal stream: `rate` and
+    /// `channels` are the input's. Dropping the recorder detaches it from the tap.
+    pub fn attach(tap: &Arc<InputTap>, name: String, rate: u32, channels: usize) -> Recorder {
+        let channels = channels.max(1);
+        let ring = CaptureRing::new((rate as usize).saturating_mul(channels * RING_SECONDS).min(1 << 25));
+        let shared = Arc::new(Shared::new(ring));
+        let monitor = InputRing::new_duplex(channels, rate, tap.buffer_frames.load(Ordering::Relaxed));
+        let sink = InputSink { shared: Arc::clone(&shared), monitor: Arc::clone(&monitor), owed: 0 };
+        *tap.sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(sink);
+        Recorder {
+            shared,
+            monitor,
+            #[cfg(not(target_os = "freebsd"))]
+            _stream: None,
+            tap: Some(Arc::clone(tap)),
+            device_name: name,
+            sample_rate: rate,
+            channels,
+            writer: None,
+            seen: (0, Instant::now()),
+        }
     }
 
     /// Create each take's file and start recording into them: a track's take records the given
@@ -321,6 +404,13 @@ impl Recorder {
 impl Drop for Recorder {
     fn drop(&mut self) {
         self.finish();
+        if let Some(tap) = &self.tap {
+            // Detach only our own sink: a newer recorder may have attached since.
+            let mut sink = tap.sink.lock().unwrap_or_else(PoisonError::into_inner);
+            if sink.as_ref().is_some_and(|s| Arc::ptr_eq(&s.shared, &self.shared)) {
+                *sink = None;
+            }
+        }
     }
 }
 
@@ -469,6 +559,7 @@ mod tests {
             monitor: InputRing::new(1, 48_000),
             #[cfg(not(target_os = "freebsd"))]
             _stream: None,
+            tap: None,
             device_name: "Mic In".into(),
             sample_rate: 48_000,
             channels: 1,
@@ -552,6 +643,42 @@ mod tests {
     }
 
     #[test]
+    fn a_tap_feeds_its_recorder_until_that_recorder_drops() {
+        let tap = Arc::new(InputTap::default());
+        tap.set_buffer_frames(64);
+        let rec = Recorder::attach(&tap, "Duplex".into(), 48_000, 1);
+        rec.shared.armed.store(true, Ordering::Release);
+        tap.sink.lock().unwrap().as_mut().unwrap().feed(&[0.5; 64]);
+        let mut captured = Vec::new();
+        rec.shared.ring.pop_all(&mut captured);
+        assert_eq!(captured, vec![0.5; 64], "the armed input is captured");
+        assert_eq!(rec.monitor.state.lock().unwrap().data.len(), 64, "and monitored");
+        // A newer recorder takes the tap over; dropping the older one must not detach it.
+        let newer = Recorder::attach(&tap, "Duplex".into(), 48_000, 1);
+        drop(rec);
+        assert!(tap.sink.lock().unwrap().is_some(), "the newer recorder is still attached");
+        drop(newer);
+        assert!(tap.sink.lock().unwrap().is_none(), "dropping the last recorder detaches it");
+    }
+
+    #[test]
+    fn an_asio_block_counts_as_a_beat_so_an_armed_input_is_not_stalled() {
+        // Regression: the ASIO path used to skip `guarded`, so `beats` never moved and an armed
+        // recording reported "stopped sending audio" after STALL.
+        let tap = Arc::new(InputTap::default());
+        tap.set_buffer_frames(64);
+        let mut rec = Recorder::attach(&tap, "Duplex".into(), 48_000, 1);
+        rec.shared.armed.store(true, Ordering::Release);
+        assert_eq!(rec.trouble(), None);
+        rec.seen.1 = Instant::now().checked_sub(STALL).unwrap();
+        for _ in 0..3 {
+            tap.sink.lock().unwrap().as_mut().unwrap().feed(&[0.5; 64]);
+        }
+        assert_eq!(rec.shared.beats.load(Ordering::Relaxed), 3, "each block bumps beats");
+        assert_eq!(rec.trouble(), None, "a recording input that keeps sending is not stalled");
+    }
+
+    #[test]
     fn a_take_sums_itself_up_for_drawing_while_it_records() {
         let dir = std::env::temp_dir().join(format!("soundcraft-live-take-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -587,8 +714,23 @@ pub struct InputRing {
 
 impl InputRing {
     pub fn new(channels: usize, rate: u32) -> Arc<InputRing> {
-        let ch = channels.max(1);
         let frames = if rate == 0 { 24_000 } else { rate as usize / 2 };
+        InputRing::with_backlog(channels, rate, frames)
+    }
+
+    /// A ring for a duplex stream whose input and output run in one callback: the backlog is
+    /// capped at two driver buffers (`frames`), so a startup backlog cannot become monitoring
+    /// delay. With `frames == 0` (unknown) it is [`InputRing::new`].
+    pub fn new_duplex(channels: usize, rate: u32, frames: u32) -> Arc<InputRing> {
+        if frames == 0 {
+            return InputRing::new(channels, rate);
+        }
+        InputRing::with_backlog(channels, rate, 2 * frames as usize)
+    }
+
+    /// Keeps at most `frames` frames of input (the oldest are dropped first).
+    fn with_backlog(channels: usize, rate: u32, frames: usize) -> Arc<InputRing> {
+        let ch = channels.max(1);
         Arc::new(InputRing {
             state: Mutex::new(RingState { data: std::collections::VecDeque::with_capacity(rate.max(48_000) as usize * ch), phase: 0.0 }),
             channels: std::sync::atomic::AtomicUsize::new(ch),
@@ -693,6 +835,23 @@ mod ring_tests {
         let mut out = vec![vec![1.0f32; 16]];
         ring.pop_into(&mut out, 16, 48_000);
         assert!(out[0].iter().all(|v| *v == 0.0));
+    }
+
+    /// A duplex ring keeps two driver buffers at most: the oldest of a startup backlog is dropped,
+    /// so the monitor is never delayed by more than that.
+    #[test]
+    fn duplex_backlog_is_capped_at_two_buffers() {
+        let ring = InputRing::new_duplex(2, 48_000, 64);
+        let input: Vec<f32> = (0..2 * 1_000).map(|i| i as f32).collect();
+        ring.push(&input);
+        let mut out = vec![vec![0.0f32; 1]; 2];
+        ring.pop_into(&mut out, 1, 48_000);
+        // 2 × 64 frames kept: the first one read is frame 1000 - 128 = 872 (left = 2 × 872).
+        assert_eq!((out[0][0], out[1][0]), (1744.0, 1745.0));
+        // Without a buffer size the ring keeps the usual half second.
+        let unknown = InputRing::new_duplex(1, 48_000, 0);
+        unknown.push(&[0.25; 30_000]);
+        assert_eq!(unknown.state.lock().unwrap().data.len(), 24_000);
     }
 
     /// NaN and infinities from the device monitor as silence.

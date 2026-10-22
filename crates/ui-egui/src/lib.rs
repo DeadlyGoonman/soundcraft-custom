@@ -282,6 +282,8 @@ pub struct SoundApp {
     /// Folder for user plugin presets (native apps set it).
     pub preset_dir: Option<std::path::PathBuf>,
     last_autosave: Option<std::time::Instant>,
+    /// When the driver last asked to be reset and the device was reopened for it (see `reset_output`).
+    last_reset: Option<std::time::Instant>,
     pub dialogs: dialogs::Dialogs,
     pub meters: HashMap<TrackId, MeterDisplay>,
     pub main_meter: MeterDisplay,
@@ -304,6 +306,8 @@ pub struct SoundApp {
     pending_shots: Vec<control::PendingShot>,
     /// An insert just picked from its menu, opened once the audio engine has its instance.
     pub(crate) pending_open: Option<(TrackId, usize)>,
+    /// When `pending_open` started waiting for a third-party plugin's editor.
+    pub(crate) pending_open_since: Option<std::time::Instant>,
     last_rev: u64,
     fonts_ready: bool,
     fonts_installed: bool,
@@ -358,6 +362,7 @@ impl SoundApp {
             punch: None,
             recorder_failed: false,
             lost_shown: 0,
+            last_reset: None,
             take_plan: None,
             ui: UiState::default(),
             audio_health_report: None,
@@ -388,6 +393,7 @@ impl SoundApp {
             control_rx: None,
             pending_shots: Vec::new(),
             pending_open: None,
+            pending_open_since: None,
             last_rev: 0,
             fonts_ready: false,
             fonts_installed: false,
@@ -623,14 +629,32 @@ impl SoundApp {
 
     /// Opens the insert just picked from its menu: a hosted plugin's own editor, else (a built-in
     /// plugin, no audio engine, or an editor that can't open here) its plugin window.
-    fn open_inserted(&mut self) {
-        let Some((track, slot)) = self.pending_open.take() else { return };
-        let Some(plugin) = self.engine.session().track(track).and_then(|t| t.mixer.inserts.get(slot).cloned().flatten()).map(|i| i.plugin) else {
+    fn open_inserted(&mut self, ctx: &egui::Context) {
+        let Some((track, slot)) = self.pending_open else { return };
+        let session = self.engine.session();
+        let picked = if slot == soundcraft_mix::INSTRUMENT_SLOT {
+            session.track(track).and_then(|t| t.instrument.clone())
+        } else {
+            session.track(track).and_then(|t| t.mixer.inserts.get(slot).cloned().flatten())
+        };
+        let Some(plugin) = picked.map(|i| i.plugin) else {
+            self.pending_open = None;
+            self.pending_open_since = None;
             return;
         };
-        if soundcraft_mix::is_third_party(&plugin)
+        let third_party = soundcraft_mix::is_third_party(&plugin);
+        let has_editor = self.player.as_ref().is_some_and(|p| p.has_editor(track, slot));
+        let since = *self.pending_open_since.get_or_insert_with(std::time::Instant::now);
+        let step = open_step(third_party, has_editor, since.elapsed());
+        if step == OpenStep::Wait {
+            // The engine has not built the instance yet: look again shortly.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        }
+        self.pending_open = None;
+        self.pending_open_since = None;
+        if step == OpenStep::Editor
             && let Some(p) = &self.player
-            && p.has_editor(track, slot)
         {
             match p.open_editor(track, slot) {
                 Ok(()) => return,
@@ -812,18 +836,31 @@ impl SoundApp {
         // The input reopens on the next record or monitor with the new choice.
         self.recorder = None;
         self.recorder_failed = false;
+        // The old player goes first: an ASIO driver can only be open once.
+        self.player = None;
         let player = soundcraft_playback::Player::with_config(self.engine.session_arc(), &self.ui.audio);
         player.locate(at);
         self.player = Some(player);
+        self.report_fallback();
         Ok(())
     }
 
-    /// Open the input device once (for recording and input monitoring) and feed the player.
+    /// Open the input device once (for recording and input monitoring) and feed the player. An
+    /// ASIO output has its input on the same driver: the recorder attaches to it instead.
     fn ensure_input(&mut self) {
         if self.recorder.is_some() || self.recorder_failed || self.player.is_none() {
             return;
         }
-        match soundcraft_playback::record::Recorder::open_with(&self.ui.audio) {
+        let tapped = self
+            .player
+            .as_ref()
+            .and_then(|p| p.input_tap())
+            .map(|(tap, name, rate, channels)| soundcraft_playback::record::Recorder::attach(&tap, name, rate, channels));
+        let opened = match tapped {
+            Some(r) => Ok(r),
+            None => soundcraft_playback::record::Recorder::open_with(&self.ui.audio),
+        };
+        match opened {
             Ok(r) => {
                 if let Some(p) = &self.player {
                     p.set_input(std::sync::Arc::clone(&r.monitor));
@@ -843,6 +880,7 @@ impl SoundApp {
         let Some(trouble) = p.trouble() else { return };
         let name = p.device_name.clone();
         let (cause, then) = match trouble {
+            OutputTrouble::Reset => return self.reset_output(&name),
             OutputTrouble::Bug => (
                 "the audio engine hit an internal error (see the log)".to_string(),
                 "Use Reconnect audio device in Setup ▸ Playback Engine, or restart SoundCraft.",
@@ -863,6 +901,46 @@ impl SoundApp {
         } else {
             format!("Audio output: {cause}. {then}")
         };
+    }
+
+    /// The driver asked to be reopened (its buffer size or rate changed): reopen it with the same
+    /// settings. While recording, the take is stopped and kept, and the user reconnects.
+    fn reset_output(&mut self, name: &str) {
+        /// A second reset this soon after an automatic reopen means the driver is looping; stop.
+        const RESET_LOOP_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+        let now = std::time::Instant::now();
+        let looping = self.last_reset.is_some_and(|t| now.duration_since(t) < RESET_LOOP_WINDOW);
+        let recording = self.engine.transport.recording;
+        if recording || self.is_playing() {
+            self.stop_play();
+        }
+        if looping {
+            self.ui.status = format!("“{name}” keeps asking to be reset; use Reconnect audio device in Setup ▸ Playback Engine.");
+            return;
+        }
+        if recording {
+            self.ui.status = format!(
+                "Recording stopped: “{name}” changed its settings. The take is kept up to there. Reconnect audio device in Setup ▸ Playback Engine, then record again."
+            );
+            return;
+        }
+        self.last_reset = Some(now);
+        self.ui.status = match self.apply_audio_config(self.ui.audio.clone()) {
+            Ok(()) => self
+                .player
+                .as_ref()
+                .and_then(|p| p.fallback_note.clone())
+                .unwrap_or_else(|| format!("“{name}” changed its settings; the audio device was reopened.")),
+            Err(e) => format!("“{name}” changed its settings; the audio device was not reopened: {e}"),
+        };
+    }
+
+    /// Shows why the output is not the device the user chose (an ASIO driver that did not open),
+    /// after the device was reopened.
+    fn report_fallback(&mut self) {
+        if let Some(note) = self.player.as_ref().and_then(|p| p.fallback_note.clone()) {
+            self.ui.status = note;
+        }
     }
 
     /// Stop recording, keeping the take, when the input device or the disk fails, and say as soon
@@ -907,7 +985,10 @@ impl SoundApp {
         }
         self.recorder = None;
         self.recorder_failed = false;
+        // The old player goes first: an ASIO driver can only be open once (as in `apply_audio_config`).
+        self.player = None;
         self.player = Some(Player::with_config(self.engine.session_arc(), &self.ui.audio));
+        self.report_fallback();
     }
 
     fn finish_recording(&mut self) {
@@ -919,13 +1000,17 @@ impl SoundApp {
         let Some(r) = &mut self.recorder else { return };
         let (takes, problem) = r.finish();
         let tracks = takes.len().max(1);
-        let plan = plan.unwrap_or_else(|| soundcraft_engine::io::Recording {
+        let mut plan = plan.unwrap_or_else(|| soundcraft_engine::io::Recording {
             start: self.record_start,
             pass: None,
             punch: self.punch,
             rate: 0,
             takes: Vec::new(),
         });
+        // The take holds what was played `offset` frames before it reached the input, so it is
+        // placed that much earlier (latency compensation; zero for cpal devices).
+        let offset = self.player.as_ref().map_or(0, |p| p.record_offset());
+        plan.start = soundcraft_playback::compensated_take_start(plan.start, offset);
         self.punch = None;
         self.autosaved_rev = 0;
         let ids = soundcraft_engine::io::place_recording(&mut self.engine, &plan, takes);
@@ -1178,7 +1263,7 @@ impl SoundApp {
                 p.update_session(self.engine.session_arc());
             }
         }
-        self.open_inserted();
+        self.open_inserted(ctx);
         self.autosave_changes();
         self.write_automation(ctx);
         self.autosave();
@@ -1326,6 +1411,51 @@ fn failed_plugin_status(s: &soundcraft_model::Session, track: TrackId, slot: usi
     let ins = if slot == soundcraft_mix::INSTRUMENT_SLOT { t.instrument.as_ref() } else { t.mixer.inserts.get(slot)?.as_ref() }?;
     let name = crate::mix_window::plugin_info(&ins.plugin).map_or(ins.plugin.as_str(), |p| p.name);
     Some(format!("{name} on {} put out invalid audio, so it is bypassed until playback stops or starts again.", t.name))
+}
+
+/// What to do with a plugin just picked from a menu (see `SoundApp::open_inserted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenStep {
+    /// Open the hosted plugin's own editor.
+    Editor,
+    /// The engine has not built the third-party instance yet; look again.
+    Wait,
+    /// Open SoundCraft's parameter window.
+    Parameters,
+}
+
+/// How long a third-party plugin's instance may take to appear before its editor is given up on.
+const OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The step for a picked plugin: a third-party plugin opens its editor (waiting up to `OPEN_WAIT`
+/// for the instance to exist), anything else, or one without an editor, its parameter window.
+fn open_step(third_party: bool, has_editor: bool, waited: std::time::Duration) -> OpenStep {
+    match (third_party, has_editor) {
+        (false, _) => OpenStep::Parameters,
+        (true, true) => OpenStep::Editor,
+        (true, false) if waited < OPEN_WAIT => OpenStep::Wait,
+        (true, false) => OpenStep::Parameters,
+    }
+}
+
+#[cfg(test)]
+mod open_step_tests {
+    use super::{OPEN_WAIT, OpenStep, open_step};
+    use std::time::Duration;
+
+    #[test]
+    fn a_hosted_plugin_opens_its_editor_or_waits_for_it_then_falls_back() {
+        assert_eq!(open_step(true, true, Duration::ZERO), OpenStep::Editor);
+        assert_eq!(open_step(true, false, Duration::ZERO), OpenStep::Wait, "the instance is not there yet");
+        assert_eq!(open_step(true, false, OPEN_WAIT - Duration::from_millis(1)), OpenStep::Wait);
+        assert_eq!(open_step(true, false, OPEN_WAIT), OpenStep::Parameters, "no editor after a second: the parameter window");
+    }
+
+    #[test]
+    fn a_built_in_plugin_never_waits_for_an_editor() {
+        assert_eq!(open_step(false, false, Duration::ZERO), OpenStep::Parameters);
+        assert_eq!(open_step(false, true, Duration::ZERO), OpenStep::Parameters);
+    }
 }
 
 #[cfg(test)]

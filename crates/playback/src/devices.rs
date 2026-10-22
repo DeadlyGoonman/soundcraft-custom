@@ -93,8 +93,9 @@ fn describe(d: &cpal::Device, default_name: Option<&str>, output: bool) -> Optio
 /// systems probe each device): call it when the settings window opens, not every frame.
 pub fn audio_systems() -> Vec<AudioSystem> {
     let default_id = cpal::default_host().id();
-    cpal::available_hosts()
+    let systems: Vec<AudioSystem> = cpal::available_hosts()
         .into_iter()
+        .filter(|id| !id.name().eq_ignore_ascii_case("ASIO"))
         .filter_map(|id| {
             let host = cpal::host_from_id(id).ok()?;
             let def_out = host.default_output_device().as_ref().and_then(device_name);
@@ -103,15 +104,79 @@ pub fn audio_systems() -> Vec<AudioSystem> {
             let inputs = host.input_devices().map(|ds| ds.filter_map(|d| describe(&d, def_in.as_deref(), false)).collect()).unwrap_or_default();
             Some(AudioSystem { name: id.name().to_string(), is_default: id == default_id, outputs, inputs })
         })
-        .collect()
+        .collect();
+    #[cfg(all(windows, feature = "asio"))]
+    let systems = systems.into_iter().chain(asio_system()).collect();
+    systems
+}
+
+/// Whether this build has ASIO: Windows, with the `asio` feature.
+pub fn asio_available() -> bool {
+    cfg!(all(windows, feature = "asio"))
+}
+
+/// The ASIO system: every installed driver, as an output and as an input device each.
+#[cfg(all(windows, feature = "asio"))]
+fn asio_system() -> Option<AudioSystem> {
+    let drivers = soundcraft_asio::drivers();
+    if drivers.is_empty() {
+        return None;
+    }
+    let (mut outputs, mut inputs) = (Vec::new(), Vec::new());
+    for name in drivers {
+        // A driver that will not load is still listed, with nothing to offer.
+        let (ins, outs, rates, buffers) = match soundcraft_asio::probe(&name) {
+            Ok(c) => (c.inputs.len(), c.outputs.len(), c.rates.clone(), Some((c.buffer_min, c.buffer_max))),
+            Err(e) => {
+                log::warn!("ASIO driver \"{name}\" cannot be probed: {e}");
+                (0, 0, Vec::new(), None)
+            }
+        };
+        let device = |channels: usize| DeviceInfo {
+            name: name.clone(),
+            is_default: false,
+            max_channels: u16::try_from(channels).unwrap_or(u16::MAX),
+            sample_rates: rates.clone(),
+            buffer_min: buffers.map(|b| b.0),
+            buffer_max: buffers.map(|b| b.1),
+        };
+        outputs.push(device(outs));
+        inputs.push(device(ins));
+    }
+    Some(AudioSystem { name: "ASIO".into(), is_default: false, outputs, inputs })
+}
+
+/// The ASIO driver to open for `cfg`, if any. That is the chosen system when it is ASIO, or no
+/// system chosen at all while a driver is installed (ASIO is preferred over the platform default:
+/// on Windows that is WASAPI, which routes through the system mixer and ignores the buffer size).
+/// Among the drivers: the named output when installed, else the first Focusrite, else the first.
+#[cfg(all(windows, feature = "asio"))]
+pub(crate) fn asio_driver(cfg: &AudioConfig) -> Option<String> {
+    if !cfg.system.as_deref().is_none_or(|s| s.eq_ignore_ascii_case("ASIO")) {
+        return None;
+    }
+    let drivers = soundcraft_asio::drivers();
+    if let Some(want) = cfg.output.as_deref()
+        && let Some(d) = drivers.iter().find(|d| d.as_str() == want)
+    {
+        return Some(d.clone());
+    }
+    drivers.iter().find(|d| d.to_lowercase().contains("focusrite")).or_else(|| drivers.first()).cloned()
+}
+
+/// Opens the ASIO driver's own control panel (routing, buffer size, clock).
+#[cfg(all(windows, feature = "asio"))]
+pub fn asio_control_panel(driver: &str) -> Result<(), String> {
+    soundcraft_asio::control_panel(driver).map_err(|e| e.to_string())
+}
+
+/// Without ASIO in this build there is no control panel to open.
+#[cfg(not(all(windows, feature = "asio")))]
+pub fn asio_control_panel(_driver: &str) -> Result<(), String> {
+    Err("ASIO is not available in this build".into())
 }
 
 /// The chosen audio system, else the default one.
-///
-/// When the user has not chosen a system, prefer an ASIO host over the platform default: on
-/// Windows the default is WASAPI, which routes through the system mixer and ignores the buffer
-/// size, so a recording interface is effectively unusable for tracking. ASIO is the path that
-/// actually puts the interface's inputs and outputs under the DAW's control.
 pub(crate) fn host(cfg: &AudioConfig) -> cpal::Host {
     cfg.system
         .as_deref()
@@ -121,22 +186,11 @@ pub(crate) fn host(cfg: &AudioConfig) -> cpal::Host {
             if let Some(s) = &cfg.system {
                 log::warn!("audio system `{s}` is not available; using the default");
             }
-            if cfg.system.is_none()
-                && let Some(asio) = cpal::available_hosts().into_iter().find(|id| id.name().eq_ignore_ascii_case("ASIO"))
-                && let Ok(h) = cpal::host_from_id(asio)
-            {
-                log::info!("no audio system chosen; using ASIO (an ASIO driver is installed)");
-                return h;
-            }
             cpal::default_host()
         })
 }
 
 /// The named output (or input) device of `host`, else its default device.
-///
-/// ASIO has no concept of a default device, so cpal returns the first one it finds — which is
-/// whatever the registry lists first, often a third-party driver rather than the recording
-/// interface. When no device is named, prefer a Focusrite driver when one is installed.
 pub(crate) fn device(host: &cpal::Host, name: Option<&str>, output: bool) -> Option<cpal::Device> {
     if let Some(want) = name {
         let found = if output { host.output_devices().ok() } else { host.input_devices().ok() }
@@ -145,11 +199,6 @@ pub(crate) fn device(host: &cpal::Host, name: Option<&str>, output: bool) -> Opt
             return found;
         }
         log::warn!("audio device `{want}` is not available; using the default");
-    } else if host.id().name() == "ASIO"
-        && let Some(mut devs) = (if output { host.output_devices().ok() } else { host.input_devices().ok() })
-        && let Some(d) = devs.find(|d| device_name(d).is_some_and(|n| n.to_lowercase().contains("focusrite")))
-    {
-        return Some(d);
     }
     if output { host.default_output_device() } else { host.default_input_device() }
 }
