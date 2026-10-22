@@ -84,6 +84,9 @@ impl Imp {
     pub(crate) fn reset_requested(&self) -> bool {
         match *self {}
     }
+    pub(crate) fn failed(&self) -> bool {
+        match *self {}
+    }
     pub(crate) fn control_panel(&self) -> Result<(), Error> {
         match *self {}
     }
@@ -148,6 +151,12 @@ impl AsioStream {
     /// a sample-rate change. The owner should drop and reopen the stream.
     pub fn reset_requested(&self) -> bool {
         self.imp.reset_requested()
+    }
+
+    /// True once a panic escaped the audio callback. The stream then plays silence and should be
+    /// reported to the user and reopened.
+    pub fn failed(&self) -> bool {
+        self.imp.failed()
     }
 
     /// Opens the driver's own control panel and waits until it is closed.
