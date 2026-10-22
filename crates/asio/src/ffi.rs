@@ -121,6 +121,9 @@ static CALLBACKS: Callbacks = Callbacks { buffer_switch, sample_rate_changed, me
 pub(crate) struct Flags {
     reset: AtomicBool,
     failed: AtomicBool,
+    /// Set while the stream is being torn down: blocks are silenced and the callback is skipped,
+    /// so the driver loops silence instead of the last block.
+    quiet: AtomicBool,
 }
 
 /// The state the driver's callbacks work on. Heap-allocated with `Box::into_raw`, installed in
@@ -210,7 +213,7 @@ fn process_block(index: i32) {
     // It is cleared before the context is freed, and the driver serialises its buffer callbacks, so
     // this is the only live mutable reference.
     let ctx = unsafe { &mut *p };
-    if ctx.flags.failed.load(Ordering::Relaxed) {
+    if ctx.flags.failed.load(Ordering::Relaxed) || ctx.flags.quiet.load(Ordering::Acquire) {
         ctx.silence(idx);
         return;
     }
@@ -421,11 +424,19 @@ struct Live {
     ctx: *mut Context,
     created: bool,
     started: bool,
+    /// Two buffer periods, in ms: how long to keep silence flowing before `stop()`.
+    quiet_ms: u64,
+}
+
+/// Two buffer periods in milliseconds, clamped to 5..=100 ms.
+fn quiet_period_ms(rate: u32, frames: u32) -> u64 {
+    let ms = u64::from(frames).saturating_mul(2).saturating_mul(1000) / u64::from(rate.max(1));
+    ms.clamp(5, 100)
 }
 
 impl Live {
     fn empty() -> Live {
-        Live { co: false, drv: None, ctx: null_mut(), created: false, started: false }
+        Live { co: false, drv: None, ctx: null_mut(), created: false, started: false, quiet_ms: 5 }
     }
 
     /// Initialises COM on this thread, creates the driver and calls its `init`.
@@ -524,6 +535,7 @@ impl Live {
         ACTIVE.store(raw, Ordering::Release);
         check(drv.start(), "start")?;
         self.started = true;
+        self.quiet_ms = quiet_period_ms(sample_rate, u32::try_from(frames).unwrap_or(0));
 
         log::info!("asio: {} open at {sample_rate} Hz, {frames} frames, {open_in} in / {open_out} out, latency {lat_in}/{lat_out}", job.name);
         Ok(Info {
@@ -543,6 +555,10 @@ impl Drop for Live {
         if self.started
             && let Some(d) = self.drv.as_ref()
         {
+            // Drivers loop the last half-buffer they were given, so keep silence flowing for two
+            // buffer periods before stopping. The callback is skipped while quiet.
+            with_flags(|f| f.quiet.store(true, Ordering::Release));
+            thread::sleep(Duration::from_millis(self.quiet_ms));
             let _ = d.stop();
         }
         self.started = false;
@@ -895,6 +911,11 @@ impl Stream {
         self.info.flags.reset.load(Ordering::Acquire)
     }
 
+    /// True once a panic escaped the audio callback; the stream then plays silence.
+    pub(crate) fn failed(&self) -> bool {
+        self.info.flags.failed.load(Ordering::Acquire)
+    }
+
     pub(crate) fn control_panel(&self) -> Result<(), Error> {
         send_control(&self.tx)
     }
@@ -956,5 +977,18 @@ pub(crate) fn open(cfg: &StreamConfig, cb: Box<dyn Callback>) -> Result<Stream, 
             lock(&OPEN).take();
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quiet_period_ms;
+
+    #[test]
+    fn the_quiet_period_is_two_buffers_clamped_to_5_to_100_ms() {
+        assert_eq!(quiet_period_ms(48_000, 512), 21, "two 512-frame buffers at 48 kHz");
+        assert_eq!(quiet_period_ms(44_100, 64), 5, "a tiny buffer is still given 5 ms");
+        assert_eq!(quiet_period_ms(48_000, 1 << 18), 100, "a huge buffer is capped at 100 ms");
+        assert_eq!(quiet_period_ms(0, 512), 100, "a zero rate cannot divide by zero");
     }
 }
