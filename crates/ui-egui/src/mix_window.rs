@@ -706,6 +706,12 @@ fn drag_label(ctx: &egui::Context, at: egui::Pos2, name: &str) {
 /// with them. Their editor windows close and the plugin windows follow their plugins.
 fn move_insert(app: &mut SoundApp, id: TrackId, from: usize, to: usize) {
     app.capture_plugin_states();
+    // Both live instances go: with the same plugin in both slots, the old ones would otherwise stay
+    // where they were. The next update recreates each from the session, in its new slot.
+    if let Some(p) = app.player.as_ref() {
+        p.forget_instance(id, from);
+        p.forget_instance(id, to);
+    }
     match app.run("mix.insert_move", json!({"track": id.0, "from": from, "to": to})) {
         Ok(_) => {
             if let Some(p) = app.player.as_ref() {
@@ -741,6 +747,16 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
         if ui.button("no insert").clicked() {
             run_pick(app, ui, "mix.insert_remove", json!({"track": id.0, "slot": slot}));
         }
+        let third_party = app
+            .engine
+            .session()
+            .track(id)
+            .and_then(|t| t.mixer.inserts.get(slot).cloned().flatten())
+            .is_some_and(|i| soundcraft_mix::is_third_party(&i.plugin));
+        if third_party && ui.button("SoundCraft Parameters…").clicked() {
+            open_parameters(app, id, slot);
+            ui.close();
+        }
         ui.separator();
     }
     let mut cats: Vec<soundcraft_dsp::Category> = Vec::new();
@@ -771,7 +787,7 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     let search = MenuSearch::show(ui, egui::Id::new(("instrument-search", id.0)), "Search instruments…");
     if search.typing() {
         if let Some(plugin) = plugin_search(ui, &search, true) {
-            run_pick(app, ui, "mix.instrument", json!({"track": id.0, "plugin": plugin}));
+            pick_instrument(app, ui, id, &plugin);
         }
         return;
     }
@@ -779,9 +795,11 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     if let Some(info) = current.as_ref().and_then(|i| plugin_info(&i.plugin)) {
         ui.label(egui::RichText::new(info.name).strong());
         if current.as_ref().is_some_and(|i| !soundcraft_mix::is_third_party(&i.plugin)) && ui.button("Edit Parameters…").clicked() {
-            if !app.ui.plugin_windows.contains(&(id, slot)) {
-                app.ui.plugin_windows.push((id, slot));
-            }
+            open_parameters(app, id, slot);
+            ui.close();
+        }
+        if current.as_ref().is_some_and(|i| soundcraft_mix::is_third_party(&i.plugin)) && ui.button("SoundCraft Parameters…").clicked() {
+            open_parameters(app, id, slot);
             ui.close();
         }
         if let Some(p) = &app.player
@@ -813,7 +831,7 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
         picked = Some(p);
     }
     if let Some(plugin) = picked {
-        run_pick(app, ui, "mix.instrument", json!({"track": id.0, "plugin": plugin}));
+        pick_instrument(app, ui, id, &plugin);
     }
 }
 
@@ -825,6 +843,24 @@ fn pick_insert(app: &mut SoundApp, ui: &Ui, id: TrackId, slot: usize, plugin: &s
         Err(e) => app.ui.status = e,
     }
     ui.close();
+}
+
+/// Sets the instrument of an instrument track. A hosted instrument is then opened as an insert's
+/// is (`SoundApp::open_inserted`): its own editor. A built-in one opens nothing, as before.
+fn pick_instrument(app: &mut SoundApp, ui: &Ui, id: TrackId, plugin: &str) {
+    match app.run("mix.instrument", json!({"track": id.0, "plugin": plugin})) {
+        Ok(_) if soundcraft_mix::is_third_party(plugin) => app.pending_open = Some((id, soundcraft_mix::INSTRUMENT_SLOT)),
+        Ok(_) => {}
+        Err(e) => app.ui.status = e,
+    }
+    ui.close();
+}
+
+/// Shows SoundCraft's parameter window for a slot.
+fn open_parameters(app: &mut SoundApp, id: TrackId, slot: usize) {
+    if !app.ui.plugin_windows.contains(&(id, slot)) {
+        app.ui.plugin_windows.push((id, slot));
+    }
 }
 
 /// Runs a menu's pick, shows its error in the status line and closes the menu.
@@ -1366,6 +1402,37 @@ fn send_route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, cu
     }
 }
 
+/// The input choices for a track: `(label, route value)`. With the interface's channel `names`, each
+/// input is labelled with its name (`In 3 · Loopback 1`); without names, the `count` inputs are listed
+/// (the open recorder's channel count, else 8). A
+/// stereo track also gets the pairs (`In 1-2`, `In 3-4`, …) first, labelled with both names. The
+/// values are the routes the engine maps: `In N` is channel N, `In N-M` a stereo pair from N.
+fn input_entries(names: &[String], count: usize, stereo: bool) -> Vec<(String, String)> {
+    let count = if names.is_empty() { count.max(1) } else { names.len() };
+    let name = |n: usize| n.checked_sub(1).and_then(|i| names.get(i)).cloned();
+    let mut out = Vec::new();
+    if stereo {
+        for first in (1..count).step_by(2) {
+            let second = first + 1;
+            let value = format!("In {first}-{second}");
+            let label = match (name(first), name(second)) {
+                (Some(a), Some(b)) => format!("{value} · {a}/{b}"),
+                _ => value.clone(),
+            };
+            out.push((label, value));
+        }
+    }
+    for n in 1..=count {
+        let value = format!("In {n}");
+        let label = match name(n) {
+            Some(a) => format!("{value} · {a}"),
+            None => value.clone(),
+        };
+        out.push((label, value));
+    }
+    out
+}
+
 fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
     let key = if input { "input" } else { "output" };
     let cmd = if input { "track.input" } else { "track.output" };
@@ -1379,9 +1446,13 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
         ui.close();
     }
     if input {
-        for i in 1..=8 {
-            if ui.button(format!("In {i}")).clicked() {
-                let _ = app.run(cmd, json!({"track": id.0, key: format!("In {i}")}));
+        let names = app.player.as_ref().map(|p| p.input_names()).unwrap_or_default();
+        let stereo = app.engine.session().track(id).is_some_and(|t| t.channels() == 2);
+        // Without driver names, the open recorder's input count (else the usual 8).
+        let count = app.recorder.as_ref().map_or(8, |r| r.channels);
+        for (label, value) in input_entries(&names, count, stereo) {
+            if ui.button(label).clicked() {
+                let _ = app.run(cmd, json!({"track": id.0, key: value}));
                 ui.close();
             }
         }
@@ -1407,7 +1478,43 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{dragged_send_db, editable_readout, parse_db, parse_pan};
+    use super::{dragged_send_db, editable_readout, input_entries, parse_db, parse_pan};
+
+    #[test]
+    fn input_menu_shows_the_interfaces_channel_names_when_known() {
+        let names: Vec<String> = ["Mic 1", "Mic 2", "Loopback 1", "Loopback 2"].iter().map(|s| s.to_string()).collect();
+        let mono: Vec<String> = input_entries(&names, 8, false).into_iter().map(|e| e.0).collect();
+        assert_eq!(mono, ["In 1 · Mic 1", "In 2 · Mic 2", "In 3 · Loopback 1", "In 4 · Loopback 2"]);
+        let stereo = input_entries(&names, 8, true);
+        assert_eq!(stereo[0], ("In 1-2 · Mic 1/Mic 2".to_string(), "In 1-2".to_string()));
+        assert_eq!(stereo[1], ("In 3-4 · Loopback 1/Loopback 2".to_string(), "In 3-4".to_string()));
+        assert_eq!(stereo.len(), 2 + 4, "pairs first, then the single inputs");
+        assert_eq!(stereo[2], ("In 1 · Mic 1".to_string(), "In 1".to_string()), "the values are the engine's routes");
+    }
+
+    #[test]
+    fn input_menu_keeps_inputs_1_to_8_without_names() {
+        let mono: Vec<String> = input_entries(&[], 8, false).into_iter().map(|e| e.1).collect();
+        assert_eq!(mono, (1..=8).map(|n| format!("In {n}")).collect::<Vec<_>>());
+        let stereo: Vec<String> = input_entries(&[], 8, true).into_iter().map(|e| e.1).collect();
+        assert_eq!(stereo[..4], ["In 1-2", "In 3-4", "In 5-6", "In 7-8"].map(String::from));
+        assert_eq!(stereo.len(), 4 + 8);
+    }
+
+    #[test]
+    fn input_menu_uses_the_recorders_channel_count_without_names() {
+        let mono: Vec<String> = input_entries(&[], 2, false).into_iter().map(|e| e.1).collect();
+        assert_eq!(mono, ["In 1", "In 2"]);
+        let stereo: Vec<String> = input_entries(&[], 2, true).into_iter().map(|e| e.1).collect();
+        assert_eq!(stereo, ["In 1-2", "In 1", "In 2"]);
+    }
+
+    #[test]
+    fn input_menu_pairs_never_run_past_the_last_input() {
+        let names: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
+        let stereo: Vec<String> = input_entries(&names, 8, true).into_iter().map(|e| e.1).collect();
+        assert_eq!(stereo, ["In 1-2", "In 1", "In 2", "In 3"]);
+    }
     use egui::{Event, Modifiers, PointerButton, Rect, pos2, vec2};
 
     #[test]

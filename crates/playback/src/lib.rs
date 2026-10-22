@@ -25,7 +25,7 @@
 pub mod devices;
 pub mod record;
 
-pub use devices::AudioConfig;
+pub use devices::{AudioConfig, asio_available, asio_control_panel};
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
@@ -64,6 +64,9 @@ enum Cmd {
     /// Where the callback sends the snapshots it replaces (freeing one takes thousands of frees).
     OldSessions(SyncSender<Arc<Session>>),
     Input(Arc<record::InputRing>),
+    /// The device runs at another rate than the one the engine was built for (ASIO's rate).
+    #[cfg(all(windows, feature = "asio"))]
+    DeviceRate(f64),
     Recording(bool),
     Play {
         from: Samples,
@@ -91,6 +94,9 @@ pub enum OutputTrouble {
     Gone,
     /// The device stopped asking for audio while playing.
     Stalled,
+    /// The driver asked to be reopened (a buffer size or sample-rate change, or a driver reset).
+    /// The owner should open the device again with the same settings.
+    Reset,
 }
 
 /// How the audio output is doing, for the UI.
@@ -221,6 +227,8 @@ impl AudioState {
         while let Ok(c) = self.rx.try_recv() {
             match c {
                 Cmd::Input(r) => self.input = Some(r),
+                #[cfg(all(windows, feature = "asio"))]
+                Cmd::DeviceRate(rate) => self.device_rate = rate,
                 Cmd::Recording(r) => self.recording = r,
                 Cmd::Session(s, instances) => {
                     changed = true;
@@ -476,14 +484,47 @@ pub struct Player {
     _stream: Option<cpal::Stream>,
     #[cfg(target_arch = "wasm32")]
     _stream: Option<cpal::Stream>,
+    /// The native ASIO stream, when the output is an ASIO driver.
+    #[cfg(all(windows, feature = "asio"))]
+    asio: Option<soundcraft_asio::AsioStream>,
+    /// The ASIO input that recorders attach to (`None` for cpal devices).
+    input_tap: Option<Arc<record::InputTap>>,
+    /// Frames a take is placed earlier by (see [`Player::record_offset`]).
+    offset: u32,
+    /// Input channels the ASIO stream passes to its recorders (0 otherwise).
+    input_channels: usize,
+    /// The driver's reset request has been reported.
+    reset_reported: AtomicBool,
     pub device_name: String,
     pub device_rate: u32,
     /// Output channels the device was opened with (0 for the silent clock).
     pub device_channels: u16,
     /// The device buffer in frames when one was chosen (`None`: the device default).
     pub device_buffer: Option<u32>,
+    /// Input and output latency in frames at the device rate, as the driver reports them (`None`
+    /// for cpal devices and the silent clock).
+    pub device_latency: Option<(u32, u32)>,
     /// True when no audio device could be opened (silent clock).
     pub silent: bool,
+    /// Why the output is not the ASIO driver the user chose, when it fell back (shown in the status line).
+    pub fallback_note: Option<String>,
+}
+
+/// Frames of device latency (input plus output, at the device's rate) at the session rate: how far
+/// a take is placed earlier, so that an overdub lines up with what was already played.
+pub fn record_offset_frames(input: u32, output: u32, device_rate: u32, session_rate: u32) -> u32 {
+    if device_rate == 0 {
+        return 0;
+    }
+    let frames = u64::from(input) + u64::from(output);
+    let scaled = (frames * u64::from(session_rate) + u64::from(device_rate) / 2) / u64::from(device_rate);
+    u32::try_from(scaled).unwrap_or(u32::MAX)
+}
+
+/// Where a take recorded from `start` goes once it is compensated by `offset` frames: earlier, but
+/// never before the start of the session.
+pub fn compensated_take_start(start: Samples, offset: u32) -> Samples {
+    start.saturating_sub(i64::from(offset)).max(0)
 }
 
 impl Player {
@@ -495,7 +536,9 @@ impl Player {
     /// Open the output device `cfg` chooses (system, device, rate, buffer size), falling back to the
     /// defaults for whatever is unavailable. Never fails: without a device it runs a silent clock.
     pub fn with_config(session: Arc<Session>, cfg: &AudioConfig) -> Player {
-        let p = Player::open(Arc::clone(&session), cfg);
+        let mut note = None;
+        let mut p = Player::open(Arc::clone(&session), cfg, &mut note);
+        p.fallback_note = note;
         p.side().return_old_sessions(&p.tx);
         // Hand the initial session's third-party plugins over.
         p.update_session(session);
@@ -505,6 +548,19 @@ impl Player {
     /// What stopped the audio output, once: a bug in the engine, or the device went away or
     /// stopped asking for audio while playing.
     pub fn trouble(&self) -> Option<OutputTrouble> {
+        #[cfg(all(windows, feature = "asio"))]
+        let reset = self.asio.as_ref().is_some_and(|s| s.reset_requested());
+        #[cfg(not(all(windows, feature = "asio")))]
+        let reset = false;
+        #[cfg(all(windows, feature = "asio"))]
+        if self.asio.as_ref().is_some_and(|s| s.failed()) {
+            // A panic escaped the driver callback: the stream plays silence from now on.
+            self.fault.failed.store(true, Ordering::Relaxed);
+            self.shared.playing.store(false, Ordering::Relaxed);
+        }
+        if reset && !self.reset_reported.swap(true, Ordering::Relaxed) {
+            return Some(OutputTrouble::Reset);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         let stalled = {
             let playing = self.shared.playing.load(Ordering::Relaxed) && !self.silent;
@@ -519,7 +575,9 @@ impl Player {
         self.side.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn open(session: Arc<Session>, cfg: &AudioConfig) -> Player {
+    fn open(session: Arc<Session>, cfg: &AudioConfig, note: &mut Option<String>) -> Player {
+        #[cfg(not(all(windows, feature = "asio")))]
+        let _ = note;
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
@@ -530,6 +588,22 @@ impl Player {
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
         let side_rate = session.sample_rate.as_f64() as f32;
         let new_side = |garbage: Receiver<Vec<Box<dyn Plugin>>>| Mutex::new(Side::new(side_rate, garbage));
+        // An ASIO driver first; when it does not open, the audio system's own device (below).
+        #[cfg(all(windows, feature = "asio"))]
+        let fallback: AudioConfig;
+        #[cfg(all(windows, feature = "asio"))]
+        let cfg = match devices::asio_driver(cfg) {
+            Some(driver) => match Player::open_asio(&driver, &session, cfg, &shared) {
+                Ok(player) => return player,
+                Err(e) => {
+                    log::warn!("ASIO driver \"{driver}\" did not open ({e}); using the default audio system");
+                    *note = Some(format!("ASIO driver “{driver}” did not open ({e}); using the default audio system instead."));
+                    fallback = AudioConfig { system: Some(cpal::default_host().id().name().into()), ..cfg.clone() };
+                    &fallback
+                }
+            },
+            None => cfg,
+        };
         match open_device(want, want_ch, cfg) {
             Ok((device, config, format, name)) => {
                 // The chosen buffer size first; if the device refuses it, its default.
@@ -575,11 +649,19 @@ impl Player {
                             tx,
                             side: new_side(grx),
                             _stream: Some(stream),
+                            #[cfg(all(windows, feature = "asio"))]
+                            asio: None,
+                            input_tap: None,
+                            offset: 0,
+                            input_channels: 0,
+                            reset_reported: AtomicBool::new(false),
                             device_name: name,
                             device_rate: rate,
                             device_channels: config.channels,
                             device_buffer: buffer,
+                            device_latency: None,
                             silent: false,
+                            fallback_note: None,
                         }
                     }
                     None => {
@@ -652,11 +734,19 @@ impl Player {
             tx,
             side,
             _stream: None,
+            #[cfg(all(windows, feature = "asio"))]
+            asio: None,
+            input_tap: None,
+            offset: 0,
+            input_channels: 0,
+            reset_reported: AtomicBool::new(false),
             device_name: "No audio device (silent)".into(),
             device_rate: rate,
             device_channels: 0,
             device_buffer: None,
+            device_latency: None,
             silent: true,
+            fallback_note: None,
         }
     }
 
@@ -675,12 +765,118 @@ impl Player {
             tx,
             side,
             _stream: None,
+            input_tap: None,
+            offset: 0,
+            input_channels: 0,
+            reset_reported: AtomicBool::new(false),
             device_name: "No audio device".into(),
             device_rate: session.sample_rate.hz(),
             device_channels: 0,
             device_buffer: None,
+            device_latency: None,
             silent: true,
+            fallback_note: None,
         }
+    }
+
+    /// Opens the ASIO driver `driver`. Its callback renders the mix on the driver's thread and feeds
+    /// the driver's input to the [`record::InputTap`] that recorders attach to.
+    #[cfg(all(windows, feature = "asio"))]
+    fn open_asio(driver: &str, session: &Arc<Session>, cfg: &AudioConfig, shared: &Arc<Shared>) -> Result<Player, String> {
+        let session_rate = session.sample_rate.hz();
+        let asked_rate = cfg.sample_rate.unwrap_or(session_rate);
+        let stream_cfg = soundcraft_asio::StreamConfig {
+            driver: driver.to_owned(),
+            sample_rate: Some(asked_rate),
+            buffer_frames: cfg.buffer_size,
+            max_outputs: main_channels(session).max(2),
+            max_inputs: 64,
+        };
+        let (tx, rx) = channel();
+        let (gtx, grx) = channel();
+        let fault = Arc::new(Fault::default());
+        let tap = Arc::new(record::InputTap::default());
+        let state = AudioState::new(rx, Arc::clone(shared), Arc::clone(session), f64::from(asked_rate), gtx);
+        let callback = AsioCallback { state, fault: Arc::clone(&fault), shared: Arc::clone(shared), tap: Arc::clone(&tap) };
+        let stream = soundcraft_asio::AsioStream::open(&stream_cfg, Box::new(callback)).map_err(|e| e.to_string())?;
+        let rate = stream.sample_rate();
+        if rate != asked_rate {
+            log::info!("ASIO driver \"{driver}\" runs at {rate} Hz, not {asked_rate} Hz; the mix is resampled");
+            let _ = tx.send(Cmd::DeviceRate(f64::from(rate)));
+        }
+        let buffer = stream.buffer_frames();
+        let (input, output) = stream.latency();
+        let offset = record_offset_frames(input, output, rate, session_rate);
+        let (inputs, outputs) = (stream.input_channels(), stream.output_channels());
+        tap.set_buffer_frames(buffer);
+        log::info!(
+            "audio device: {driver} (ASIO) @ {rate} Hz, {inputs} in / {outputs} out, buffer {buffer}, latency {input}/{output}; record offset {offset} samples"
+        );
+        Ok(Player {
+            shared: Arc::clone(shared),
+            fault,
+            watch: Mutex::new(None),
+            tx,
+            side: Mutex::new(Side::new(session.sample_rate.as_f64() as f32, grx)),
+            _stream: None,
+            asio: Some(stream),
+            input_tap: Some(tap),
+            offset,
+            input_channels: inputs,
+            reset_reported: AtomicBool::new(false),
+            device_name: driver.to_owned(),
+            device_rate: rate,
+            device_channels: u16::try_from(outputs).unwrap_or(u16::MAX),
+            device_buffer: Some(buffer),
+            device_latency: Some((input, output)),
+            silent: false,
+            fallback_note: None,
+        })
+    }
+
+    /// The input the recorder attaches to, when the output is an ASIO driver: the tap, the driver's
+    /// name, its input rate and its input channel count.
+    pub fn input_tap(&self) -> Option<(Arc<record::InputTap>, String, u32, usize)> {
+        let tap = self.input_tap.as_ref()?;
+        if self.input_channels == 0 {
+            return None;
+        }
+        Some((Arc::clone(tap), self.device_name.clone(), self.device_rate, self.input_channels))
+    }
+
+    /// The ASIO driver's input channel names for the opened inputs, in channel order (empty for
+    /// cpal devices).
+    pub fn input_names(&self) -> Vec<String> {
+        #[cfg(all(windows, feature = "asio"))]
+        {
+            if let Some(s) = &self.asio {
+                return s.caps().inputs.iter().take(s.input_channels()).cloned().collect();
+            }
+        }
+        Vec::new()
+    }
+
+    /// How many frames (at the session rate) a take recorded now must be placed earlier by: the
+    /// device's reported input plus output latency. Zero for cpal devices.
+    pub fn record_offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// Opens the driver's own control panel (routing, buffer size, clock), for an ASIO device.
+    pub fn control_panel(&self) -> Result<(), String> {
+        #[cfg(all(windows, feature = "asio"))]
+        {
+            if let Some(s) = &self.asio {
+                return s.control_panel().map_err(|e| e.to_string());
+            }
+        }
+        Err("not an ASIO device".into())
+    }
+
+    /// Drops the live plugin instance of `(track, slot)`, so the next [`Player::update_session`]
+    /// creates it again from the session (used when two inserts swap plugins).
+    pub fn forget_instance(&self, track: TrackId, slot: usize) {
+        self.side().forget((track, slot));
     }
 
     /// Sends a new session snapshot to the audio thread, with freshly created (state-restored,
@@ -1029,6 +1225,27 @@ fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<(cpal:
     Ok((device, config, format, name))
 }
 
+/// The ASIO duplex callback: the driver's input goes to the recorder tap, and the mix renders into
+/// its output. It runs on the driver's thread, so it only `try_lock`s and never allocates.
+#[cfg(all(windows, feature = "asio"))]
+struct AsioCallback {
+    state: AudioState,
+    fault: Arc<Fault>,
+    shared: Arc<Shared>,
+    tap: Arc<record::InputTap>,
+}
+
+#[cfg(all(windows, feature = "asio"))]
+impl soundcraft_asio::Callback for AsioCallback {
+    fn process(&mut self, input: &[f32], output: &mut [f32], frames: usize) {
+        mark_audio_thread();
+        self.tap.feed(input);
+        // The driver hands over `frames` frames of `channels` interleaved samples each.
+        let channels = output.len().checked_div(frames).unwrap_or(1).max(1);
+        guarded_block(&self.fault, &self.shared, output, |out| self.state.fill(out, channels));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1329,6 +1546,43 @@ mod tests {
         tx.send(Cmd::Session(Arc::new(s44), Vec::new())).unwrap();
         st.fill(&mut out, 2);
         assert_eq!(grx.try_recv().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_offset_is_the_device_latency_at_the_session_rate() {
+        // Same rate: input plus output frames, as they are.
+        assert_eq!(record_offset_frames(128, 128, 48_000, 48_000), 256);
+        // 44.1 kHz device under a 48 kHz session: 256 frames become 278.6, rounded to 279.
+        assert_eq!(record_offset_frames(128, 128, 44_100, 48_000), 279);
+        // Nothing reported (cpal, or an unknown rate): no compensation.
+        assert_eq!(record_offset_frames(0, 0, 48_000, 48_000), 0);
+        assert_eq!(record_offset_frames(128, 128, 0, 48_000), 0);
+    }
+
+    #[test]
+    fn a_compensated_take_starts_earlier_but_never_before_zero() {
+        assert_eq!(compensated_take_start(10_000, 256), 9_744);
+        assert_eq!(compensated_take_start(100, 256), 0, "clamped to the start of the session");
+        assert_eq!(compensated_take_start(5_000, 0), 5_000, "no offset, no change");
+    }
+
+    /// Swapping two inserts that hold the same third-party plugin: both slots must be dropped, so
+    /// the next update recreates both instances in their new places.
+    #[test]
+    fn forgetting_both_slots_of_a_swap_recreates_both_instances() {
+        use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+        let mut side = Side::new(48_000.0, channel().1);
+        let mut s = soundcraft_model::Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:does.not.exist"));
+        s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::new("clap:does.not.exist"));
+        side.prepare(&s);
+        assert_eq!(side.shadow.len(), 2);
+        side.forget((t, 0));
+        side.forget((t, 1));
+        assert!(side.shadow.is_empty(), "both live instances are dropped");
+        side.prepare(&s);
+        assert!(side.shadow.contains_key(&(t, 0)) && side.shadow.contains_key(&(t, 1)), "and created again");
     }
 
     #[test]
