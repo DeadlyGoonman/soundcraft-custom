@@ -2,7 +2,7 @@
 
 use crate::dialogs::Dialog;
 use crate::spot::Spot;
-use crate::theme::{Tokens, bold, clip_colors, regular, rgb};
+use crate::theme::{TRACK_TINT_EMPTY, TRACK_TINT_SECTION, Tokens, bold, clip_colors, regular, rgb, track_tint};
 use crate::widgets::{groove, level_pos, meter_pos, raised_key, shade};
 use crate::{Gesture, SoundApp, toolbar};
 use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
@@ -1302,7 +1302,7 @@ fn header_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, col: &str, r: R
 fn io_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, r: Rect) {
     let t = Tokens::current();
     let id = track.id;
-    ui.painter().rect_filled(r, 0.0, t.slot_well);
+    ui.painter().rect_filled(r, 0.0, track_tint(t.slot_well, track.color, TRACK_TINT_SECTION));
     let ui = column_ui(ui, "io", r);
     let row = |y: f32, h: f32| (r.height() >= y + h + 1.0).then_some(Rect::from_min_size(r.min + vec2(7.0, y), vec2(r.width() - 14.0, h)));
     if let Some(input) = row(4.0, 15.0) {
@@ -1345,7 +1345,7 @@ fn io_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, r: Rect) {
 /// on a neutral well, or on tracks too short for three of them, a row of squares.
 fn plugin_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, col: &str, r: Rect) {
     let t = Tokens::current();
-    ui.painter().rect_filled(r, 0.0, t.slot_well);
+    ui.painter().rect_filled(r, 0.0, track_tint(t.slot_well, track.color, TRACK_TINT_SECTION));
     let rows = if r.height() < 16.0 { 0 } else { ((r.height() - 16.0) / 18.0) as usize + 1 };
     let cell = |row: usize| Rect::from_min_size(pos2(r.min.x + 4.0, r.min.y + 1.0 + row as f32 * 18.0), vec2(r.width() - 8.0, 15.0));
     let square = |i: usize, row: usize| Rect::from_min_size(cell(row).min + vec2(i as f32 * 14.0, 0.0), vec2(10.0, 15.0));
@@ -1368,7 +1368,7 @@ fn plugin_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, col: &str, r: R
     }
     if rows == 2 {
         for i in 0..5 {
-            ui.painter().rect_filled(square(i, 1), 1.5, t.slot_empty);
+            ui.painter().rect_filled(square(i, 1), 1.5, track_tint(t.slot_empty, track.color, TRACK_TINT_EMPTY));
         }
     }
 }
