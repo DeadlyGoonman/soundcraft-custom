@@ -124,11 +124,15 @@ fn asio_system() -> Option<AudioSystem> {
     }
     let (mut outputs, mut inputs) = (Vec::new(), Vec::new());
     for name in drivers {
-        // A driver that will not load is still listed, with nothing to offer.
+        // A driver that will not load (or is not loaded while another ASIO driver runs) is still
+        // listed, with nothing to offer.
         let (ins, outs, rates, buffers) = match soundcraft_asio::probe(&name) {
             Ok(c) => (c.inputs.len(), c.outputs.len(), c.rates.clone(), Some((c.buffer_min, c.buffer_max))),
             Err(e) => {
-                log::warn!("ASIO driver \"{name}\" cannot be probed: {e}");
+                match e {
+                    soundcraft_asio::Error::Busy(_) => log::debug!("ASIO driver \"{name}\" has no details while another ASIO driver is open: {e}"),
+                    _ => log::warn!("ASIO driver \"{name}\" cannot be probed: {e}"),
+                }
                 (0, 0, Vec::new(), None)
             }
         };

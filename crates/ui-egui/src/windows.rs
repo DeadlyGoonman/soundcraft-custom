@@ -523,6 +523,19 @@ fn chosen_device<'a>(devices: &'a [DeviceInfo], name: Option<&str>) -> Option<&'
     name.and_then(|n| devices.iter().find(|d| d.name == n)).or_else(|| devices.iter().find(|d| d.is_default))
 }
 
+/// Under the Playback Engine's choices: when the selected ASIO driver has no details because it is
+/// not the open one (only one ASIO driver can be loaded at a time), say when they will appear.
+fn asio_draft_note(systems: &[AudioSystem], draft: &AudioConfig, open: Option<&str>) -> Option<&'static str> {
+    let open = open?;
+    let sys = chosen_system(systems, draft)?;
+    if !sys.name.eq_ignore_ascii_case("ASIO") {
+        return None;
+    }
+    let dev = chosen_device(&sys.outputs, draft.output.as_deref())?;
+    let no_details = dev.max_channels == 0 && dev.sample_rates.is_empty();
+    (no_details && dev.name != open).then_some("Details appear after Apply (only one ASIO driver can be loaded at a time).")
+}
+
 fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, devices: &[DeviceInfo]) {
     let default = devices.iter().find(|d| d.is_default).map_or("none".to_string(), |d| d.name.clone());
     let shown = value.clone().unwrap_or_else(|| format!("Default ({default})"));
@@ -606,6 +619,10 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
             number_combo(ui, "pe-buffer", &mut draft.buffer_size, &buffers, "samples");
             ui.end_row();
         });
+        if let Some(note) = asio_draft_note(&systems, &draft, app.player.as_ref().filter(|p| p.input_tap().is_some()).map(|p| p.device_name.as_str()))
+        {
+            ui.label(egui::RichText::new(note).small().color(t.text_dim));
+        }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if ui.button("Refresh devices").clicked() {

@@ -107,6 +107,8 @@ struct Fault {
     gone: AtomicBool,
     /// Blocks so far, to tell a device that stopped asking for audio.
     beats: std::sync::atomic::AtomicU64,
+    /// The ASIO driver stopped calling back and the output was reopened for it.
+    asio_stalled: AtomicBool,
     /// The UI has been told.
     reported: AtomicBool,
 }
@@ -131,17 +133,37 @@ impl Fault {
 #[cfg(not(target_arch = "wasm32"))]
 const STALL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// True once the block count `beats` has stood still for `STALL` while playing; `seen` is the
-/// count last seen and since when.
+/// How long an open ASIO stream may go without a block, playing or not. Its driver calls back
+/// continuously, so a silence this long means the driver stopped.
 #[cfg(not(target_arch = "wasm32"))]
-fn stalled(seen: &mut Option<(u64, std::time::Instant)>, beats: u64, playing: bool) -> bool {
-    match *seen {
-        Some((b, since)) if playing && b == beats => since.elapsed() >= STALL,
-        _ => {
-            *seen = Some((beats, std::time::Instant::now()));
-            false
-        }
+const ASIO_STALL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the output counts as stalled: the block count has been unchanged for `elapsed` (or
+/// changed, which is never a stall). An ASIO stream is watched whether or not the transport plays;
+/// any other output only while it plays.
+#[cfg(not(target_arch = "wasm32"))]
+fn stall_due(asio: bool, playing: bool, elapsed: std::time::Duration, beats_changed: bool) -> bool {
+    if beats_changed {
+        false
+    } else if asio {
+        elapsed >= ASIO_STALL
+    } else {
+        playing && elapsed >= STALL
     }
+}
+
+/// True once the block count `beats` has stood still long enough (see [`stall_due`]); `seen` is
+/// the count last seen and since when.
+#[cfg(not(target_arch = "wasm32"))]
+fn stalled(seen: &mut Option<(u64, std::time::Instant)>, beats: u64, playing: bool, asio: bool) -> bool {
+    // Not watched (a cpal output that is not playing) restarts the clock, so playing again is not
+    // judged on the time spent stopped.
+    let (since, beats_changed) = match *seen {
+        Some((b, since)) if b == beats && (asio || playing) => (since, false),
+        _ => (std::time::Instant::now(), true),
+    };
+    *seen = Some((beats, since));
+    stall_due(asio, playing, since.elapsed(), beats_changed)
 }
 
 /// Fill one block with `fill`. If it panics, the block and every later one are silent and the
@@ -561,14 +583,31 @@ impl Player {
         if reset && !self.reset_reported.swap(true, Ordering::Relaxed) {
             return Some(OutputTrouble::Reset);
         }
+        #[cfg(all(windows, feature = "asio"))]
+        let asio = self.asio.is_some();
+        #[cfg(not(all(windows, feature = "asio")))]
+        let asio = false;
         #[cfg(not(target_arch = "wasm32"))]
         let stalled = {
             let playing = self.shared.playing.load(Ordering::Relaxed) && !self.silent;
-            stalled(&mut self.watch.lock().unwrap_or_else(PoisonError::into_inner), self.fault.beats.load(Ordering::Relaxed), playing)
+            stalled(&mut self.watch.lock().unwrap_or_else(PoisonError::into_inner), self.fault.beats.load(Ordering::Relaxed), playing, asio)
         };
         #[cfg(target_arch = "wasm32")]
         let stalled = false;
-        self.fault.trouble(stalled)
+        match self.fault.trouble(stalled) {
+            // An ASIO driver that stopped calling back is reopened, like a driver that asked for it.
+            Some(OutputTrouble::Stalled) if asio => {
+                self.fault.asio_stalled.store(true, Ordering::Relaxed);
+                Some(OutputTrouble::Reset)
+            }
+            other => other,
+        }
+    }
+
+    /// True when the output was reset because its ASIO driver stopped calling back (see
+    /// [`Player::trouble`]), so the UI can say so.
+    pub fn driver_stopped(&self) -> bool {
+        self.fault.asio_stalled.load(Ordering::Relaxed)
     }
 
     fn side(&self) -> std::sync::MutexGuard<'_, Side> {
@@ -1344,6 +1383,29 @@ mod tests {
     }
 
     #[test]
+    fn an_asio_stream_is_stalled_after_a_second_without_blocks_even_when_not_playing() {
+        use std::time::{Duration, Instant};
+        let (millis, secs) = (Duration::from_millis, Duration::from_secs);
+        // ASIO: one second without a block is a stall, playing or stopped.
+        assert!(stall_due(true, false, secs(1), false));
+        assert!(stall_due(true, true, secs(1), false));
+        assert!(!stall_due(true, false, millis(999), false), "not yet a second");
+        assert!(!stall_due(true, true, secs(5), true), "blocks changed");
+        // cpal: two seconds without a block, and only while playing.
+        assert!(stall_due(false, true, secs(2), false));
+        assert!(!stall_due(false, true, millis(1500), false));
+        assert!(!stall_due(false, false, secs(5), false), "stopped, so nothing to ask for");
+        assert!(!stall_due(false, true, secs(5), true), "blocks changed");
+        // The watch: an ASIO output unchanged for 5 s is stalled even when stopped.
+        let aged = |t: Duration| Some((3, Instant::now().checked_sub(t).unwrap_or_else(Instant::now)));
+        assert!(stalled(&mut aged(secs(5)), 3, false, true));
+        // A stopped cpal output is not judged, and its clock restarts (so playing again is fresh).
+        let mut seen = aged(secs(5));
+        assert!(!stalled(&mut seen, 3, false, false));
+        assert!(seen.is_some_and(|(_, since)| since.elapsed() < secs(1)), "the clock restarted");
+    }
+
+    #[test]
     fn a_lost_or_stalled_device_is_reported_once() {
         let ago = |seen: &mut Option<(u64, std::time::Instant)>| {
             if let Some(s) = seen {
@@ -1351,12 +1413,12 @@ mod tests {
             }
         };
         let mut seen = None;
-        assert!(!stalled(&mut seen, 5, true));
+        assert!(!stalled(&mut seen, 5, true, false));
         ago(&mut seen);
-        assert!(stalled(&mut seen, 5, true));
-        assert!(!stalled(&mut seen, 6, true), "it asked again");
+        assert!(stalled(&mut seen, 5, true, false));
+        assert!(!stalled(&mut seen, 6, true, false), "it asked again");
         ago(&mut seen);
-        assert!(!stalled(&mut seen, 6, false), "stopped, so nothing to ask for");
+        assert!(!stalled(&mut seen, 6, false, false), "stopped, so nothing to ask for");
         assert_eq!(Fault::default().trouble(true), Some(OutputTrouble::Stalled));
         let fault = Fault::default();
         fault.gone.store(true, Ordering::Relaxed);

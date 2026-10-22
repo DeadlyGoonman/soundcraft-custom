@@ -761,6 +761,11 @@ fn on_worker<T: Send + 'static>(f: impl FnOnce() -> Result<T, Error> + Send + 's
     handle.join().unwrap_or_else(|_| Err(Error::Driver("driver thread panicked".into())))
 }
 
+/// The driver of the open stream, if one is open.
+pub(crate) fn open_driver() -> Option<String> {
+    lock(&OPEN).as_ref().map(|o| o.name.clone())
+}
+
 /// Loads the driver just long enough to read its caps.
 pub(crate) fn probe(name: &str) -> Result<DriverCaps, Error> {
     {

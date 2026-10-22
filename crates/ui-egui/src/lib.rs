@@ -880,7 +880,10 @@ impl SoundApp {
         let Some(trouble) = p.trouble() else { return };
         let name = p.device_name.clone();
         let (cause, then) = match trouble {
-            OutputTrouble::Reset => return self.reset_output(&name),
+            OutputTrouble::Reset => {
+                let stopped = p.driver_stopped();
+                return self.reset_output(&name, stopped);
+            }
             OutputTrouble::Bug => (
                 "the audio engine hit an internal error (see the log)".to_string(),
                 "Use Reconnect audio device in Setup ▸ Playback Engine, or restart SoundCraft.",
@@ -905,7 +908,8 @@ impl SoundApp {
 
     /// The driver asked to be reopened (its buffer size or rate changed): reopen it with the same
     /// settings. While recording, the take is stopped and kept, and the user reconnects.
-    fn reset_output(&mut self, name: &str) {
+    /// `stopped`: the driver stopped calling back (not that it asked), which the status says.
+    fn reset_output(&mut self, name: &str, stopped: bool) {
         /// A second reset this soon after an automatic reopen means the driver is looping; stop.
         const RESET_LOOP_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
         let now = std::time::Instant::now();
@@ -926,11 +930,13 @@ impl SoundApp {
         }
         self.last_reset = Some(now);
         self.ui.status = match self.apply_audio_config(self.ui.audio.clone()) {
-            Ok(()) => self
-                .player
-                .as_ref()
-                .and_then(|p| p.fallback_note.clone())
-                .unwrap_or_else(|| format!("“{name}” changed its settings; the audio device was reopened.")),
+            Ok(()) => self.player.as_ref().and_then(|p| p.fallback_note.clone()).unwrap_or_else(|| {
+                if stopped {
+                    format!("“{name}” stopped asking for audio, so the driver was reopened.")
+                } else {
+                    format!("“{name}” changed its settings; the audio device was reopened.")
+                }
+            }),
             Err(e) => format!("“{name}” changed its settings; the audio device was not reopened: {e}"),
         };
     }
