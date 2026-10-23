@@ -35,9 +35,13 @@
 //! them into the session. Linux (X11) editor windows are not hosted yet: opening reports
 //! "unsupported".
 //!
-//! Not hosted yet: `IMessage`/`IAttributeList` creation through the host (plugins that need it
-//! for processor ↔ controller messaging may lose those messages), sidechain (aux buses are kept
-//! inactive) and 64-bit processing.
+//! Processor ↔ controller messages: the host creates `IMessage` and `IAttributeList` objects
+//! through `IHostApplication::createInstance`, so plugins can send their analyzer frames and
+//! curve state to the controller over the connection points. Parameter values the session sets
+//! on the processor reach the controller on the UI thread (through the editor's `idle`), and
+//! values the plugin changes itself are re-read after its `restartComponent` request.
+//!
+//! Not hosted yet: sidechain (aux buses are kept inactive) and 64-bit processing.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
