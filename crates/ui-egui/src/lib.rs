@@ -11,6 +11,8 @@ pub mod dialogs;
 pub mod docking;
 pub mod edit_window;
 pub mod extra_windows;
+mod ffmpeg_setup;
+mod file_drop;
 pub mod fonts;
 pub mod icons;
 pub mod menus;
@@ -198,6 +200,20 @@ pub struct Services {
     pub pick_open: Option<Box<dyn Fn(&str, &[&str]) -> Option<String>>>,
     pub pick_save: Option<Box<dyn Fn(&str, &str) -> Option<String>>>,
     pub pick_folder: Option<Box<dyn Fn(&str) -> Option<String>>>,
+    /// The pointer position read from the OS (see [`os_pointer_pos`]), for drags from other apps.
+    pub pointer_pos: Option<Box<dyn Fn() -> Option<egui::Pos2>>>,
+    /// Shows a finished file selected in the system file manager.
+    pub reveal: Option<Box<dyn Fn(&std::path::Path)>>,
+}
+
+/// The mouse position in `ctx`'s window, in points, read from the OS (Windows only). Windows
+/// sends no mouse moves while files are dragged in from another app, so egui's own pointer is
+/// stale then; [`SoundApp::raw_input_hook`] feeds this in instead.
+pub fn os_pointer_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+    let (x, y) = soundcraft_clap_host::cursor_screen_pos()?;
+    let inner = ctx.input(|i| i.viewport().inner_rect)?;
+    let ppp = ctx.pixels_per_point();
+    Some(egui::pos2(x as f32 / ppp, y as f32 / ppp) - inner.min.to_vec2())
 }
 
 /// File-system-safe folder name for a plugin id (`clap:com.x.y` → `clap_com.x.y`).
@@ -303,6 +319,8 @@ pub struct SoundApp {
     pub synthetic: Vec<egui::Event>,
     /// Where a dropped audio file loads into a track's sampler (last frame's rects).
     pub sample_drop_targets: Vec<(egui::Rect, TrackId)>,
+    pub audio_drop_lanes: Vec<(egui::Rect, egui::Rect, TrackId)>,
+    pub(crate) drop_preview: file_drop::DropPreview,
     sample_reads: Vec<sampler_window::SampleRead>,
     synthetic_grace: u32,
     control_rx: Option<Receiver<ControlRequest>>,
@@ -336,6 +354,8 @@ pub struct SoundApp {
     pub video: video_track::VideoPool,
     /// The Bounce Mix in progress, rendered a slice per frame.
     pub bounce: Option<soundcraft_engine::io::Bounce>,
+    /// An ffmpeg install (for MP3 export) running in the background, and the bounce it waits to start.
+    pub(crate) ffmpeg_install: Option<ffmpeg_setup::Install>,
     /// Test-only: owns the process-wide palette lock while this app exists, so frames painted
     /// and colour assertions in one test can never straddle another test's palette change.
     #[cfg(test)]
@@ -391,6 +411,8 @@ impl SoundApp {
             focus_mix: false,
             synthetic: Vec::new(),
             sample_drop_targets: Vec::new(),
+            audio_drop_lanes: Vec::new(),
+            drop_preview: file_drop::DropPreview::default(),
             sample_reads: Vec::new(),
             synthetic_grace: 0,
             control_rx: None,
@@ -413,6 +435,7 @@ impl SoundApp {
             last_meter_poll: f64::NEG_INFINITY,
             video: video_track::VideoPool::default(),
             bounce: None,
+            ffmpeg_install: None,
             #[cfg(test)]
             _palette_lock: theme::lock_test_palette(),
         }
@@ -1252,6 +1275,7 @@ impl SoundApp {
         control::drain(self, ctx);
         self.note_recent_session();
         self.apply_editor_edits();
+        ffmpeg_setup::poll(self, ctx);
         bounce::step(self, ctx);
         if !ctx.input(|i| i.pointer.any_down()) {
             if matches!(self.gesture, Some(Gesture::Fader { .. })) {
@@ -1284,7 +1308,8 @@ impl SoundApp {
         }
         // Autosave and the macOS menu bar only run on frames, and plugin editors are native windows egui never hears from.
         // egui takes its predicted frame time off every delay, so add it back.
-        let editors = self.player.as_ref().is_some_and(Player::any_editor_open);
+        // Files dragged in from another app move without events on Windows: poll the pointer.
+        let editors = self.player.as_ref().is_some_and(Player::any_editor_open) || ctx.input(|i| !i.raw.hovered_files.is_empty());
         ctx.request_repaint_after_secs(if editors { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt));
         control::collect_screenshots(self, ctx);
     }
@@ -1292,6 +1317,15 @@ impl SoundApp {
     /// Feed queued synthetic input (from the control channel) into egui: one pointer event per
     /// frame (so drags span frames like real ones), keys as press+release pairs, text at once.
     pub fn raw_input_hook(&mut self, raw: &mut egui::RawInput) {
+        // Files dragged in from another app: the OS may send no pointer moves (Windows), so the
+        // drop outline and drop point would use a stale position. Ask the host for it.
+        if (!raw.hovered_files.is_empty() || !raw.dropped_files.is_empty())
+            && !raw.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_)))
+            && let Some(p) = self.services.pointer_pos.as_ref().and_then(|f| f())
+        {
+            let inside = raw.screen_rect.is_none_or(|r| r.contains(p));
+            raw.events.push(if inside { egui::Event::PointerMoved(p) } else { egui::Event::PointerGone });
+        }
         // While a synthetic gesture plays (and briefly after), the real pointer is ignored so it
         // cannot interleave with the scripted one.
         if !self.synthetic.is_empty() {
@@ -1337,6 +1371,7 @@ impl SoundApp {
         }
         shortcuts::handle(self, &ctx);
         self.sample_drop_targets.clear();
+        self.audio_drop_lanes.clear();
         if !self.native_menu_bar {
             menus::menu_bar(self, ui);
         }

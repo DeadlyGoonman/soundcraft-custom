@@ -45,7 +45,7 @@ impl BounceMetadata {
 pub enum Dialog {
     NewTracks { count: u32, format: String, kind: String, timebase: String, name: String },
     NewSession { name: String, sample_rate: u32, demo: bool },
-    Bounce { path: String, format: String, bit_depth: String, normalize: bool, metadata: BounceMetadata },
+    Bounce { path: String, format: String, bit_depth: String, bitrate: u32, normalize: bool, metadata: BounceMetadata },
     RenameTrack { id: TrackId, name: String },
     RenameClip { id: ClipId, name: String },
     RenameMarker { id: soundcraft_model::MarkerId, name: String },
@@ -147,9 +147,10 @@ impl Dialogs {
                     .filter(|d| !d.as_os_str().is_empty())
                     .map_or(home.clone(), |d| d.display().to_string());
                 Dialog::Bounce {
-                    path: format!("{dir}/{name} Bounce.wav"),
+                    path: format!("{dir}/Bounced Files/{name} Bounce.wav"),
                     format: "wav".into(),
                     bit_depth: "24".into(),
+                    bitrate: 320,
                     normalize: false,
                     metadata: BounceMetadata::default(),
                 }
@@ -342,6 +343,57 @@ fn default_dir() -> String {
     }
 }
 
+/// `path` with the extension for `format`, replacing an audio extension it already has but not
+/// another dotted part of the name ("Mix v1.2" becomes "Mix v1.2.wav").
+pub fn with_audio_ext(path: &str, format: &str) -> String {
+    let ext = if format == "aiff" { "aif" } else { format };
+    let p = std::path::Path::new(path);
+    let known =
+        p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["wav", "aif", "aiff", "flac", "mp3"].contains(&x.to_ascii_lowercase().as_str()));
+    if known { p.with_extension(ext).to_string_lossy().into_owned() } else { format!("{path}.{ext}") }
+}
+
+/// A bounce path as the dialog shows it: the folder, and the file name without its audio extension.
+pub fn split_bounce_path(path: &str) -> (String, String) {
+    let p = std::path::Path::new(path);
+    let dir = p.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+    let file = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let audio =
+        p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["wav", "aif", "aiff", "flac", "mp3"].contains(&x.to_ascii_lowercase().as_str()));
+    let name = if audio { p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() } else { file };
+    (dir, name)
+}
+
+/// The full bounce path from the dialog's folder and name, with the extension for `format`.
+pub fn join_bounce_path(dir: &str, name: &str, format: &str) -> String {
+    let ext = if format == "aiff" { "aif" } else { format };
+    let file = format!("{name}.{ext}");
+    if dir.is_empty() { file } else { std::path::Path::new(dir).join(file).to_string_lossy().into_owned() }
+}
+
+/// Extensions a save prompt hides from its Name field.
+const SAVE_EXTS: &[&str] = &["scraft", "mid", "musicxml", "svg", "scgrp", "txt", "wav", "aif", "aiff", "flac", "mp3"];
+
+/// A save path as its prompt shows it: the folder, the name, and the hidden extension (with its dot,
+/// or empty when the name has none the app writes).
+pub fn split_save_path(path: &str) -> (String, String, String) {
+    let p = std::path::Path::new(path);
+    let dir = p.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+    let file = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    match p.extension().and_then(|x| x.to_str()) {
+        Some(x) if SAVE_EXTS.contains(&x.to_ascii_lowercase().as_str()) || x == soundcraft_engine::io::BUNDLE_EXTENSION => {
+            (dir, p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), format!(".{x}"))
+        }
+        _ => (dir, file, String::new()),
+    }
+}
+
+/// The full save path from a prompt's folder, name and hidden extension.
+pub fn join_save_path(dir: &str, name: &str, ext: &str) -> String {
+    let file = format!("{name}{ext}");
+    if dir.is_empty() { file } else { std::path::Path::new(dir).join(file).to_string_lossy().into_owned() }
+}
+
 /// Show the open dialog, if any.
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     audiosuite_window(app, ctx);
@@ -409,8 +461,10 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                                 ui.selectable_value(timebase, "ticks".to_string(), "Ticks");
                             },
                         );
+                    });
+                    ui.horizontal(|ui| {
                         ui.label("Name:");
-                        ui.add(egui::TextEdit::singleline(name).desired_width(140.0));
+                        ui.add(egui::TextEdit::singleline(name).desired_width(280.0));
                     });
                     if buttons(ui, "Create", enter) {
                         action =
@@ -435,34 +489,59 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         ));
                     }
                 }
-                Dialog::Bounce { path, format, bit_depth, normalize, metadata } => {
-                    ui.horizontal(|ui| {
-                        ui.label("File");
-                        ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
+                Dialog::Bounce { path, format, bit_depth, bitrate, normalize, metadata } => {
+                    let (mut dir, mut name) = split_bounce_path(path);
+                    let (old_dir, old_name) = (dir.clone(), name.clone());
+                    let mut picked = None;
+                    egui::Grid::new("bounce_file").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
+                        ui.label("Folder");
+                        ui.add(egui::TextEdit::singleline(&mut dir).desired_width(420.0));
+                        ui.end_row();
+                        ui.label("");
                         if let Some(pick) = &app.services.pick_save
                             && ui.button("Browse…").clicked()
-                            && let Some(p) = pick("file.bounce_mix", path)
                         {
-                            *path = p;
-                            match std::path::Path::new(path.as_str()).extension().map(|x| x.to_string_lossy().to_lowercase()).as_deref() {
-                                Some("wav") => *format = "wav".into(),
-                                Some("aif" | "aiff") => *format = "aiff".into(),
-                                Some("flac") => *format = "flac".into(),
-                                _ => {}
-                            }
+                            picked = pick("file.bounce_mix", path);
                         }
+                        ui.end_row();
+                        ui.label("Name");
+                        ui.add(egui::TextEdit::singleline(&mut name).desired_width(420.0));
+                        ui.end_row();
                     });
+                    if let Some(p) = picked {
+                        *path = p;
+                        match std::path::Path::new(path.as_str()).extension().map(|x| x.to_string_lossy().to_lowercase()).as_deref() {
+                            Some("wav") => *format = "wav".into(),
+                            Some("aif" | "aiff") => *format = "aiff".into(),
+                            Some("flac") => *format = "flac".into(),
+                            Some("mp3") if !cfg!(target_arch = "wasm32") => *format = "mp3".into(),
+                            _ => {}
+                        }
+                    } else if dir != old_dir || name != old_name {
+                        *path = join_bounce_path(&dir, &name, format);
+                    }
                     ui.horizontal(|ui| {
+                        let before = format.clone();
                         egui::ComboBox::from_label("Format").selected_text(format.to_uppercase()).show_ui(ui, |ui| {
-                            for f in ["wav", "aiff", "flac"] {
+                            for f in ["wav", "aiff", "flac", "mp3"] {
+                                if f == "mp3" && cfg!(target_arch = "wasm32") {
+                                    continue;
+                                }
                                 ui.selectable_value(format, f.to_string(), f.to_uppercase());
                             }
                         });
-                        egui::ComboBox::from_label("Bit Depth").selected_text(format!("{bit_depth}-bit")).show_ui(ui, |ui| {
-                            for b in ["16", "24", "32f"] {
-                                ui.selectable_value(bit_depth, b.to_string(), format!("{b}-bit"));
-                            }
-                        });
+                        if *format != before {
+                            *path = with_audio_ext(path, format);
+                        }
+                        if format == "mp3" {
+                            ui.add(egui::Slider::new(bitrate, 32..=320).text("Bitrate (kbps)"));
+                        } else {
+                            egui::ComboBox::from_label("Bit Depth").selected_text(format!("{bit_depth}-bit")).show_ui(ui, |ui| {
+                                for b in ["16", "24", "32f"] {
+                                    ui.selectable_value(bit_depth, b.to_string(), format!("{b}-bit"));
+                                }
+                            });
+                        }
                     });
                     crate::widgets::checkbox(ui, normalize, "Normalize to -0.1 dBFS");
                     egui::CollapsingHeader::new("Metadata (optional)").default_open(metadata.expanded).show(ui, |ui| {
@@ -483,7 +562,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         });
                         ui.label(
                             egui::RichText::new(
-                                "Written into the file as tags (WAV LIST/INFO, AIFF NAME/AUTH/ANNO, FLAC Vorbis comment). Left blank, nothing is written.",
+                                "Written into the file as tags (WAV LIST/INFO, AIFF NAME/AUTH/ANNO, FLAC Vorbis comment, MP3 ID3). Left blank, nothing is written.",
                             )
                             .small()
                             .color(Tokens::current().text_dim),
@@ -495,8 +574,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                             .color(Tokens::current().text_dim),
                     );
                     if buttons(ui, "Bounce", enter) {
-                        let p = std::path::Path::new(path.as_str()).with_extension(if format == "aiff" { "aif" } else { format.as_str() });
-                        let mut params = json!({"path": p.to_string_lossy(), "format": format, "bit_depth": bit_depth, "normalize": normalize});
+                        let p = with_audio_ext(path, format);
+                        let mut params = json!({"path": p,"format": format, "bit_depth": bit_depth, "bitrate": bitrate, "normalize": normalize});
                         if let (Value::Object(map), Value::Object(m)) = (&mut params, metadata.to_json()) {
                             map.insert("metadata".into(), Value::Object(m));
                         }
@@ -530,29 +609,40 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     }
                 }
                 Dialog::PathPrompt { cmd, path, key, .. } => {
-                    ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
-                    if let Some(pick) = &app.services.pick_open
-                        && cmd != "session.save_as"
-                        && cmd != "session.save_copy"
-                        && key != "dir"
-                        && ui.button("Browse…").clicked()
-                        && let Some(p) = pick(cmd, &[])
-                    {
+                    let folder = key == "dir";
+                    let opening = !folder && (cmd.contains("import") || cmd.contains("open"));
+                    let (mut dir, mut name, ext) = split_save_path(path);
+                    let (old_dir, old_name) = (dir.clone(), name.clone());
+                    let mut picked = None;
+                    egui::Grid::new("path_prompt").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
+                        if folder || opening {
+                            ui.label(if folder { "Folder" } else { "File" });
+                            ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
+                        } else {
+                            ui.label("Folder");
+                            ui.add(egui::TextEdit::singleline(&mut dir).desired_width(420.0));
+                        }
+                        ui.end_row();
+                        ui.label("");
+                        let browse = if folder {
+                            app.services.pick_folder.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(path)).flatten())
+                        } else if opening {
+                            app.services.pick_open.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(cmd, &[])).flatten())
+                        } else {
+                            app.services.pick_save.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(cmd, path)).flatten())
+                        };
+                        picked = browse.flatten();
+                        ui.end_row();
+                        if !folder && !opening {
+                            ui.label("Name");
+                            ui.add(egui::TextEdit::singleline(&mut name).desired_width(420.0));
+                            ui.end_row();
+                        }
+                    });
+                    if let Some(p) = picked {
                         *path = p;
-                    }
-                    if let Some(pick) = &app.services.pick_folder
-                        && key == "dir"
-                        && ui.button("Browse…").clicked()
-                        && let Some(p) = pick(path)
-                    {
-                        *path = p;
-                    }
-                    if let Some(pick) = &app.services.pick_save
-                        && (cmd == "session.save_as" || cmd == "session.save_copy")
-                        && ui.button("Browse…").clicked()
-                        && let Some(p) = pick(cmd, path)
-                    {
-                        *path = p;
+                    } else if !folder && !opening && (dir != old_dir || name != old_name) {
+                        *path = join_save_path(&dir, &name, &ext);
                     }
                     let file = soundcraft_engine::io::session_file(path);
                     let replaces = soundcraft_engine::io::replaces(&app.engine, cmd, &file);

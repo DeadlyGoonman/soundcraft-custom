@@ -45,6 +45,20 @@ pub use plugin::ClapPlugin;
 use soundcraft_dsp::{Category, Plugin, PluginInfo};
 use std::path::{Path, PathBuf};
 
+/// The mouse position on screen in physical pixels, read from the OS (Windows only; `None`
+/// elsewhere). Windows sends a window no mouse moves while files are dragged into it from
+/// another app, so a file drop has to ask for the position.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cursor_screen_pos() -> Option<(i32, i32)> {
+    ffi::cursor_screen_pos()
+}
+
+/// The browser gives no OS cursor position.
+#[cfg(target_arch = "wasm32")]
+pub fn cursor_screen_pos() -> Option<(i32, i32)> {
+    None
+}
+
 /// Prefix of every hosted-CLAP plugin id.
 pub const ID_PREFIX: &str = "clap:";
 

@@ -34,7 +34,9 @@
     <Property Id="ARPHELPLINK" Value="https://github.com/DeadlyGoonman/soundcraft-custom/issues" />
 
     <StandardDirectory Id="ProgramFiles6432Folder">
-      <Directory Id="INSTALLFOLDER" Name="SoundCraft" />
+      <!-- Own folder: upstream installs to Program Files\SoundCraft, and sharing it would let either
+           product overwrite or uninstall the other's files. -->
+      <Directory Id="INSTALLFOLDER" Name="SoundCraft (DeadlyGoonman fork)" />
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
 

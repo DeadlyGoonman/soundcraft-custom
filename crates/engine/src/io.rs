@@ -392,6 +392,19 @@ pub struct Bounce {
     peak: f32,
     meter: soundcraft_dsp::meter::LoudnessMeter,
     enc: Option<soundcraft_audio_io::FileEncoder<Out>>,
+    target_db: f32,
+    mp3: Option<Mp3Stage>,
+}
+
+/// The ffmpeg pass that turns a bounce's temporary WAV into the MP3 at the bounce's path.
+struct Mp3Stage {
+    ffmpeg: PathBuf,
+    wav: PathBuf,
+    out_part: PathBuf,
+    meta: Option<soundcraft_audio_io::Metadata>,
+    kbps: u32,
+    child: Option<std::process::Child>,
+    stderr: Option<std::thread::JoinHandle<String>>,
 }
 
 /// A finished bounce: the size of its file and its levels.
@@ -451,7 +464,23 @@ impl Bounce {
             peak: 0.0,
             meter,
             enc: Some(enc),
+            target_db: -0.1,
+            mp3: None,
         })
+    }
+
+    /// Makes this bounce (whose path is a temporary WAV) end as an MP3 at `path`, encoded by
+    /// `ffmpeg` once the WAV is complete. Lossy encoding can overshoot, so a normalized bounce
+    /// peaks at -1 dBFS.
+    pub fn to_mp3(mut self, path: &Path, ffmpeg: &Path, meta: Option<soundcraft_audio_io::Metadata>, kbps: u32) -> Result<Bounce> {
+        let name = path.file_name().map_or_else(|| "bounce".into(), |n| n.to_string_lossy().into_owned());
+        let out_part = path.with_file_name(format!("{name}.part"));
+        crate::file_access::check_write(path).map_err(EngineError::Io)?;
+        crate::file_access::check_write(&out_part).map_err(EngineError::Io)?;
+        let wav = std::mem::replace(&mut self.path, path.to_path_buf());
+        self.target_db = -1.0;
+        self.mp3 = Some(Mp3Stage { ffmpeg: ffmpeg.to_path_buf(), wav, out_part, meta, kbps, child: None, stderr: None });
+        Ok(self)
     }
 
     pub fn path(&self) -> &Path {
@@ -465,16 +494,24 @@ impl Bounce {
     /// How far along the bounce is, from 0 to 1.
     pub fn progress(&self) -> f32 {
         let pass = (self.done as f64 / self.range.len().max(1) as f64).min(1.0) as f32;
-        match (self.normalize, self.measuring) {
+        let render = match (self.normalize, self.measuring) {
             (false, _) => pass,
             (true, true) => pass / 2.0,
             (true, false) => 0.5 + pass / 2.0,
+        };
+        match &self.mp3 {
+            Some(m) if m.child.is_some() => 0.95,
+            Some(_) => render * 0.9,
+            None => render,
         }
     }
 
     /// Renders blocks until `more` returns false (at least one per call). Returns the finished
     /// bounce once its file is complete.
     pub fn step(&mut self, mut more: impl FnMut() -> bool) -> Result<Option<Bounced>> {
+        if self.encoding() {
+            return self.poll_mp3(false);
+        }
         loop {
             match self.render.next_block(&self.session) {
                 Some((chunk, n)) => {
@@ -489,13 +526,13 @@ impl Bounce {
                     }
                 }
                 None if self.measuring => {
-                    self.gain = if self.peak > 0.0 { soundcraft_dsp::db_to_gain(-0.1) / self.peak } else { 1.0 };
+                    self.gain = if self.peak > 0.0 { soundcraft_dsp::db_to_gain(self.target_db) / self.peak } else { 1.0 };
                     self.peak = 0.0;
                     self.done = 0;
                     self.measuring = false;
                     self.render = soundcraft_mix::RangeRender::new(&self.session, self.bus, self.range, 1024);
                 }
-                None => return self.finish().map(Some),
+                None => return self.finish(),
             }
             if !more() {
                 return Ok(None);
@@ -509,28 +546,78 @@ impl Bounce {
             if let Some(done) = self.step(|| true)? {
                 return Ok(done);
             }
+            if self.encoding() {
+                return self.poll_mp3(true)?.ok_or_else(|| EngineError::Io("ffmpeg did not finish".into()));
+            }
         }
     }
 
-    fn finish(&mut self) -> Result<Bounced> {
+    fn encoding(&self) -> bool {
+        self.mp3.as_ref().is_some_and(|m| m.child.is_some())
+    }
+
+    fn levels(&self, bytes: u64) -> Bounced {
+        Bounced { bytes, peak_db: soundcraft_dsp::gain_to_db(self.peak), lufs: self.meter.integrated_lufs(), true_peak_db: self.meter.true_peak_db() }
+    }
+
+    fn finish(&mut self) -> Result<Option<Bounced>> {
+        let target = self.mp3.as_ref().map_or_else(|| self.path.clone(), |m| m.wav.clone());
         let bytes = match self.enc.take() {
-            Some(enc) => enc.finish().map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?.complete(&self.part, &self.path)?,
+            Some(enc) => enc.finish().map_err(|err| EngineError::Io(format!("{}: {err}", target.display())))?.complete(&self.part, &target)?,
             None => 0,
         };
-        Ok(Bounced {
-            bytes,
-            peak_db: soundcraft_dsp::gain_to_db(self.peak),
-            lufs: self.meter.integrated_lufs(),
-            true_peak_db: self.meter.true_peak_db(),
-        })
+        let Some(m) = &mut self.mp3 else {
+            return Ok(Some(self.levels(bytes)));
+        };
+        let args = crate::mp3::args(&m.wav, &m.out_part, m.meta.as_ref(), self.session.sample_rate.hz(), m.kbps);
+        let mut child = crate::mp3::spawn(&m.ffmpeg, &args).map_err(|err| EngineError::Io(format!("cannot run ffmpeg: {err}")))?;
+        m.stderr = child.stderr.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let mut bytes = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut std::io::Read::take(&mut pipe, 1 << 16), &mut bytes);
+                text.push_str(&String::from_utf8_lossy(&bytes));
+                let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+                text
+            })
+        });
+        m.child = Some(child);
+        Ok(None)
+    }
+
+    /// Checks (or with `block`, waits for) the ffmpeg pass; on success the MP3 replaces the path.
+    fn poll_mp3(&mut self, block: bool) -> Result<Option<Bounced>> {
+        let Some(m) = &mut self.mp3 else { return Ok(None) };
+        let Some(child) = &mut m.child else { return Ok(None) };
+        let status = if block { child.wait().map(Some) } else { child.try_wait() }.map_err(|err| EngineError::Io(format!("ffmpeg: {err}")))?;
+        let Some(status) = status else { return Ok(None) };
+        m.child = None;
+        let text = m.stderr.take().and_then(|h| h.join().ok()).unwrap_or_default();
+        if !status.success() {
+            let text = text.trim();
+            let text: String = text.chars().take(500).collect();
+            return Err(EngineError::Io(format!("ffmpeg failed ({status}): {text}")));
+        }
+        let bytes = std::fs::metadata(&m.out_part).map(|md| md.len()).map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?;
+        replace_with(&m.out_part, &self.path, Ok(()))?;
+        let _ = std::fs::remove_file(&m.wav);
+        Ok(Some(self.levels(bytes)))
     }
 }
 
 impl Drop for Bounce {
-    /// Removes the part file unless the bounce completed (which renamed it).
+    /// Removes the part files (and the temporary WAV of an MP3 bounce) unless the bounce completed.
     fn drop(&mut self) {
         drop(self.enc.take());
         let _ = std::fs::remove_file(&self.part);
+        if let Some(mut m) = self.mp3.take() {
+            if let Some(mut child) = m.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_file(&m.wav);
+            let _ = std::fs::remove_file(&m.out_part);
+        }
     }
 }
 
@@ -1239,6 +1326,15 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
     }
     crate::file_access::check_write(path).map_err(EngineError::Io)?;
     std::fs::write(path, bytes).map_err(|err| EngineError::Io(format!("{path}: {err}")))
+}
+
+/// Creates the folder `path` goes in when it is missing (after the write check).
+pub fn create_parent_dir(path: &Path) -> Result<()> {
+    let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty() && !d.exists()) else {
+        return Ok(());
+    };
+    crate::file_access::check_write(path).map_err(EngineError::Io)?;
+    std::fs::create_dir_all(dir).map_err(|err| EngineError::Io(format!("cannot create {}: {err}", dir.display())))
 }
 
 /// The session as a bundle: `<name>.scraft` plus every source's audio as 32-bit float WAV under

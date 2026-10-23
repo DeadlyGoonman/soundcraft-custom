@@ -84,7 +84,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 crate::io::import_video_bytes(e, &path, bytes, at)
             }
         ),
-        cmd!(noundo "file.bounce_mix", "Bounce Mix...", ["File"], Some("Cmd+Alt+B"), "{path, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?, source?: main|bus name, normalize?: false, dither?: true, fold_down?: stereo, metadata?: {title?, artist?, album?, genre?, year?, comment?}}", always, bounce),
+        cmd!(noundo "file.bounce_mix", "Bounce Mix...", ["File"], Some("Cmd+Alt+B"), "{path, format?: wav|aiff|flac|mp3 (mp3 needs ffmpeg, bit_depth ignored), bitrate?: 32-320 kbps (mp3, default 320), bit_depth?: 16|24|32f, start?, end?, source?: main|bus name, normalize?: false, dither?: true, fold_down?: stereo, metadata?: {title?, artist?, album?, genre?, year?, comment?}}", always, bounce),
         cmd!(noundo "file.bounce_stems", "Bounce Stems...", [], None, "{dir, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?, fold_down?: stereo, metadata?: {title?, artist?, album?, genre?, year?, comment?}}", has_tracks, |e, p| {
             let dir = str_param(p, "dir").ok_or_else(|| bad("file.bounce_stems", "`dir` required"))?.to_string();
             let r = range_param(e, "file.bounce_stems", p)?;
@@ -302,19 +302,44 @@ pub fn bounce_job(e: &Engine, p: &Value) -> Result<crate::io::Bounce> {
     let r = if r.is_empty() { soundcraft_time::Range::new(0, e.session().content_end().max(1)) } else { r };
     let ext = std::path::Path::new(&path).extension().and_then(|x| x.to_str()).unwrap_or("wav").to_ascii_lowercase();
     let format_name = str_param(p, "format").unwrap_or(ext.as_str());
+    let metadata = metadata_param(p);
+    let normalize = bool_or(p, "normalize", false);
+    let fold = fold_down_param(p, "file.bounce_mix")?;
+    let bus = bounce_bus(e, p)?;
+    let target = std::path::Path::new(&path);
+    crate::io::create_parent_dir(target).map_err(|err| bad("file.bounce_mix", err.to_string()))?;
+    if format_name.trim_start_matches('.').eq_ignore_ascii_case("mp3") {
+        if cfg!(target_arch = "wasm32") {
+            return Err(bad("file.bounce_mix", "MP3 export needs ffmpeg (desktop only)"));
+        }
+        let ffmpeg = crate::mp3::ffmpeg_path().ok_or_else(|| {
+            bad("file.bounce_mix", "MP3 export needs ffmpeg (not found on PATH or in WinGet Links). Install it, e.g. `winget install Gyan.FFmpeg`")
+        })?;
+        let kbps = p.get("bitrate").and_then(Value::as_u64).map_or(320, |b| b.clamp(32, 320) as u32);
+        let name = target.file_name().map_or_else(|| "bounce".into(), |n| n.to_string_lossy().into_owned());
+        let wav = target.with_file_name(format!("{name}.render.wav"));
+        let opts = soundcraft_audio_io::EncodeOptions {
+            format: soundcraft_audio_io::FileFormat::Wav,
+            bit_depth: soundcraft_audio_io::BitDepth::Float32,
+            dither: false,
+            bwf: None,
+            metadata: None,
+        };
+        return crate::io::Bounce::new(e.session_arc(), &wav, r, &opts, bus, normalize, true)?.to_mp3(target, &ffmpeg, metadata, kbps);
+    }
     let format = soundcraft_audio_io::encode_format_for(format_name).ok_or_else(|| {
-        bad("file.bounce_mix", format!("cannot write `{format_name}` files (supported: {})", soundcraft_audio_io::ENCODE_EXTENSIONS))
+        bad(
+            "file.bounce_mix",
+            format!("cannot write `{format_name}` files (supported: {}, mp3 (needs ffmpeg))", soundcraft_audio_io::ENCODE_EXTENSIONS),
+        )
     })?;
     let bit_depth = match p.get("bit_depth").map(|b| b.to_string().trim_matches('"').to_string()).as_deref() {
         Some("16") => soundcraft_audio_io::BitDepth::Int16,
         Some("32") | Some("32f") => soundcraft_audio_io::BitDepth::Float32,
         _ => soundcraft_audio_io::BitDepth::Int24,
     };
-    let opts = soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: bool_or(p, "dither", true), bwf: None, metadata: metadata_param(p) };
-    let normalize = bool_or(p, "normalize", false);
-    let fold = fold_down_param(p, "file.bounce_mix")?;
-    let bus = bounce_bus(e, p)?;
-    crate::io::Bounce::new(e.session_arc(), std::path::Path::new(&path), r, &opts, bus, normalize, fold)
+    let opts = soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: bool_or(p, "dither", true), bwf: None, metadata };
+    crate::io::Bounce::new(e.session_arc(), target, r, &opts, bus, normalize, fold)
 }
 
 /// Write the score of the chosen MIDI tracks as MusicXML (or SVG when `svg`).
@@ -404,7 +429,7 @@ mod tests {
         let mut e = Engine::default();
         let dir = std::env::temp_dir().join(format!("sc-bounce-ext-{}", std::process::id()));
         assert!(std::fs::create_dir_all(&dir).is_ok());
-        for name in ["mix.mp3", "mix.ogg", "mix.xyz"] {
+        for name in ["mix.ogg", "mix.xyz"] {
             let path = dir.join(name);
             let err = e.execute("file.bounce_mix", &json!({"path": path.to_string_lossy(), "start": 0, "end": 480})).map(|_| ()).unwrap_err();
             assert!(err.to_string().contains("supported: wav"), "{name}: {err}");
@@ -413,6 +438,91 @@ mod tests {
         let ok = dir.join("mix.flac");
         assert!(e.execute("file.bounce_mix", &json!({"path": ok.to_string_lossy(), "start": 0, "end": 480})).is_ok());
         assert!(std::fs::remove_dir_all(&dir).is_ok());
+    }
+
+    fn mp3_session() -> (Engine, std::path::PathBuf) {
+        let mut e = Engine::default();
+        assert!(e.execute("track.new", &json!({"count": 1, "format": "stereo"})).is_ok());
+        let dir =
+            std::env::temp_dir().join(format!("sc-mp3-{}-{}", std::process::id(), std::thread::current().name().unwrap_or("t").replace(':', "_")));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        (e, dir)
+    }
+
+    fn leftovers(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir).map(|d| d.flatten().map(|f| f.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn bounce_creates_a_missing_output_folder() {
+        let (mut e, dir) = mp3_session();
+        let path = dir.join("Bounced Files").join("mix.wav");
+        let out = e.execute("file.bounce_mix", &json!({"path": path.to_string_lossy(), "start": 0, "end": 480}));
+        assert!(out.is_ok(), "{out:?}");
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mp3_with_missing_ffmpeg_errors_and_cleans_up() {
+        let (e, dir) = mp3_session();
+        let wav = dir.join("mix.mp3.render.wav");
+        let opts = soundcraft_audio_io::EncodeOptions { bit_depth: soundcraft_audio_io::BitDepth::Float32, ..Default::default() };
+        let range = soundcraft_time::Range::new(0, 4800);
+        let job = crate::io::Bounce::new(e.session_arc(), &wav, range, &opts, None, false, true)
+            .and_then(|b| b.to_mp3(&dir.join("mix.mp3"), std::path::Path::new("Z:/no/ffmpeg.exe"), None, 320));
+        assert!(job.is_ok());
+        assert!(job.and_then(|b| b.run()).is_err());
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mp3_dropped_midway_leaves_nothing() {
+        let (e, dir) = mp3_session();
+        let wav = dir.join("mix.mp3.render.wav");
+        let opts = soundcraft_audio_io::EncodeOptions { bit_depth: soundcraft_audio_io::BitDepth::Float32, ..Default::default() };
+        let range = soundcraft_time::Range::new(0, 48000 * 60);
+        if let Ok(job) = crate::io::Bounce::new(e.session_arc(), &wav, range, &opts, None, false, true)
+            .and_then(|b| b.to_mp3(&dir.join("mix.mp3"), std::path::Path::new("Z:/no/ffmpeg.exe"), None, 128))
+        {
+            let mut job = job;
+            assert!(job.step(|| false).is_ok());
+            drop(job);
+        }
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mp3_bounce_round_trips() {
+        let Some(_) = crate::mp3::ffmpeg_path() else {
+            eprintln!("skipping: no ffmpeg");
+            return;
+        };
+        let (mut e, dir) = mp3_session();
+        let path = dir.join("mix.mp3");
+        let out = e.execute(
+            "file.bounce_mix",
+            &json!({"path": path.to_string_lossy(), "start": 0, "end": 48000, "bitrate": 128, "metadata": {"title": "Round", "artist": "Trip"}}),
+        );
+        assert!(out.is_ok(), "{out:?}");
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        assert!(!bytes.is_empty());
+        assert!(bytes.windows(5).any(|w| w == b"Round"));
+        let decoded = soundcraft_audio_io::decode(&bytes, Some("mp3"));
+        assert!(decoded.is_ok());
+        if let Ok((info, _)) = decoded {
+            assert!(info.sample_rate > 0);
+        }
+        if let Ok(probe) =
+            std::process::Command::new("ffprobe").args(["-v", "error", "-show_entries", "format=bit_rate", "-of", "csv=p=0"]).arg(&path).output()
+        {
+            let kbps = String::from_utf8_lossy(&probe.stdout).trim().parse::<u64>().unwrap_or(0) / 1000;
+            assert!((120..=145).contains(&kbps), "expected about 128 kbps, got {kbps}");
+        }
+        assert_eq!(leftovers(&dir), vec!["mix.mp3".to_string()]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

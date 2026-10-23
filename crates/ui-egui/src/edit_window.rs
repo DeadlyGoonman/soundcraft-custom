@@ -827,6 +827,12 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect, 
     ui.painter().line_segment([pos2(head.min.x, row.max.y + 0.5), pos2(tl.max.x, row.max.y + 0.5)], Stroke::new(1.0, t.border));
     ui.painter().hline(head.min.x + STRIP_W..=head.max.x, head.min.y + 0.5, Stroke::new(1.0, t.edge_light));
     track_header(app, ui, track, head, selected, head_bg);
+    // Audio files dropped from outside on the header: the sampler (instrument) or the edit cursor.
+    if track.kind == TrackKind::Instrument {
+        crate::sampler_window::drop_target(app, ui.ctx(), head, id);
+    } else if track.kind == TrackKind::Audio {
+        crate::file_drop::audio_lane(app, ui, head, tl, id);
+    }
     // Lane.
     ui.painter().vline(tl.min.x - 0.5, row.y_range(), Stroke::new(1.0, t.border));
     let painter = ui.painter().with_clip_rect(lane.intersect(ui.clip_rect()));
@@ -1999,6 +2005,8 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     // Audio files dropped from outside onto an instrument track load its sampler.
     if track.kind == soundcraft_model::TrackKind::Instrument {
         crate::sampler_window::drop_target(app, ui.ctx(), lane, track.id);
+    } else if track.kind == soundcraft_model::TrackKind::Audio {
+        crate::file_drop::audio_lane(app, ui, lane, tl, track.id);
     }
     let s = app.engine.session_arc();
     let tool = s.edit.tool;
@@ -2479,7 +2487,7 @@ fn automation_id(p: &AutoParam) -> String {
 }
 
 /// Grid snapping while dragging; holding Cmd/Ctrl swaps Grid and Slip.
-fn drag_snap(s: &Session, at: Samples, flip: bool) -> Samples {
+pub(crate) fn drag_snap(s: &Session, at: Samples, flip: bool) -> Samples {
     if s.edit.edit_mode.is_grid() != flip { s.edit.grid.snap(at, s.sample_rate, &s.tempo, s.frame_rate) } else { at }
 }
 

@@ -159,7 +159,7 @@ fn save_prefs(ui: &UiState) {
     }
 }
 
-fn services() -> Services {
+fn services(ctx: egui::Context) -> Services {
     Services {
         pick_open: Some(Box::new(|purpose: &str, _exts: &[&str]| {
             let d = rfd::FileDialog::new();
@@ -190,6 +190,27 @@ fn services() -> Services {
         pick_folder: Some(Box::new(|start: &str| {
             rfd::FileDialog::new().set_directory(start).pick_folder().map(|p| p.to_string_lossy().into_owned())
         })),
+        pointer_pos: Some(Box::new(move || soundcraft_ui_egui::os_pointer_pos(&ctx))),
+        reveal: Some(Box::new(reveal)),
+    }
+}
+
+fn reveal(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Explorer only parses `/select,"C:\dir\file"` with backslashes and the path quoted on its own.
+        let full = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let win = full.to_string_lossy().replace('/', "\\");
+        let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{win}\"")).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(dir) = path.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
     }
 }
 
@@ -269,7 +290,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let player =
                 if no_audio { None } else { Some(soundcraft_playback::Player::with_config(Arc::new(engine.session().clone()), &prefs.audio)) };
-            let mut app = SoundApp::new(engine, player, services());
+            let mut app = SoundApp::new(engine, player, services(cc.egui_ctx.clone()));
             app.autosave_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave")));
             app.leftovers = app.autosave_dir.as_deref().map(soundcraft_engine::autosave::leftovers).unwrap_or_default();
             app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));

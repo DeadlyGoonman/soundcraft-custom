@@ -11,6 +11,15 @@ pub fn start(app: &mut SoundApp, params: &Value) {
         app.ui.status = "A bounce is already running".into();
         return;
     }
+    if app.ffmpeg_install.is_some() {
+        app.ui.status = "Waiting for the ffmpeg install to finish".into();
+        return;
+    }
+    let mp3 = params.get("format").and_then(Value::as_str).is_some_and(|f| f.eq_ignore_ascii_case("mp3"));
+    if mp3 && !cfg!(target_arch = "wasm32") && soundcraft_engine::mp3::ffmpeg_path().is_none() {
+        crate::ffmpeg_setup::begin(app, params);
+        return;
+    }
     // Third-party plugins keep state the session can't see: store it first.
     app.capture_plugin_states();
     match soundcraft_engine::cmd::bounce_job(&app.engine, params) {
@@ -29,6 +38,9 @@ pub fn step(app: &mut SoundApp, ctx: &egui::Context) {
             return;
         }
         Ok(Some(done)) => {
+            if let Some(reveal) = &app.services.reveal {
+                reveal(job.path());
+            }
             format!("Bounced {} (peak {:.1} dBFS, {:.1} LUFS)", job.path().file_name().unwrap_or_default().to_string_lossy(), done.peak_db, done.lufs)
         }
         Err(e) => e.to_string(),

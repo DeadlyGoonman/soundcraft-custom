@@ -1,6 +1,6 @@
 # Where SoundCraft falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-20 · **Change:** minor (G-01: ASIO auto-preference, input tied to output, driver control panel, audio trouble in the UI) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-23 · **Change:** minor (G-21: MP3 bounce through ffmpeg) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in SoundCraft. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -214,8 +214,10 @@ articulations, parts). ≈ 40–60 h.
 
 ### G-21. Compressed export
 
-Bounce writes WAV/BWF/RF64, AIFF and FLAC; Pro Tools also writes MP3 and AAC/M4A in Bounce Mix.
-≈ 10–20 h (pure-Rust encoders).
+Bounce writes WAV/BWF/RF64, AIFF, FLAC and MP3 (32-320 kbps, ID3v2.3 tags, through a system
+`ffmpeg`; the Bounce dialog offers a winget install when it is missing). Pro Tools also writes
+AAC/M4A. Left: AAC/M4A, Ogg/Opus, and a bundled pure-Rust MP3 encoder so ffmpeg is not needed.
+≈ 8–16 h.
 
 ### G-22. Avid cloud services
 
@@ -226,6 +228,7 @@ missing. Out of scope unless the owner decides otherwise.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | minor | G-21 shrunk: MP3 bounce through a system ffmpeg (bitrate, ID3 tags); Bounce defaults to a `Bounced Files` folder |
 | 2026-10-20 | minor | G-01: ASIO auto-preference, input tied to output, driver control panel, audio trouble reported in the UI; plugin editor button added |
 | 2026-10-20 | minor | G-04: Playback Engine froze with an ASIO system (two `reg query` subprocesses per frame); the control-panel lookup is now cached |
 | 2026-10-18 | trivial | G-04: mono device stereo/surround fold-down fixed and regression-tested; estimates unchanged |

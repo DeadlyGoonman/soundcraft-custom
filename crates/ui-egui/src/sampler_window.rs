@@ -86,11 +86,11 @@ impl SoundApp {
     /// path loads straight away; one without (the browser) waits in [`SoundApp::take_sample_reads`]
     /// for the shell to read. Everything else is returned for the shell to open or import.
     pub fn take_dropped_files(&mut self, ctx: &egui::Context) -> Vec<egui::DroppedFileHandle> {
-        let (files, pos) = ctx.input(|i| (i.raw.dropped_files.clone(), i.pointer.latest_pos()));
+        let (files, pos, flip) = ctx.input(|i| (i.raw.dropped_files.clone(), i.pointer.latest_pos(), i.modifiers.command));
         if files.is_empty() {
             return files;
         }
-        let Some(track) = self.drop_track(pos) else { return files };
+        let Some(track) = self.drop_track(pos) else { return crate::file_drop::lane_drop(self, files, pos, flip) };
         let mut rest = Vec::new();
         let mut claimed = false;
         for f in files {
