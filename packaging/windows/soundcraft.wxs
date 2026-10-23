@@ -10,25 +10,28 @@
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
-      Name="SoundCraft"
-      Manufacturer="Learning Machines LLC"
+      Name="SoundCraft (DeadlyGoonman fork)"
+      Manufacturer="DeadlyGoonman"
       Version="$(var.Version)"
-      UpgradeCode="EE53D3E5-D0AE-40F9-808D-9417FDEBF61A"
+      UpgradeCode="E2B15805-C68E-4B07-8838-C4687B796DA5"
       Scope="perMachine"
       Compressed="yes"
       Language="1033">
-    <SummaryInformation Description="SoundCraft digital audio workstation" Manufacturer="Learning Machines LLC" />
+    <SummaryInformation Description="SoundCraft digital audio workstation (DeadlyGoonman's fork)" Manufacturer="DeadlyGoonman" />
+    <!-- A distinct UpgradeCode/Manufacturer from upstream's own installer: this fork is a
+         separate MSI product family, so it never reads as an upgrade or downgrade of (and never
+         replaces) any real upstream SoundCraft install on the same machine. -->
     <!-- Same-version upgrades let successive pre-releases of one X.Y.Z replace each other
          (MSI versions are numeric, so 1.2.3-rc.1 and 1.2.3-rc.2 are both 1.2.3). -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
-        DowngradeErrorMessage="A newer version of SoundCraft is already installed." />
+        DowngradeErrorMessage="A newer version of this fork is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
     <Icon Id="SoundcraftIcon.ico" SourceFile="$(var.IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="SoundcraftIcon.ico" />
-    <Property Id="ARPURLINFOABOUT" Value="https://getartcraft.com/apps/soundcraft" />
-    <Property Id="ARPURLUPDATEINFO" Value="https://getartcraft.com/apps/soundcraft" />
-    <Property Id="ARPHELPLINK" Value="https://discord.gg/artcraft" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/DeadlyGoonman/soundcraft-custom" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/DeadlyGoonman/soundcraft-custom/releases" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/DeadlyGoonman/soundcraft-custom/issues" />
 
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="SoundCraft" />
@@ -42,7 +45,7 @@
 
   <Fragment>
     <ComponentGroup Id="SoundcraftFiles" Directory="INSTALLFOLDER">
-      <Component Id="SoundcraftApp" Guid="091136D7-205E-41A8-9D27-5E231F7CBBD4">
+      <Component Id="SoundcraftApp" Guid="9BC5C046-C472-4CEF-A9D5-FE3099C32E98">
         <File Id="SoundcraftExe" Source="$(var.BinDir)\soundcraft.exe" KeyPath="yes">
           <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="SoundCraft"
               Description="SoundCraft digital audio workstation" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
@@ -83,7 +86,7 @@
         <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\soundcraft.exe" Value="[#SoundcraftExe]" Type="string" />
       </Component>
 
-      <Component Id="SoundcraftCli" Guid="4552049A-C2F0-4AB0-BAE6-A62C3348F4B4">
+      <Component Id="SoundcraftCli" Guid="5186CCA9-AAF5-4623-B92A-BEE4CD98553A">
         <File Id="SoundcraftCliExe" Source="$(var.BinDir)\soundcraft-cli.exe" KeyPath="yes" />
       </Component>
     </ComponentGroup>
