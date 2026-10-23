@@ -27,7 +27,7 @@ pub mod record;
 
 pub use devices::{AudioConfig, asio_available, asio_control_panel};
 
-use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
+use soundcraft_dsp::{EditorScale, Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
 use soundcraft_model::{Session, TrackId};
 use soundcraft_time::{Range, Samples};
@@ -952,6 +952,20 @@ impl Player {
     /// Opens the plugin's own editor window. Main thread only.
     pub fn open_editor(&self, track: TrackId, slot: usize) -> Result<(), String> {
         self.side().open_editor((track, slot))
+    }
+
+    /// True when the plugin in this slot can draw its editor at another size. Main thread only.
+    pub fn editor_native_scaling(&self, track: TrackId, slot: usize) -> bool {
+        self.side().editors.get_mut(&(track, slot)).is_some_and(|e| e.native_scaling())
+    }
+
+    /// Sets the scale of the plugin's editor (applies live when it is open). Main thread only.
+    /// An error says why the scale can't be used for this plugin.
+    pub fn set_editor_scale(&self, track: TrackId, slot: usize, scale: EditorScale) -> Result<(), String> {
+        match self.side().editors.get_mut(&(track, slot)) {
+            Some(e) => e.set_scale(scale),
+            None => Err("this plugin has no editor (or it is not loaded)".to_string()),
+        }
     }
 
     pub fn close_editor(&self, track: TrackId, slot: usize) {

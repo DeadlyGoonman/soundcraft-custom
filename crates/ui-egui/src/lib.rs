@@ -129,6 +129,10 @@ pub struct UiState {
     pub window_size: [f32; 2],
     pub window_maximized: bool,
     pub ui_scale: f32,
+    /// Plugin editor scale per plugin id (Editor Scale in an insert's or instrument's menu). A plugin
+    /// without an entry opens at 100 % Auto.
+    #[serde(default)]
+    pub editor_scales: HashMap<String, soundcraft_dsp::EditorScale>,
 }
 
 impl Default for UiState {
@@ -190,6 +194,7 @@ impl Default for UiState {
             window_size: [1600.0, 1000.0],
             window_maximized: false,
             ui_scale: 1.0,
+            editor_scales: HashMap::new(),
         }
     }
 }
@@ -653,6 +658,46 @@ impl SoundApp {
         }
     }
 
+    /// The plugin id in a slot: the track's instrument for the instrument slot, else its insert.
+    pub fn slot_plugin_id(&self, track: TrackId, slot: usize) -> Option<String> {
+        let t = self.engine.session().track(track)?;
+        if slot == soundcraft_mix::INSTRUMENT_SLOT {
+            t.instrument.as_ref().map(|i| i.plugin.clone())
+        } else {
+            t.mixer.inserts.get(slot)?.as_ref().map(|i| i.plugin.clone())
+        }
+    }
+
+    /// Applies the editor scale remembered for the slot's plugin, then opens its editor. A scale
+    /// that can't be applied is shown in the status line, and the editor opens at its own size.
+    pub fn open_slot_editor(&mut self, track: TrackId, slot: usize) -> Result<(), String> {
+        let remembered = self.slot_plugin_id(track, slot).and_then(|id| self.ui.editor_scales.get(&id).copied());
+        let Some(p) = self.player.as_ref() else { return Err("no audio engine".into()) };
+        if let Some(scale) = remembered.filter(|s| *s != soundcraft_dsp::EditorScale::default())
+            && let Err(e) = p.set_editor_scale(track, slot, scale)
+        {
+            self.ui.status = e;
+        }
+        p.open_editor(track, slot)
+    }
+
+    /// Sets a slot's plugin editor scale (applied live to an open editor) and remembers it for the
+    /// plugin. A scale the editor refuses is not remembered.
+    pub fn set_slot_editor_scale(&mut self, track: TrackId, slot: usize, scale: soundcraft_dsp::EditorScale) -> Result<(), String> {
+        let Some(plugin) = self.slot_plugin_id(track, slot) else { return Err("no plugin in this slot".into()) };
+        if let Some(p) = self.player.as_ref()
+            && p.has_editor(track, slot)
+        {
+            p.set_editor_scale(track, slot, scale)?;
+        }
+        if scale == soundcraft_dsp::EditorScale::default() {
+            self.ui.editor_scales.remove(&plugin);
+        } else {
+            self.ui.editor_scales.insert(plugin, scale);
+        }
+        Ok(())
+    }
+
     /// Opens the insert just picked from its menu: a hosted plugin's own editor, else (a built-in
     /// plugin, no audio engine, or an editor that can't open here) its plugin window.
     fn open_inserted(&mut self, ctx: &egui::Context) {
@@ -679,10 +724,8 @@ impl SoundApp {
         }
         self.pending_open = None;
         self.pending_open_since = None;
-        if step == OpenStep::Editor
-            && let Some(p) = &self.player
-        {
-            match p.open_editor(track, slot) {
+        if step == OpenStep::Editor && self.player.is_some() {
+            match self.open_slot_editor(track, slot) {
                 Ok(()) => return,
                 Err(e) => self.ui.status = format!("{}: {e}", mix_window::plugin_info(&plugin).map_or(plugin.as_str(), |i| i.name)),
             }

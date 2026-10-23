@@ -463,7 +463,7 @@ fn plugin_editor_button(app: &mut SoundApp, ui: &mut Ui) {
         let id = track.id;
         if let Some(p) = app.player.as_ref() {
             if p.has_editor(id, slot) {
-                if let Err(e) = p.open_editor(id, slot) {
+                if let Err(e) = app.open_slot_editor(id, slot) {
                     app.ui.status = e;
                 }
             } else if !app.ui.plugin_windows.contains(&(id, slot)) {

@@ -514,11 +514,9 @@ pub(crate) fn instrument_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, r:
     }
     let hosted = ins.is_some_and(|i| soundcraft_mix::is_third_party(&i.plugin));
     if resp.clicked() && hosted {
-        if let Some(p) = app.player.as_ref()
-            && p.has_editor(id, slot)
-        {
+        if app.player.as_ref().is_some_and(|p| p.has_editor(id, slot)) {
             // A hosted instrument keeps its sounds in its own editor: open it on click.
-            if let Err(e) = p.open_editor(id, slot) {
+            if let Err(e) = app.open_slot_editor(id, slot) {
                 app.ui.status = format!("{}: {e}", info.map_or("instrument", |i| i.name));
             }
         } else if !app.ui.plugin_windows.contains(&(id, slot)) {
@@ -653,11 +651,9 @@ pub(crate) fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: 
     if resp.clicked() && ins.is_some() {
         if ui.input(|i| i.modifiers.command) {
             let _ = app.run("mix.insert_bypass", json!({"track": id.0, "slot": slot}));
-        } else if let Some(p) = app.player.as_ref()
-            && p.has_editor(id, slot)
-        {
+        } else if app.player.as_ref().is_some_and(|p| p.has_editor(id, slot)) {
             // A hosted plugin's own editor opens on click, not its parameter menu.
-            if let Err(e) = p.open_editor(id, slot) {
+            if let Err(e) = app.open_slot_editor(id, slot) {
                 app.ui.status = format!("{}: {e}", name);
             }
         } else if !app.ui.plugin_windows.contains(&(id, slot)) {
@@ -747,15 +743,14 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
         if ui.button("no insert").clicked() {
             run_pick(app, ui, "mix.insert_remove", json!({"track": id.0, "slot": slot}));
         }
-        let third_party = app
-            .engine
-            .session()
-            .track(id)
-            .and_then(|t| t.mixer.inserts.get(slot).cloned().flatten())
-            .is_some_and(|i| soundcraft_mix::is_third_party(&i.plugin));
+        let plugin = app.slot_plugin_id(id, slot);
+        let third_party = plugin.as_deref().is_some_and(soundcraft_mix::is_third_party);
         if third_party && ui.button("SoundCraft Parameters…").clicked() {
             open_parameters(app, id, slot);
             ui.close();
+        }
+        if let Some(plugin) = plugin.as_deref().filter(|p| soundcraft_mix::is_third_party(p)) {
+            editor_scale_menu(app, ui, id, slot, plugin);
         }
         ui.separator();
     }
@@ -802,16 +797,19 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
             open_parameters(app, id, slot);
             ui.close();
         }
-        if let Some(p) = &app.player
-            && p.has_editor(id, slot)
-        {
-            if p.editor_open(id, slot) {
+        if let Some(plugin) = current.as_ref().map(|i| i.plugin.as_str()).filter(|p| soundcraft_mix::is_third_party(p)) {
+            editor_scale_menu(app, ui, id, slot, plugin);
+        }
+        if app.player.as_ref().is_some_and(|p| p.has_editor(id, slot)) {
+            if app.player.as_ref().is_some_and(|p| p.editor_open(id, slot)) {
                 if ui.button("Close Plugin Editor").clicked() {
-                    p.close_editor(id, slot);
+                    if let Some(p) = &app.player {
+                        p.close_editor(id, slot);
+                    }
                     ui.close();
                 }
             } else if ui.button("Open Plugin Editor").clicked() {
-                if let Err(e) = p.open_editor(id, slot) {
+                if let Err(e) = app.open_slot_editor(id, slot) {
                     app.ui.status = format!("{}: {e}", info.name);
                 }
                 ui.close();
@@ -833,6 +831,50 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     if let Some(plugin) = picked {
         pick_instrument(app, ui, id, &plugin);
     }
+}
+
+/// Editor scale choices (percent of the plugin's own size) in the Editor Scale submenu.
+pub const EDITOR_SCALE_PERCENTS: [u32; 7] = [50, 75, 100, 125, 150, 200, 300];
+
+/// `scale` with its factor set to `percent` (the mode is kept).
+pub fn scale_at_percent(scale: soundcraft_dsp::EditorScale, percent: u32) -> soundcraft_dsp::EditorScale {
+    soundcraft_dsp::EditorScale { factor: percent as f32 / 100.0, ..scale }
+}
+
+/// The Editor Scale submenu of a hosted plugin's slot: zoom percentages, then the scaling mode.
+/// Native is disabled when the plugin cannot draw itself at another size.
+fn editor_scale_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, plugin: &str) {
+    use soundcraft_dsp::{EditorScale, EditorScaleMode, UpscaleFilter};
+    let current = app.ui.editor_scales.get(plugin).copied().unwrap_or_default();
+    let native_ok = app.player.as_ref().is_some_and(|p| p.editor_native_scaling(id, slot));
+    ui.menu_button("Editor Scale", |ui| {
+        for pct in EDITOR_SCALE_PERCENTS {
+            let selected = (current.clamped_factor() * 100.0).round() as u32 == pct;
+            if ui.radio(selected, format!("{pct} %")).clicked() {
+                set_slot_scale(app, ui, id, slot, scale_at_percent(current, pct));
+            }
+        }
+        ui.separator();
+        let modes = [
+            ("Auto", EditorScaleMode::Auto, true),
+            ("Native", EditorScaleMode::Native, native_ok),
+            ("Upscale FSR 1", EditorScaleMode::Upscale(UpscaleFilter::Fsr1), true),
+            ("Upscale Bilinear", EditorScaleMode::Upscale(UpscaleFilter::Bilinear), true),
+        ];
+        for (label, mode, enabled) in modes {
+            if ui.add_enabled(enabled, egui::RadioButton::new(current.mode == mode, label)).clicked() {
+                set_slot_scale(app, ui, id, slot, EditorScale { mode, ..current });
+            }
+        }
+    });
+}
+
+/// Applies a picked editor scale; a refused one is shown in the status line.
+fn set_slot_scale(app: &mut SoundApp, ui: &Ui, id: TrackId, slot: usize, scale: soundcraft_dsp::EditorScale) {
+    if let Err(e) = app.set_slot_editor_scale(id, slot, scale) {
+        app.ui.status = e;
+    }
+    ui.close();
 }
 
 /// Inserts the plugin picked in an insert's menu and, as DAWs do, opens it once the audio engine has
