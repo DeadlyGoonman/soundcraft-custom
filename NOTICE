@@ -3,9 +3,12 @@ Copyright (c) 2026 ArtCraft Team and the SoundCraft contributors.
 Licensed under the MIT License or the Apache License, Version 2.0, at your option
 (LICENSE-MIT, LICENSE-APACHE).
 
-The ArtCraft name, wordmark and logos in docs/brand/ are trademarks of the ArtCraft Team. They are
-not open source and are not covered by the license above; their terms are in
-docs/brand/LICENSE-brand.txt.
+This is DeadlyGoonman/soundcraft-custom, an independent fork of upstream SoundCraft
+(https://github.com/storytold/soundcraft). The ArtCraft name, wordmark and logos are trademarks of
+the ArtCraft Team and are not used in this fork.
+
+Fork changes (native ASIO host, custom themes, plugin editor scaling, and related fixes) were
+prompted and directed by DeadlyGoonman and written end-to-end by Claude (Anthropic's Claude Code).
 
 Third-party material
 

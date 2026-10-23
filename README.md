@@ -1,26 +1,17 @@
 <p align="center">
-  <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
-  </a>
-</p>
-
-<p align="center">
   <img src="assets/app-icon/hicolor/256x256/apps/ai.storyteller.soundcraft.png" width="128" height="128" alt="SoundCraft icon: a singing bird on a blue tile">
 </p>
 
-<h1 align="center">SoundCraft</h1>
+<h1 align="center">SoundCraft — DeadlyGoonman's fork</h1>
 
 <p align="center">
-  <b>Recording, editing and mixing audio; an open-source, modern digital audio workstation (DAW), built in pure Rust.</b>
+  <b>A personal fork of the open-source SoundCraft DAW, adding native ASIO support, custom themes, and resizable/upscaled plugin editors.</b>
 </p>
 
 <p align="center">
-  A complete digital audio workstation that runs natively on macOS, Windows, Linux and FreeBSD, and
-  in the browser. Multitrack editing, a full mixer with plugins, sends and automation, MIDI, recording
-  and bouncing, and every action scriptable from the command line or by an AI agent.
+  Prompted and directed end-to-end by <a href="https://github.com/DeadlyGoonman"><b>DeadlyGoonman</b></a> —
+  every change in this fork (design, code and tests) was written by <b>Claude</b> (Anthropic's Claude Code).
+  <br><b>This fork's changes are 100% AI-generated.</b>
 </p>
 
 <p align="center">
@@ -29,19 +20,11 @@
   <img alt="Platforms" src="https://img.shields.io/badge/macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20FreeBSD%20%C2%B7%20Web-0b7385?style=flat-square">
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square">
   <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square">
-  <br>
-  <a href="https://sonarcloud.io/project/overview?id=storytold_soundcraft"><img alt="Scanned by SonarCloud" src="https://img.shields.io/badge/Scanned_by-SonarCloud-4b9fd5?style=flat-square&logo=sonarqubecloud&logoColor=white"></a>
-  <a href="https://coderabbit.ai"><img alt="Reviewed by CodeRabbit" src="https://img.shields.io/coderabbit/prs/github/storytold/soundcraft?style=flat-square&label=Reviewed%20by%20CodeRabbit&logo=coderabbit"></a>
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/artcraft"><img alt="Join the ArtCraft community on Discord" src="https://img.shields.io/badge/Join%20us%20on%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" height="40"></a>
-</p>
-
-<p align="center">
-  <a href="https://getartcraft.com/apps/soundcraft"><b>SoundCraft on getartcraft.com</b></a> ·
-  <a href="https://getartcraft.com/">ArtCraft</a> ·
-  <a href="https://getartcraft.com/apps">All Crafting Apps</a>
+  <a href="https://github.com/storytold/soundcraft"><b>Upstream: storytold/soundcraft</b></a> ·
+  <a href="#this-fork">This fork's changes</a>
 </p>
 
 <p align="center">
@@ -50,20 +33,49 @@
   <sub>The Edit window: tracks, waveforms, MIDI, rulers, markers and the transport, playing the built-in demo song (every sound in it is synthesised by SoundCraft itself).</sub>
 </p>
 
-> [!NOTE]
-> **ArtCraft is a community of artists from all walks of life.** Painters, photographers,
-> filmmakers, illustrators, designers, animators, hobbyists, and people who picked up a pencil
-> last week. If you make things, you're one of us. **[Come say hi on Discord](https://discord.gg/artcraft).**
+## This fork
+
+**[DeadlyGoonman/soundcraft-custom](https://github.com/DeadlyGoonman/soundcraft-custom)** — a personal, independently
+maintained fork of upstream SoundCraft, not affiliated with or endorsed by the ArtCraft team. Prompted and directed
+end-to-end by **[DeadlyGoonman](https://github.com/DeadlyGoonman)**; every change below — design, code and tests —
+was written by **Claude** (Anthropic's Claude Code). **This fork's changes are 100% AI-generated.**
+
+- **Native ASIO host** — a from-scratch ASIO driver host (no Steinberg SDK), wired into playback and recording, with
+  stall detection, safe reconnects, and a guard against opening a second driver while a stream is live.
+- **Plugin editors open themselves** — clicking an insert or instrument opens the plugin's own GUI directly instead of
+  SoundCraft's parameter wrapper, and waits for third-party editors that take a moment to appear.
+- **VST3 analyzer/sync fix** — hosts `IMessage`/`IAttributeList` so plugins like FabFilter Pro-Q can push live analyzer
+  data to their own editor, and keeps the editor in sync with presets, automation and undo.
+- **Plugin editor scaling** — native resizing where a plugin supports it, otherwise upscaled (FSR1/NIS), so small
+  plugin GUIs aren't stuck tiny on a high-DPI display.
+- **Custom themes** — an OLED Black theme (pure-black surfaces) and a Custom theme shaded from any colour you pick,
+  alongside the built-in Dark/Light/System options.
+- **Track-colour tint + insert drag-swap** — inserts, sends and I/O rows pick up a faint tint from their track's
+  colour; dragging one insert onto another swaps them.
+
+<table>
+  <tr>
+    <td width="50%"><img alt="The Playback Engine panel with a Focusrite USB ASIO device selected, its control panel button, and a live latency readout" src="docs/images/fork/asio-playback-engine.png"></td>
+    <td width="50%"><img alt="The Appearance panel with the Theme dropdown open: Dark, OLED Black, Light, System and Custom" src="docs/images/fork/appearance-theme-menu.png"></td>
+  </tr>
+  <tr>
+    <td><b>Native ASIO.</b> A real hardware driver selected, its own control panel one click away, measured latency shown live.</td>
+    <td><b>Theme picker.</b> OLED Black and Custom sit next to the built-in Dark, Light and System options.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img alt="The Edit window, with insert and send columns tinted by each track's colour" src="docs/images/fork/edit-dark.png"></td>
+    <td width="50%"><img alt="The Mix window, showing full channel strips with inserts and sends" src="docs/images/fork/mix-dark.png"></td>
+  </tr>
+  <tr>
+    <td><b>Edit window.</b></td>
+    <td><b>Mix window.</b></td>
+  </tr>
+</table>
 
 <p align="center">
-  <a href="#what-it-does">What it does</a> ·
-  <a href="#getting-started">Getting started</a> ·
-  <a href="#for-agents-and-scripts">Agents &amp; scripts</a> ·
-  <a href="#how-its-built">How it's built</a> ·
-  <a href="#status-and-roadmap">Status</a> ·
-  <a href="#downloads">Downloads</a> ·
-  <a href="#the-crafting-apps">The Crafting Apps</a> ·
-  <a href="#license-and-credits">License</a>
+  <img alt="The Custom Theme colour picker, with a pink colour chosen and swatches for Soft Pink, Dark Pink, Grey (Dark) and OLED Black" src="docs/images/fork/custom-theme-picker.png" width="60%">
+  <br>
+  <sub>Custom theme picker — any colour, or one of the presets.</sub>
 </p>
 
 ## What it does
@@ -324,30 +336,13 @@ RISC-V (riscv64): `soundcraft-<ver>-linux-riscv64.tar.gz`, a tarball only (glibc
 |---|---|---|
 | Static site | `soundcraft-web-<ver>.zip` | Runs in a modern browser; host it on any static server |
 
-## The Crafting Apps
+## Upstream: The Crafting Apps
 
-SoundCraft is one of the **Crafting Apps**: free, open-source creative tools from the
-[ArtCraft](https://getartcraft.com/) team, each written from scratch in Rust and each able to
-stand on its own.
-
-| | App | What it's for | Code | Learn more |
-|:-:|---|---|---|---|
-| <img src="https://raw.githubusercontent.com/storytold/photocraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.photocraft.png" alt="" width="32" height="32"> | **PhotoCraft** | Image editing: layers, masks, type and real PSD files | [GitHub](https://github.com/storytold/photocraft) | [Website](https://getartcraft.com/apps/photocraft) |
-| <img src="https://raw.githubusercontent.com/storytold/vectorcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.vectorcraft.png" alt="" width="32" height="32"> | **VectorCraft** | Vector illustration | [GitHub](https://github.com/storytold/vectorcraft) | [Website](https://getartcraft.com/apps/vectorcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/filmcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.filmcraft.png" alt="" width="32" height="32"> | **FilmCraft** | Video editing, color and sound | [GitHub](https://github.com/storytold/filmcraft) | [Website](https://getartcraft.com/apps/filmcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/lightcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.lightcraft.png" alt="" width="32" height="32"> | **LightCraft** | Photo library and raw development | [GitHub](https://github.com/storytold/lightcraft) | [Website](https://getartcraft.com/apps/lightcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/pdfcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.pdfcraft.png" alt="" width="32" height="32"> | **PdfCraft** | Reading, organizing and protecting PDFs | [GitHub](https://github.com/storytold/pdfcraft) | [Website](https://getartcraft.com/apps/pdfcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/effectcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.effectcraft.png" alt="" width="32" height="32"> | **EffectCraft** | Motion graphics and visual effects | [GitHub](https://github.com/storytold/effectcraft) | [Website](https://getartcraft.com/apps/effectcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/designcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.designcraft.png" alt="" width="32" height="32"> | **DesignCraft** | Page layout and publishing | [GitHub](https://github.com/storytold/designcraft) | [Website](https://getartcraft.com/apps/designcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/soundcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.soundcraft.png" alt="" width="32" height="32"> | **SoundCraft** | **Recording, editing and mixing audio · you are here** | [GitHub](https://github.com/storytold/soundcraft) | [Website](https://getartcraft.com/apps/soundcraft) |
-
-And [**ArtCraft**](https://getartcraft.com/) itself, our AI image and video studio for artists who want real control.
-
-<br>
-
-<p align="center">
-  <a href="https://discord.gg/artcraft"><img alt="Join the ArtCraft community on Discord" src="https://img.shields.io/badge/Join%20us%20on%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" height="40"></a>
-</p>
+Upstream SoundCraft is one of the **Crafting Apps**: free, open-source creative tools from the
+[ArtCraft](https://getartcraft.com/) team (PhotoCraft, VectorCraft, FilmCraft, LightCraft, PdfCraft,
+EffectCraft, DesignCraft and SoundCraft itself), each written from scratch in Rust. This fork tracks
+only SoundCraft; see [storytold/soundcraft](https://github.com/storytold/soundcraft) for the others
+and for the ArtCraft project generally.
 
 <h3 align="center">Come make things with us</h3>
 
@@ -356,13 +351,6 @@ And [**ArtCraft**](https://getartcraft.com/) itself, our AI image and video stud
   set type, and people still figuring out what they like to make. Share what you're working on,
   ask for help, tell us what's broken, or tell us what you wish these tools could do.
   Whatever your medium and however long you've been at it, you're welcome here.
-</p>
-
-<p align="center">
-  <a href="https://discord.gg/artcraft"><b>discord.gg/artcraft</b></a> ·
-  <a href="https://getartcraft.com/">getartcraft.com</a> ·
-  <a href="https://getartcraft.com/apps">The Crafting Apps</a> ·
-  <a href="https://getartcraft.com/apps/soundcraft">SoundCraft</a>
 </p>
 
 ## License and credits
@@ -377,14 +365,15 @@ Every icon in the interface is drawn in code, the app icon is original, and the 
 screenshots' audio are synthesised by SoundCraft itself, so there are no samples or artwork from
 anyone else in this repository.
 
-The ArtCraft name, wordmark and logos in [`docs/brand/`](docs/brand/) are trademarks of the
-ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as
-part of this repository and SoundCraft, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
-Forks and modified versions must remove them.
+SoundCraft was originally created by the [ArtCraft](https://getartcraft.com/) team and community;
+upstream development continues at [storytold/soundcraft](https://github.com/storytold/soundcraft).
+The ArtCraft name, wordmark and logos are trademarks of the ArtCraft Team and are not used in this
+fork.
 
 <p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
-  <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
+  <sub>This fork (<a href="https://github.com/DeadlyGoonman/soundcraft-custom">DeadlyGoonman/soundcraft-custom</a>)
+  is prompted and directed by <a href="https://github.com/DeadlyGoonman">DeadlyGoonman</a>; its changes were written
+  end-to-end by Claude (Anthropic's Claude Code) and are 100% AI-generated.</sub>
 </p>
 
 Tracks and Groups, Clips, MIDI Editor, Memory Locations, and Undo History use movable panels. Edit and Mix retain separate arrangements; Clips and MIDI Editor belong to Edit. Transport, plug-in, and specialist utility windows retain their existing hosts. Drag a panel header to a target edge or another header. Its context menu offers Float panel, Move to group, and Close panel. Existing panel toggles reopen panels at their saved location; Reset Panel Layout restores the app layout. Floating panels remain inside the current app window.
