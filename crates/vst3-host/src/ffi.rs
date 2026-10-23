@@ -15,7 +15,8 @@
 #![allow(clippy::unnecessary_cast)]
 
 use crate::{Vst3Error, scan};
-use soundcraft_dsp::{EditorScale, EditorScaleMode, Transport};
+use soundcraft_dsp::{EditorScale, Transport};
+use soundcraft_editor_scale::{Choice, ScaledWindow, plan};
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::mem::ManuallyDrop;
@@ -1895,13 +1896,59 @@ fn split_state(data: &[u8]) -> Option<(&[u8], &[u8])> {
 
 // ---- editor (IPlugView) --------------------------------------------------------------------
 
-/// Why `scale` can't be applied to an editor (`native`: the plugin scales itself), if it can't.
-fn scale_error(scale: EditorScale, native: bool) -> Option<&'static str> {
-    match scale.mode {
-        EditorScaleMode::Upscale(_) => Some("upscaling is not wired up yet"),
-        EditorScaleMode::Auto if !native && scale.clamped_factor() != 1.0 => Some("upscaling is not wired up yet"),
-        EditorScaleMode::Native if !native => Some("this plugin cannot scale its editor natively"),
-        EditorScaleMode::Auto | EditorScaleMode::Native => None,
+/// The window an editor is shown in: a host window the plugin draws in at its scale, or a
+/// [`ScaledWindow`] the plugin draws at its own size and the host stretches.
+enum EditorWindow {
+    Plain(window::HostWindow),
+    Scaled(ScaledWindow),
+}
+
+impl EditorWindow {
+    /// The window the plug frame resizes directly. Null for a scaled window: its size is applied
+    /// on the next idle (see [`EditorLink::sync_scaled`]).
+    fn frame_window(&self) -> *mut c_void {
+        match self {
+            EditorWindow::Plain(w) => w.raw(),
+            EditorWindow::Scaled(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// The `HWND`/`NSView`-like parent the plugin view attaches to.
+    fn parent(&self) -> *mut c_void {
+        match self {
+            EditorWindow::Plain(w) => w.parent(),
+            EditorWindow::Scaled(s) => s.parent(),
+        }
+    }
+
+    /// Sets the editor's own (unscaled) size: the host window's client area, or the scaled
+    /// window's native size.
+    fn set_native_size(&mut self, size: (f64, f64)) {
+        match self {
+            EditorWindow::Plain(w) => window::resize(w.raw(), size.0, size.1),
+            EditorWindow::Scaled(s) => s.resize_native(size.0 as u32, size.1 as u32),
+        }
+    }
+
+    fn raise(&self) {
+        match self {
+            EditorWindow::Plain(w) => w.raise(),
+            EditorWindow::Scaled(s) => s.raise(),
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        match self {
+            EditorWindow::Plain(w) => w.is_visible(),
+            EditorWindow::Scaled(s) => s.is_visible(),
+        }
+    }
+
+    fn close(self) {
+        match self {
+            EditorWindow::Plain(w) => w.close(),
+            EditorWindow::Scaled(s) => s.close(),
+        }
     }
 }
 
@@ -1969,7 +2016,11 @@ struct EditorInner {
     controller: Option<ComPtr<sv::IEditController>>,
     view: Option<ComPtr<sb::IPlugView>>,
     frame: Option<ComWrapper<PlugFrame>>,
-    window: Option<window::HostWindow>,
+    window: Option<EditorWindow>,
+    /// The title the editor window was (or will be) opened with, for a reopen.
+    title: String,
+    /// The native size the window was last set to (scaled windows follow the frame's size).
+    shown: (f64, f64),
     /// The scale the user asked for; applied to the open view and to the next open.
     scale: EditorScale,
     /// The content scale last handed to the view (1.0 when none).
@@ -2051,17 +2102,21 @@ impl EditorLink {
         }
         let native = EditorLink::supports_native(&view);
         g.native = Some(native);
-        if let Some(msg) = scale_error(g.scale, native) {
-            return Err(msg.into());
-        }
         let factor = g.scale.clamped_factor();
+        let choice = plan(g.scale.mode, factor, native).map_err(str::to_string)?;
+        let upscale = match choice {
+            Choice::Upscale(filter) => Some(filter),
+            Choice::Plain | Choice::Native => None,
+        };
         let mut r = sb::ViewRect { left: 0, top: 0, right: 400, bottom: 300 };
         // SAFETY: valid view; `r` is writable. On failure the default size stays.
         unsafe { view.getSize(&mut r) };
         let base = rect_size(&r);
-        // The content scale goes in before the view is attached (as the SDK asks).
+        // The content scale goes in before the view is attached (as the SDK asks). A scaled
+        // window's view draws at its own size, so it never gets one.
         let mut applied = 1.0_f32;
-        if factor != 1.0
+        if upscale.is_none()
+            && factor != 1.0
             && let Some(cs) = view.cast::<sb::IPlugViewContentScaleSupport>()
         {
             // SAFETY: valid content-scale interface of the view, not yet attached.
@@ -2069,15 +2124,20 @@ impl EditorLink {
                 applied = factor;
             }
         }
-        let resizable = EditorLink::can_resize(&view);
+        let resizable = upscale.is_none() && EditorLink::can_resize(&view);
         let mut size = base;
-        if applied != 1.0 {
-            size = EditorLink::view_size(&view).unwrap_or(base);
-        } else if factor != 1.0 {
-            size = (base.0 * f64::from(factor), base.1 * f64::from(factor));
+        if upscale.is_none() {
+            if applied != 1.0 {
+                size = EditorLink::view_size(&view).unwrap_or(base);
+            } else if factor != 1.0 {
+                size = (base.0 * f64::from(factor), base.1 * f64::from(factor));
+            }
         }
-        let win = window::HostWindow::new(title, size.0, size.1, resizable)?;
-        let frame = ComWrapper::new(PlugFrame::new(win.raw(), size.0, size.1));
+        let mut win = match upscale {
+            Some(filter) => EditorWindow::Scaled(ScaledWindow::new(title, base.0 as u32, base.1 as u32, factor, filter)?),
+            None => EditorWindow::Plain(window::HostWindow::new(title, size.0, size.1, resizable)?),
+        };
+        let frame = ComWrapper::new(PlugFrame::new(win.frame_window(), size.0, size.1));
         if let Some(f) = frame.as_com_ref::<sb::IPlugFrame>() {
             // SAFETY: valid view; the frame outlives the view's attachment (kept in `g.frame`
             // and detached in `teardown`).
@@ -2090,16 +2150,19 @@ impl EditorLink {
             win.close();
             return Err("the editor could not attach to its window".into());
         }
-        if applied == 1.0 && factor != 1.0 {
-            // Host-sized view: the plugin's size limits apply to the scaled size.
+        if upscale.is_some() || (applied == 1.0 && factor != 1.0) {
+            // Host-sized (or upscaled) view: the plugin's size limits apply to the size it gets.
             let fitted = EditorLink::fit_view(&view, size);
-            window::resize(win.raw(), fitted.0, fitted.1);
+            win.set_native_size(fitted);
             frame.set_size(fitted);
+            size = fitted;
         }
         win.raise();
         g.view = Some(view);
         g.frame = Some(frame);
         g.window = Some(win);
+        g.title = title.to_string();
+        g.shown = size;
         g.applied = applied;
         g.base = base;
         g.resizable = resizable;
@@ -2165,32 +2228,37 @@ impl EditorLink {
         EditorLink::native_support(&mut g)
     }
 
-    /// Stores the editor's scale and applies it to an open editor. Errors name why this scale
-    /// can't be used for this plugin (upscaling is not wired up yet).
+    /// Stores the editor's scale and applies it to an open editor. An open editor is applied live
+    /// when it stays a host window, otherwise closed and reopened in its new window. Errors name
+    /// why this scale can't be used for this plugin.
     pub fn set_scale(&self, scale: EditorScale) -> Result<(), String> {
-        if let EditorScaleMode::Upscale(_) = scale.mode {
-            return Err("upscaling is not wired up yet".into());
-        }
         let mut g = self.lock();
         let native = EditorLink::native_support(&mut g);
-        if let Some(msg) = scale_error(scale, native) {
-            return Err(msg.into());
-        }
-        let new = EditorScale { factor: scale.clamped_factor(), mode: scale.mode };
+        let factor = scale.clamped_factor();
+        let choice = plan(scale.mode, factor, native).map_err(str::to_string)?;
+        let new = EditorScale { factor, mode: scale.mode };
         if new == g.scale {
             return Ok(());
         }
+        let was_scaled = matches!(g.window, Some(EditorWindow::Scaled(_)));
         g.scale = new;
-        if g.view.is_some() {
-            EditorLink::apply_live(&mut g);
+        if g.view.is_none() {
+            return Ok(());
         }
+        if was_scaled || matches!(choice, Choice::Upscale(_)) {
+            EditorLink::teardown(&mut g);
+            let title = g.title.clone();
+            drop(g);
+            return self.open(&title);
+        }
+        EditorLink::apply_live(&mut g);
         Ok(())
     }
 
-    /// Applies the stored scale to the open view and resizes the host window to match. Main
-    /// thread only (called from `set_scale`, which the UI calls there).
+    /// Applies the stored scale to the open host-window view and resizes the window to match.
+    /// Main thread only (called from `set_scale`, which the UI calls there).
     fn apply_live(g: &mut EditorInner) {
-        let (Some(view), Some(win), Some(frame)) = (&g.view, &g.window, &g.frame) else { return };
+        let (Some(view), Some(EditorWindow::Plain(win)), Some(frame)) = (&g.view, &g.window, &g.frame) else { return };
         if !window::on_main_thread() {
             return;
         }
@@ -2222,7 +2290,7 @@ impl EditorLink {
         if !g.resizable {
             return;
         }
-        let (Some(view), Some(win), Some(frame)) = (&g.view, &g.window, &g.frame) else { return };
+        let (Some(view), Some(EditorWindow::Plain(win)), Some(frame)) = (&g.view, &g.window, &g.frame) else { return };
         let Some(cur) = window::client_size(win.raw()) else { return };
         // A minimised window reports no client area; the view keeps its size then.
         if cur.0 < 1.0 || cur.1 < 1.0 || cur == frame.size() {
@@ -2310,6 +2378,26 @@ impl EditorLink {
             return;
         }
         EditorLink::follow_window(&mut g);
+        EditorLink::sync_scaled(&mut g);
+        if let Some(EditorWindow::Scaled(s)) = g.window.as_mut() {
+            s.pump();
+        }
+    }
+
+    /// Applies a size the plugin asked for (`resizeView`) to a scaled window: the plug frame can't
+    /// reach the upscaler, so the frame's size is picked up here, once per UI frame.
+    fn sync_scaled(g: &mut EditorInner) {
+        let want = match g.frame.as_ref() {
+            Some(frame) => frame.size(),
+            None => return,
+        };
+        if want == g.shown {
+            return;
+        }
+        if let Some(win @ EditorWindow::Scaled(_)) = g.window.as_mut() {
+            win.set_native_size(want);
+            g.shown = want;
+        }
     }
 
     /// Normalized → plain through the controller (main thread).

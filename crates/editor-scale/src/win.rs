@@ -72,6 +72,10 @@ pub struct ScaledWindow {
     state: *mut State,
 }
 
+// SAFETY: the owned state is only touched on the UI thread (the methods are called there); the
+// struct merely carries the pointer between the host's locks, as `HostWindow` does in the hosts.
+unsafe impl Send for ScaledWindow {}
+
 /// Everything behind the visible window. Owned through a raw pointer stored in the visible
 /// window's `GWLP_USERDATA`; freed in [`ScaledWindow::drop`] after the windows are destroyed.
 struct State {

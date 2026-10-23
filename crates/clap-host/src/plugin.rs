@@ -2,7 +2,8 @@
 
 use crate::ffi::{EVENT_CAP, Event, GuiLink, Instance, NotePort, PortBuffers};
 use clap_sys::ext::note_ports::{CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI};
-use soundcraft_dsp::{EditorScale, EditorScaleMode, Plugin, PluginEditor, PluginInfo, Transport};
+use soundcraft_dsp::{EditorScale, Plugin, PluginEditor, PluginInfo, Transport};
+use soundcraft_editor_scale::plan;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -10,8 +11,6 @@ use std::sync::atomic::Ordering;
 const MAX_BLOCK: usize = 1 << 16;
 /// Most channels a host strip may ask for.
 const MAX_CHANNELS: usize = 64;
-/// Host-side upscaling is not wired up yet (floating GUIs can't be upscaled at all).
-const UPSCALE_UNSUPPORTED: &str = "upscaling is not wired up yet";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum NoteMode {
@@ -345,22 +344,15 @@ impl PluginEditor for ClapEditor {
     }
 
     fn set_scale(&mut self, scale: EditorScale) -> Result<(), String> {
-        let factor = scale.clamped_factor();
-        // Upscaling (host-side stretching) is not wired up yet.
-        if matches!(scale.mode, EditorScaleMode::Upscale(_)) {
-            return Err(UPSCALE_UNSUPPORTED.into());
-        }
-        if factor != 1.0 && !self.link.native_scaling() {
-            return Err(match scale.mode {
-                EditorScaleMode::Native => "this plugin cannot draw itself at another size".into(),
-                _ => UPSCALE_UNSUPPORTED.into(),
-            });
-        }
+        let new = EditorScale { factor: scale.clamped_factor(), mode: scale.mode };
+        // Refuses a `Native` scale the plugin can't draw; how the rest is shown is decided on open
+        // (an embedded editor, or a floating one that can't be upscaled, is only known then).
+        plan(new.mode, new.factor, self.link.native_scaling()).map_err(str::to_string)?;
         let prev = self.link.editor_scale();
         let was_open = self.link.is_open();
-        self.link.set_editor_scale(factor);
+        self.link.set_editor_scale(new);
         // Applied on open: an open editor is closed and reopened at the new scale.
-        if !was_open || prev == factor {
+        if !was_open || prev == new {
             return Ok(());
         }
         self.link.close();
@@ -388,7 +380,7 @@ impl PluginEditor for ClapEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soundcraft_dsp::{Category, UpscaleFilter};
+    use soundcraft_dsp::{Category, EditorScaleMode, UpscaleFilter};
 
     fn editor() -> ClapEditor {
         static INFO: PluginInfo =
@@ -397,19 +389,23 @@ mod tests {
     }
 
     #[test]
-    fn upscale_modes_are_refused_for_now() {
+    fn upscale_modes_are_accepted_and_remembered() {
+        // No GUI behind this link: the upscale is decided (and needs an embedded editor) on open.
         let mut e = editor();
-        for mode in [EditorScaleMode::Upscale(UpscaleFilter::Fsr1), EditorScaleMode::Upscale(UpscaleFilter::Bilinear)] {
-            assert_eq!(e.set_scale(EditorScale { factor: 1.5, mode }), Err(UPSCALE_UNSUPPORTED.to_string()));
+        for filter in [UpscaleFilter::Fsr1, UpscaleFilter::Bilinear] {
+            let scale = EditorScale { factor: 1.5, mode: EditorScaleMode::Upscale(filter) };
+            assert!(e.set_scale(scale).is_ok());
+            assert_eq!(e.link.editor_scale(), scale);
         }
     }
 
     #[test]
-    fn auto_at_another_scale_needs_native_support() {
-        // No GUI behind this link, so nothing can be scaled natively.
+    fn auto_at_another_scale_is_upscaled_without_native_support() {
+        // No GUI behind this link, so nothing is known to scale natively: Auto upscales.
         let mut e = editor();
         assert!(!e.native_scaling());
-        assert_eq!(e.set_scale(EditorScale { factor: 2.0, mode: EditorScaleMode::Auto }), Err(UPSCALE_UNSUPPORTED.to_string()));
+        assert!(e.set_scale(EditorScale { factor: 2.0, mode: EditorScaleMode::Auto }).is_ok());
+        assert_eq!(e.link.editor_scale().factor, 2.0);
         assert!(e.set_scale(EditorScale { factor: 2.0, mode: EditorScaleMode::Native }).is_err());
     }
 
@@ -417,6 +413,6 @@ mod tests {
     fn factor_one_is_always_accepted_and_remembered() {
         let mut e = editor();
         assert!(e.set_scale(EditorScale::default()).is_ok());
-        assert_eq!(e.link.editor_scale(), 1.0);
+        assert_eq!(e.link.editor_scale().factor, 1.0);
     }
 }

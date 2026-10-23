@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 soundcraft-dsp.workspace = true
+soundcraft-editor-scale.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 log.workspace = true

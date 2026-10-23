@@ -36,7 +36,8 @@ use clap_sys::plugin::clap_plugin;
 use clap_sys::process::{CLAP_PROCESS_ERROR, clap_process};
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
-use soundcraft_dsp::Transport;
+use soundcraft_dsp::{EditorScale, Transport, UpscaleFilter};
+use soundcraft_editor_scale::{Choice, ScaledWindow, plan};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
@@ -279,7 +280,16 @@ impl Bundle {
         inst.state_ext = inst.extension::<clap_plugin_state>(CLAP_EXT_STATE);
         let gui = inst.extension::<clap_plugin_gui>(CLAP_EXT_GUI);
         inst.gui = Arc::new(GuiLink {
-            inner: Mutex::new(GuiInner { plugin, gui, state: inst.state_ext, alive: true, created: false, visible: false, window: None, scale: 1.0 }),
+            inner: Mutex::new(GuiInner {
+                plugin,
+                gui,
+                state: inst.state_ext,
+                alive: true,
+                created: false,
+                visible: false,
+                window: None,
+                scale: EditorScale::default(),
+            }),
             host: Arc::clone(&inst.state),
         });
         Ok(inst)
@@ -750,10 +760,57 @@ struct GuiInner {
     alive: bool,
     created: bool,
     visible: bool,
-    /// The host window of an embedded editor (`None` for floating editors).
-    window: Option<hostwin::HostWindow>,
-    /// The scale factor applied to each GUI as it is created (1.0 = the plugin's own size).
-    scale: f32,
+    /// The window of an embedded editor (`None` for floating editors).
+    window: Option<EditorWindow>,
+    /// The scale applied to each GUI as it is created (factor 1.0 = the plugin's own size).
+    scale: EditorScale,
+}
+
+/// The window an embedded editor is shown in: a host window the plugin draws in at its scale, or a
+/// [`ScaledWindow`] the plugin draws at its own size and the host stretches.
+enum EditorWindow {
+    Plain(hostwin::HostWindow),
+    Scaled(ScaledWindow),
+}
+
+impl EditorWindow {
+    /// The `HWND` the plugin attaches to.
+    fn parent(&self) -> *mut c_void {
+        match self {
+            EditorWindow::Plain(w) => w.parent(),
+            EditorWindow::Scaled(s) => s.parent(),
+        }
+    }
+
+    /// Sets the editor's own (unscaled) size: the host window's client area, or the scaled
+    /// window's native size.
+    fn set_native_size(&mut self, w: u32, h: u32) {
+        match self {
+            EditorWindow::Plain(win) => hostwin::resize(win.raw(), f64::from(w), f64::from(h)),
+            EditorWindow::Scaled(s) => s.resize_native(w, h),
+        }
+    }
+
+    fn raise(&self) {
+        match self {
+            EditorWindow::Plain(w) => w.raise(),
+            EditorWindow::Scaled(s) => s.raise(),
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        match self {
+            EditorWindow::Plain(w) => w.is_visible(),
+            EditorWindow::Scaled(s) => s.is_visible(),
+        }
+    }
+
+    fn close(self) {
+        match self {
+            EditorWindow::Plain(w) => w.close(),
+            EditorWindow::Scaled(s) => s.close(),
+        }
+    }
 }
 
 /// The link between an instance and its editor and state handles. The instance may process on
@@ -778,7 +835,7 @@ impl Default for GuiLink {
                 created: false,
                 visible: false,
                 window: None,
-                scale: 1.0,
+                scale: EditorScale::default(),
             }),
             host: Arc::new(HostState::default()),
         }
@@ -848,27 +905,31 @@ impl GuiLink {
         if !on_main_thread() {
             return false;
         }
-        let g = self.lock();
-        let Some(vt) = GuiLink::vt(&g) else { return false };
+        GuiLink::native_of(&self.lock())
+    }
+
+    /// [`GuiLink::native_scaling`] for a locked link (the caller holds the lock).
+    fn native_of(g: &GuiInner) -> bool {
+        let Some(vt) = GuiLink::vt(g) else { return false };
         if !cfg!(target_os = "macos") && vt.set_scale.is_some() {
             return true;
         }
         match vt.can_resize {
-            // SAFETY: live plugin (`vt` exists only while `alive`); main thread (checked above).
+            // SAFETY: live plugin (`vt` exists only while `alive`); main thread (callers check).
             Some(f) if g.created => unsafe { f(g.plugin) },
             Some(_) => true,
             None => false,
         }
     }
 
-    /// The scale factor the next open applies (1.0 unless changed).
-    pub fn editor_scale(&self) -> f32 {
+    /// The scale the next open applies (factor 1.0 and Auto unless changed).
+    pub fn editor_scale(&self) -> EditorScale {
         self.lock().scale
     }
 
-    /// Stores the scale factor for the next open. The caller reopens an editor that is open.
-    pub fn set_editor_scale(&self, factor: f32) {
-        self.lock().scale = if factor.is_finite() { factor.clamp(0.5, 4.0) } else { 1.0 };
+    /// Stores the scale for the next open. The caller reopens an editor that is open.
+    pub fn set_editor_scale(&self, scale: EditorScale) {
+        self.lock().scale = EditorScale { factor: scale.clamped_factor(), mode: scale.mode };
     }
 
     pub fn available(&self) -> bool {
@@ -906,12 +967,23 @@ impl GuiLink {
         let api = window_api().ok_or_else(|| "plugin editors are not supported on this platform".to_string())?;
         let (Some(supported), Some(create)) = (vt.is_api_supported, vt.create) else { return Err("incomplete clap.gui extension".into()) };
         // SAFETY: live plugin; `api` is a static NUL-terminated string; main thread.
-        if !unsafe { supported(g.plugin, api.as_ptr(), true) } {
-            // SAFETY: as above.
-            if hostwin::SUPPORTED && unsafe { supported(g.plugin, api.as_ptr(), false) } {
-                return self.open_embedded(&mut g, vt, api, title);
+        let floating = unsafe { supported(g.plugin, api.as_ptr(), true) };
+        // SAFETY: as above.
+        let embedded = hostwin::SUPPORTED && unsafe { supported(g.plugin, api.as_ptr(), false) };
+        let choice = plan(g.scale.mode, g.scale.clamped_factor(), GuiLink::native_of(&g))?;
+        match choice {
+            // Only an embedded editor has a window we can stretch; floating editors can't be upscaled.
+            Choice::Upscale(filter) if embedded => return self.open_embedded(&mut g, vt, api, title, Some(filter)),
+            Choice::Upscale(_) => {
+                return Err("this plugin's editor opens only as a floating window, which cannot be upscaled (use a native scale)".into());
             }
-            return Err("this plugin offers only an embedded editor, which SoundCraft hosts on Windows only".into());
+            Choice::Plain | Choice::Native if !floating => {
+                if embedded {
+                    return self.open_embedded(&mut g, vt, api, title, None);
+                }
+                return Err("this plugin offers only an embedded editor, which SoundCraft hosts on Windows only".into());
+            }
+            Choice::Plain | Choice::Native => {}
         }
         self.host.gui_closed.store(false, Ordering::Relaxed);
         self.host.gui_destroyed.store(false, Ordering::Relaxed);
@@ -920,8 +992,8 @@ impl GuiLink {
             return Err("the plugin could not create its editor".into());
         }
         g.created = true;
-        let scale = g.scale;
-        if let Err(e) = apply_scale(&g, vt, scale) {
+        let factor = g.scale.clamped_factor();
+        if let Err(e) = apply_scale(&g, vt, factor) {
             GuiLink::destroy(&mut g);
             return Err(e);
         }
@@ -943,7 +1015,8 @@ impl GuiLink {
     }
 
     /// Embeds the editor in a host window of ours (plugins that offer no floating editor).
-    fn open_embedded(&self, g: &mut GuiInner, vt: clap_plugin_gui, api: &CStr, title: &str) -> Result<(), String> {
+    /// With `upscale`, the plugin draws at its own size in a [`ScaledWindow`] that stretches it.
+    fn open_embedded(&self, g: &mut GuiInner, vt: clap_plugin_gui, api: &CStr, title: &str, upscale: Option<UpscaleFilter>) -> Result<(), String> {
         let (Some(create), Some(set_parent)) = (vt.create, vt.set_parent) else { return Err("incomplete clap.gui extension".into()) };
         self.host.gui_closed.store(false, Ordering::Relaxed);
         self.host.gui_destroyed.store(false, Ordering::Relaxed);
@@ -953,8 +1026,10 @@ impl GuiLink {
             return Err("the plugin could not create its editor".into());
         }
         g.created = true;
-        let scale = g.scale;
-        if let Err(e) = apply_scale(g, vt, scale) {
+        let factor = g.scale.clamped_factor();
+        // An upscaled editor draws at its own size: no scale goes to the plugin.
+        let applied = if upscale.is_some() { 1.0 } else { factor };
+        if let Err(e) = apply_scale(g, vt, applied) {
             GuiLink::destroy(g);
             return Err(e);
         }
@@ -967,7 +1042,11 @@ impl GuiLink {
                 (w, h) = (a.min(16_384), b.min(16_384));
             }
         }
-        let win = match hostwin::HostWindow::new(title, f64::from(w), f64::from(h)) {
+        let made = match upscale {
+            Some(filter) => ScaledWindow::new(title, w, h, factor, filter).map(EditorWindow::Scaled),
+            None => hostwin::HostWindow::new(title, f64::from(w), f64::from(h)).map(EditorWindow::Plain),
+        };
+        let win = match made {
             Ok(win) => win,
             Err(e) => {
                 GuiLink::destroy(g);
@@ -1040,7 +1119,7 @@ impl GuiLink {
 
     pub fn is_open(&self) -> bool {
         let g = self.lock();
-        g.alive && g.created && g.visible && g.window.as_ref().is_none_or(hostwin::HostWindow::is_visible)
+        g.alive && g.created && g.visible && g.window.as_ref().is_none_or(EditorWindow::is_visible)
     }
 
     /// Main-thread housekeeping: runs a requested `on_main_thread`, follows the plugin's
@@ -1062,15 +1141,20 @@ impl GuiLink {
         }
         if g.created {
             let resize = self.host.gui_resize.swap(0, Ordering::Relaxed);
+            let set_size = GuiLink::vt(&g).and_then(|v| v.set_size);
+            let plugin = g.plugin;
             if resize != 0
-                && let Some(win) = &g.window
+                && let Some(win) = g.window.as_mut()
             {
                 let (w, h) = ((resize >> 32) as u32, resize as u32);
-                hostwin::resize(win.raw(), f64::from(w), f64::from(h));
-                if let Some(f) = GuiLink::vt(&g).and_then(|v| v.set_size) {
+                win.set_native_size(w, h);
+                if let Some(f) = set_size {
                     // SAFETY: live plugin with a created embedded GUI, main thread.
-                    unsafe { f(g.plugin, w, h) };
+                    unsafe { f(plugin, w, h) };
                 }
+            }
+            if let Some(EditorWindow::Scaled(s)) = g.window.as_mut() {
+                s.pump();
             }
             if g.window.as_ref().is_some_and(|w| !w.is_visible()) {
                 // The user closed the embedded editor's host window: free the editor.

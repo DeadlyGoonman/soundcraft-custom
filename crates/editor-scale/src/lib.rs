@@ -14,6 +14,69 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+use soundcraft_dsp::{EditorScaleMode, UpscaleFilter};
+
+/// How a plugin editor's window is built for a scale and mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// A host window at the plugin's own size (no scaling asked for).
+    Plain,
+    /// A host window; the plugin draws itself at the scale.
+    Native,
+    /// A [`ScaledWindow`] stretched by the upscaler with this filter.
+    Upscale(UpscaleFilter),
+}
+
+/// Decides how an editor is shown. `factor` is the clamped scale (1.0 = the plugin's own size) and
+/// `native` says whether the plugin can draw itself at another size. `Auto` uses the plugin's own
+/// scaling when it has it and FSR 1 otherwise; `Native` is an error when the plugin lacks it.
+pub fn plan(mode: EditorScaleMode, factor: f32, native: bool) -> Result<Choice, &'static str> {
+    let unit = factor == 1.0;
+    match mode {
+        EditorScaleMode::Auto if unit => Ok(Choice::Plain),
+        EditorScaleMode::Auto if native => Ok(Choice::Native),
+        EditorScaleMode::Auto => Ok(Choice::Upscale(UpscaleFilter::Fsr1)),
+        EditorScaleMode::Native if !native => Err("this plugin cannot scale its editor natively"),
+        EditorScaleMode::Native if unit => Ok(Choice::Plain),
+        EditorScaleMode::Native => Ok(Choice::Native),
+        EditorScaleMode::Upscale(_) if unit => Ok(Choice::Plain),
+        EditorScaleMode::Upscale(filter) => Ok(Choice::Upscale(filter)),
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn factor_one_is_always_the_plain_window() {
+        assert_eq!(plan(EditorScaleMode::Auto, 1.0, false), Ok(Choice::Plain));
+        assert_eq!(plan(EditorScaleMode::Auto, 1.0, true), Ok(Choice::Plain));
+        assert_eq!(plan(EditorScaleMode::Native, 1.0, true), Ok(Choice::Plain));
+        assert!(plan(EditorScaleMode::Native, 1.0, false).is_err());
+        assert_eq!(plan(EditorScaleMode::Upscale(UpscaleFilter::Fsr1), 1.0, false), Ok(Choice::Plain));
+    }
+
+    #[test]
+    fn auto_prefers_native_then_fsr1() {
+        assert_eq!(plan(EditorScaleMode::Auto, 1.5, true), Ok(Choice::Native));
+        assert_eq!(plan(EditorScaleMode::Auto, 2.0, false), Ok(Choice::Upscale(UpscaleFilter::Fsr1)));
+        assert_eq!(plan(EditorScaleMode::Auto, 0.5, false), Ok(Choice::Upscale(UpscaleFilter::Fsr1)));
+    }
+
+    #[test]
+    fn native_needs_native_support() {
+        assert_eq!(plan(EditorScaleMode::Native, 2.0, true), Ok(Choice::Native));
+        assert!(plan(EditorScaleMode::Native, 2.0, false).is_err());
+    }
+
+    #[test]
+    fn upscale_uses_the_chosen_filter() {
+        assert_eq!(plan(EditorScaleMode::Upscale(UpscaleFilter::Bilinear), 1.25, true), Ok(Choice::Upscale(UpscaleFilter::Bilinear)));
+        assert_eq!(plan(EditorScaleMode::Upscale(UpscaleFilter::Fsr1), 3.0, false), Ok(Choice::Upscale(UpscaleFilter::Fsr1)));
+    }
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod win;
