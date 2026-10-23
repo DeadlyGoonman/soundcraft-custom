@@ -287,9 +287,46 @@ fn check(channels: usize, sample_rate: u32, depth: BitDepth) -> Result<u32> {
     }
 }
 
-fn stream_info(channels: usize, sample_rate: u32, bps: u32, total: u64) -> Vec<u8> {
+/// `VORBIS_COMMENT` metadata block (type 4), little-endian length-prefixed strings per the Vorbis
+/// comment spec. `None` when every field is empty.
+fn vorbis_comment_block(m: &crate::Metadata) -> Option<Vec<u8>> {
+    if m.is_empty() {
+        return None;
+    }
+    let vendor = concat!("SoundCraft ", env!("CARGO_PKG_VERSION"));
+    let mut comments = Vec::new();
+    let mut push = |key: &str, v: &str| {
+        if !v.is_empty() {
+            comments.push(format!("{key}={v}"));
+        }
+    };
+    push("TITLE", &m.title);
+    push("ARTIST", &m.artist);
+    push("ALBUM", &m.album);
+    push("GENRE", &m.genre);
+    push("DATE", &m.year);
+    push("COMMENT", &m.comment);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    body.extend_from_slice(vendor.as_bytes());
+    body.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for c in &comments {
+        body.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        body.extend_from_slice(c.as_bytes());
+    }
+
+    let mut block = Vec::with_capacity(4 + body.len());
+    block.push(1 << 7 | 4); // last metadata block, type 4 (VORBIS_COMMENT)
+    let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+    block.extend_from_slice(&len.to_be_bytes()[1..4]);
+    block.extend_from_slice(&body);
+    Some(block)
+}
+
+fn stream_info(channels: usize, sample_rate: u32, bps: u32, total: u64, has_more: bool) -> Vec<u8> {
     let mut si = BitWriter::new();
-    si.write(1, 1); // last metadata block
+    si.write(u64::from(!has_more), 1); // last metadata block, unless a VORBIS_COMMENT follows
     si.write(0, 7); // STREAMINFO
     si.write(34, 24);
     si.write(BLOCK_SIZE as u64, 16);
@@ -318,6 +355,7 @@ pub(crate) struct Writer<W> {
     pending: Vec<Vec<i64>>,
     frames: u64,
     frame_no: u64,
+    has_comment: bool,
     /// Set when a frame write has failed: `write_frame` clears the pending samples before
     /// writing, so a failed frame is lost while `frames` still counts it; the writer refuses
     /// every later call.
@@ -325,11 +363,22 @@ pub(crate) struct Writer<W> {
 }
 
 impl<W: Write + Seek> Writer<W> {
-    pub(crate) fn new(mut out: W, channels: usize, sample_rate: u32, depth: BitDepth, dither: bool) -> Result<Self> {
+    pub(crate) fn new(
+        mut out: W,
+        channels: usize,
+        sample_rate: u32,
+        depth: BitDepth,
+        dither: bool,
+        metadata: Option<&crate::Metadata>,
+    ) -> Result<Self> {
         let bps = check(channels, sample_rate, depth)?;
         let start = out.stream_position()?;
         out.write_all(b"fLaC")?;
-        out.write_all(&stream_info(channels, sample_rate, bps, 0))?;
+        let comment = metadata.and_then(vorbis_comment_block);
+        out.write_all(&stream_info(channels, sample_rate, bps, 0, comment.is_some()))?;
+        if let Some(c) = &comment {
+            out.write_all(c)?;
+        }
         Ok(Writer {
             out,
             start,
@@ -340,6 +389,7 @@ impl<W: Write + Seek> Writer<W> {
             pending: (0..channels).map(|_| Vec::with_capacity(BLOCK_SIZE)).collect(),
             frames: 0,
             frame_no: 0,
+            has_comment: comment.is_some(),
             failed: false,
         })
     }
@@ -423,7 +473,7 @@ impl<W: Write + Seek> Writer<W> {
             return Err(crate::failed_write_error());
         }
         self.write_frame()?;
-        let info = stream_info(self.channels, self.sample_rate, self.bps, self.frames);
+        let info = stream_info(self.channels, self.sample_rate, self.bps, self.frames, self.has_comment);
         self.out.seek(SeekFrom::Start(self.start.saturating_add(4)))?;
         self.out.write_all(&info)?;
         self.out.seek(SeekFrom::End(0))?;
@@ -432,14 +482,14 @@ impl<W: Write + Seek> Writer<W> {
     }
 }
 
-pub(crate) fn encode(buf: &AudioBuffer, depth: BitDepth, dither: bool) -> Result<Vec<u8>> {
+pub(crate) fn encode(buf: &AudioBuffer, depth: BitDepth, dither: bool, metadata: Option<&crate::Metadata>) -> Result<Vec<u8>> {
     validate_buffer(buf)?;
     let bps = check(buf.channels.len(), buf.sample_rate, depth)?;
     let frames = buf.frames();
     let mut out = Vec::new();
     out.try_reserve(frames.saturating_mul(buf.channels.len()).saturating_mul(bps as usize / 8) / 2)
         .map_err(|_| AudioError::TooLarge("cannot allocate FLAC output".into()))?;
-    let mut w = Writer::new(Cursor::new(out), buf.channels.len(), buf.sample_rate, depth, dither)?;
+    let mut w = Writer::new(Cursor::new(out), buf.channels.len(), buf.sample_rate, depth, dither, metadata)?;
     w.write(&buf.channels, frames)?;
     Ok(w.finish()?.into_inner())
 }

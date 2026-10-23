@@ -150,7 +150,7 @@ fn convert(args: &[String]) -> ExitCode {
     let Some(format) = soundcraft_audio_io::encode_format_for(&out_ext) else {
         return fail(format!("{output}: cannot write `.{out_ext}` files (supported: {})", soundcraft_audio_io::ENCODE_EXTENSIONS));
     };
-    let opts = soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: true, bwf: None };
+    let opts = soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: true, bwf: None, metadata: None };
     match soundcraft_audio_io::encode(&buf, &opts).map_err(|e| e.to_string()).and_then(|b| std::fs::write(output, b).map_err(|e| e.to_string())) {
         Ok(()) => {
             outln!("wrote {output} ({} ch, {} Hz, {:.2} s)", buf.num_channels(), buf.sample_rate, buf.duration_secs());

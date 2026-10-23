@@ -161,15 +161,15 @@ fn push_chunk(out: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
 }
 
 /// Encode AIFF (integer depths) or AIFF-C `fl32` (Float32).
-pub(crate) fn encode(buf: &AudioBuffer, depth: BitDepth, dither: bool) -> Result<Vec<u8>> {
+pub(crate) fn encode(buf: &AudioBuffer, depth: BitDepth, dither: bool, metadata: Option<&crate::Metadata>) -> Result<Vec<u8>> {
     validate_buffer(buf)?;
     let frames = buf.frames();
-    let head_len = header(buf.channels.len(), buf.sample_rate, depth, frames as u64)?.len();
+    let head_len = header(buf.channels.len(), buf.sample_rate, depth, frames as u64, metadata)?.len();
     let data_len = usize::from(sample_format(depth).0 / 8).saturating_mul(buf.channels.len()).saturating_mul(frames);
     let total = head_len.saturating_add(data_len).saturating_add(1);
     let mut out = Vec::new();
     out.try_reserve_exact(total).map_err(|_| AudioError::TooLarge(format!("cannot allocate {total} bytes for AIFF output")))?;
-    let mut w = Writer::new(Cursor::new(out), buf.channels.len(), buf.sample_rate, depth, dither)?;
+    let mut w = Writer::new(Cursor::new(out), buf.channels.len(), buf.sample_rate, depth, dither, metadata)?;
     w.write(&buf.channels, frames)?;
     Ok(w.finish()?.into_inner())
 }
@@ -182,6 +182,7 @@ pub(crate) struct Writer<W> {
     channels: usize,
     sample_rate: u32,
     depth: BitDepth,
+    metadata: Option<crate::Metadata>,
     quantizers: Vec<Quantizer>,
     frames: u64,
     bytes: Vec<u8>,
@@ -191,18 +192,25 @@ pub(crate) struct Writer<W> {
 }
 
 impl<W: Write + Seek> Writer<W> {
-    pub(crate) fn new(mut out: W, channels: usize, sample_rate: u32, depth: BitDepth, dither: bool) -> Result<Self> {
+    pub(crate) fn new(
+        mut out: W,
+        channels: usize,
+        sample_rate: u32,
+        depth: BitDepth,
+        dither: bool,
+        metadata: Option<&crate::Metadata>,
+    ) -> Result<Self> {
         validate_layout(channels, sample_rate)?;
         let start = out.stream_position()?;
-        out.write_all(&header(channels, sample_rate, depth, 0)?)?;
+        out.write_all(&header(channels, sample_rate, depth, 0, metadata)?)?;
         let quantizers = Quantizer::per_channel(u32::from(sample_format(depth).0), dither, channels);
-        Ok(Writer { out, start, channels, sample_rate, depth, quantizers, frames: 0, bytes: Vec::new(), failed: false })
+        Ok(Writer { out, start, channels, sample_rate, depth, metadata: metadata.cloned(), quantizers, frames: 0, bytes: Vec::new(), failed: false })
     }
 
     /// The frame count after `frames` more, or an error when AIFF can't hold that many (4 GiB).
     pub(crate) fn check_room(&self, frames: u64) -> Result<u64> {
         let total = self.frames.saturating_add(frames);
-        header(self.channels, self.sample_rate, self.depth, total)?;
+        header(self.channels, self.sample_rate, self.depth, total, self.metadata.as_ref())?;
         Ok(total)
     }
 
@@ -229,7 +237,7 @@ impl<W: Write + Seek> Writer<W> {
         if data_len % 2 == 1 {
             self.out.write_all(&[0])?;
         }
-        let head = header(self.channels, self.sample_rate, self.depth, self.frames)?;
+        let head = header(self.channels, self.sample_rate, self.depth, self.frames, self.metadata.as_ref())?;
         self.out.seek(SeekFrom::Start(self.start))?;
         self.out.write_all(&head)?;
         self.out.seek(SeekFrom::End(0))?;
@@ -238,9 +246,28 @@ impl<W: Write + Seek> Writer<W> {
     }
 }
 
+/// `ANNO` body: comment, with album/genre/year folded in as extra lines (AIFF has no chunk for
+/// them). Empty when none of the four are set.
+fn annotation(m: &crate::Metadata) -> Option<String> {
+    let mut lines = Vec::new();
+    if !m.album.is_empty() {
+        lines.push(format!("Album: {}", m.album));
+    }
+    if !m.genre.is_empty() {
+        lines.push(format!("Genre: {}", m.genre));
+    }
+    if !m.year.is_empty() {
+        lines.push(format!("Year: {}", m.year));
+    }
+    if !m.comment.is_empty() {
+        lines.push(m.comment.clone());
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// Everything before the sample data of an AIFF holding `frames` frames; its length doesn't
 /// depend on `frames`.
-fn header(channels: usize, sample_rate: u32, depth: BitDepth, frames: u64) -> Result<Vec<u8>> {
+fn header(channels: usize, sample_rate: u32, depth: BitDepth, frames: u64, metadata: Option<&crate::Metadata>) -> Result<Vec<u8>> {
     let channels_i16 = i16::try_from(channels).map_err(|_| AudioError::Encode("too many channels for AIFF".into()))?;
     let frames_u32 = u32::try_from(frames).map_err(|_| AudioError::TooLarge("too many frames for AIFF".into()))?;
     let (bits, is_float) = sample_format(depth);
@@ -269,6 +296,17 @@ fn header(channels: usize, sample_rate: u32, depth: BitDepth, frames: u64) -> Re
         push_chunk(&mut head, b"FVER", &AIFC_VERSION_1.to_be_bytes());
     }
     push_chunk(&mut head, b"COMM", &comm);
+    if let Some(m) = metadata {
+        if !m.title.is_empty() {
+            push_chunk(&mut head, b"NAME", m.title.as_bytes());
+        }
+        if !m.artist.is_empty() {
+            push_chunk(&mut head, b"AUTH", m.artist.as_bytes());
+        }
+        if let Some(anno) = annotation(m) {
+            push_chunk(&mut head, b"ANNO", anno.as_bytes());
+        }
+    }
     head.extend_from_slice(b"SSND");
     let ssnd_len = u32::try_from(data_len.saturating_add(8)).map_err(|_| AudioError::TooLarge("AIFF data exceeds 4 GiB".into()))?;
     head.extend_from_slice(&ssnd_len.to_be_bytes());

@@ -206,6 +206,22 @@ pub fn str_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
     p.get(key).and_then(Value::as_str)
 }
 
+/// `{"metadata": {"title"?, "artist"?, "album"?, "genre"?, "year"?, "comment"?}}` (all optional
+/// strings). `None` when there is no `metadata` object, or every field in it is empty.
+pub fn metadata_param(p: &Value) -> Option<soundcraft_audio_io::Metadata> {
+    let m = p.get("metadata")?;
+    let field = |key: &str| m.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    let metadata = soundcraft_audio_io::Metadata {
+        title: field("title"),
+        artist: field("artist"),
+        album: field("album"),
+        genre: field("genre"),
+        year: field("year"),
+        comment: field("comment"),
+    };
+    (!metadata.is_empty()).then_some(metadata)
+}
+
 /// Resolve a track from `track` (id number or name) params.
 pub fn track_param(e: &Engine, cmd: &str, p: &Value, key: &str) -> Result<Option<TrackId>> {
     let Some(v) = p.get(key) else { return Ok(None) };

@@ -118,6 +118,31 @@ pub enum BitDepth {
     Float32,
 }
 
+/// Optional tags written into the file (WAV `LIST/INFO`, AIFF `NAME`/`AUTH`/`ANNO`, FLAC
+/// `VORBIS_COMMENT`). Every field is optional; empty fields write nothing. AIFF has no standard
+/// album/genre/year chunk, so those three are folded into its `ANNO` chunk as `key: value` lines.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Metadata {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub genre: String,
+    /// Free-form; a plain year (`"2026"`) or a full date, whatever the session wants recorded.
+    pub year: String,
+    pub comment: String,
+}
+
+impl Metadata {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_empty()
+            && self.artist.is_empty()
+            && self.album.is_empty()
+            && self.genre.is_empty()
+            && self.year.is_empty()
+            && self.comment.is_empty()
+    }
+}
+
 /// Options for [`encode`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EncodeOptions {
@@ -128,11 +153,13 @@ pub struct EncodeOptions {
     pub dither: bool,
     /// Write a BWF `bext` chunk (WAV only; ignored for other formats).
     pub bwf: Option<BwfInfo>,
+    /// Title/artist/album/genre/year/comment tags, written in each format's native way.
+    pub metadata: Option<Metadata>,
 }
 
 impl Default for EncodeOptions {
     fn default() -> Self {
-        Self { format: FileFormat::Wav, bit_depth: BitDepth::Int24, dither: false, bwf: None }
+        Self { format: FileFormat::Wav, bit_depth: BitDepth::Int24, dither: false, bwf: None, metadata: None }
     }
 }
 
@@ -259,9 +286,9 @@ pub fn decode(bytes: &[u8], ext_hint: Option<&str>) -> Result<(AudioInfo, AudioB
 /// Encode `buf` as WAV/BWF, AIFF/AIFF-C or FLAC. Samples are clamped to [-1, 1].
 pub fn encode(buf: &AudioBuffer, opts: &EncodeOptions) -> Result<Vec<u8>> {
     match opts.format {
-        FileFormat::Wav => wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), false, None),
-        FileFormat::Aiff => aiff::encode(buf, opts.bit_depth, opts.dither),
-        FileFormat::Flac => flac::encode(buf, opts.bit_depth, opts.dither),
+        FileFormat::Wav => wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), false, None, opts.metadata.as_ref()),
+        FileFormat::Aiff => aiff::encode(buf, opts.bit_depth, opts.dither, opts.metadata.as_ref()),
+        FileFormat::Flac => flac::encode(buf, opts.bit_depth, opts.dither, opts.metadata.as_ref()),
         other => Err(AudioError::Unsupported(format!("encoding {other:?} is not supported"))),
     }
 }
@@ -281,7 +308,7 @@ pub fn encode_format_for(name: &str) -> Option<FileFormat> {
 
 /// Encode a WAV file in the RF64 layout regardless of size (normally used only above 4 GiB).
 pub fn encode_wav_rf64(buf: &AudioBuffer, opts: &EncodeOptions) -> Result<Vec<u8>> {
-    wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), true, None)
+    wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), true, None, opts.metadata.as_ref())
 }
 
 /// Like [`encode`], with an explicit WAV speaker mask (`dwChannelMask`, e.g. 0x60F) for layouts
@@ -289,7 +316,7 @@ pub fn encode_wav_rf64(buf: &AudioBuffer, opts: &EncodeOptions) -> Result<Vec<u8
 /// FLAC have fixed channel orders and ignore it.
 pub fn encode_with_channel_mask(buf: &AudioBuffer, opts: &EncodeOptions, mask: u32) -> Result<Vec<u8>> {
     match opts.format {
-        FileFormat::Wav => wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), false, Some(mask)),
+        FileFormat::Wav => wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), false, Some(mask), opts.metadata.as_ref()),
         _ => encode(buf, opts),
     }
 }
@@ -317,9 +344,11 @@ impl<W: Write + Seek> FileEncoder<W> {
     pub fn new(out: W, opts: &EncodeOptions, channels: usize, sample_rate: u32, mask: Option<u32>) -> Result<Self> {
         let (depth, dither) = (opts.bit_depth, opts.dither);
         Ok(FileEncoder(match opts.format {
-            FileFormat::Wav => Writer::Wav(wav::Writer::new(out, channels, sample_rate, depth, dither, opts.bwf.as_ref(), mask, false)?),
-            FileFormat::Aiff => Writer::Aiff(aiff::Writer::new(out, channels, sample_rate, depth, dither)?),
-            FileFormat::Flac => Writer::Flac(flac::Writer::new(out, channels, sample_rate, depth, dither)?),
+            FileFormat::Wav => {
+                Writer::Wav(wav::Writer::new(out, channels, sample_rate, depth, dither, opts.bwf.as_ref(), mask, false, opts.metadata.as_ref())?)
+            }
+            FileFormat::Aiff => Writer::Aiff(aiff::Writer::new(out, channels, sample_rate, depth, dither, opts.metadata.as_ref())?),
+            FileFormat::Flac => Writer::Flac(flac::Writer::new(out, channels, sample_rate, depth, dither, opts.metadata.as_ref())?),
             other => return Err(AudioError::Unsupported(format!("encoding {other:?} is not supported"))),
         }))
     }
@@ -369,5 +398,5 @@ pub fn wav_float_header(channels: usize, sample_rate: u32, frames: u64) -> Resul
     if channels == 0 || sample_rate == 0 {
         return Err(AudioError::Encode("a WAV needs channels and a sample rate".into()));
     }
-    wav::header(channels, sample_rate, (32, true), None, None, frames, false)
+    wav::header(channels, sample_rate, (32, true), None, None, frames, false, None)
 }

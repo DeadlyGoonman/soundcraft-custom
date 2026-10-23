@@ -8,11 +8,44 @@ use soundcraft_engine::Engine;
 use soundcraft_model::{ClipId, GroupId, Session, SourceId, TrackId};
 use soundcraft_time::Samples;
 
+/// The Bounce dialog's optional tag fields, collapsed by default. Empty fields write no tag.
+#[derive(Debug, Clone, Default)]
+pub struct BounceMetadata {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub genre: String,
+    pub year: String,
+    pub comment: String,
+    /// Whether the collapsing section is open; not sent to the engine.
+    pub expanded: bool,
+}
+
+impl BounceMetadata {
+    fn is_empty(&self) -> bool {
+        self.title.is_empty()
+            && self.artist.is_empty()
+            && self.album.is_empty()
+            && self.genre.is_empty()
+            && self.year.is_empty()
+            && self.comment.is_empty()
+    }
+
+    /// `{"title"?, ...}` for the bounce command's `metadata` param, or `null` when every field is
+    /// empty (so the command omits the param entirely rather than writing an empty tag).
+    fn to_json(&self) -> Value {
+        if self.is_empty() {
+            return Value::Null;
+        }
+        json!({"title": self.title, "artist": self.artist, "album": self.album, "genre": self.genre, "year": self.year, "comment": self.comment})
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Dialog {
     NewTracks { count: u32, format: String, kind: String, timebase: String, name: String },
     NewSession { name: String, sample_rate: u32, demo: bool },
-    Bounce { path: String, format: String, bit_depth: String, normalize: bool },
+    Bounce { path: String, format: String, bit_depth: String, normalize: bool, metadata: BounceMetadata },
     RenameTrack { id: TrackId, name: String },
     RenameClip { id: ClipId, name: String },
     RenameMarker { id: soundcraft_model::MarkerId, name: String },
@@ -113,7 +146,13 @@ impl Dialogs {
                     .and_then(|p| std::path::Path::new(p).parent())
                     .filter(|d| !d.as_os_str().is_empty())
                     .map_or(home.clone(), |d| d.display().to_string());
-                Dialog::Bounce { path: format!("{dir}/{name} Bounce.wav"), format: "wav".into(), bit_depth: "24".into(), normalize: false }
+                Dialog::Bounce {
+                    path: format!("{dir}/{name} Bounce.wav"),
+                    format: "wav".into(),
+                    bit_depth: "24".into(),
+                    normalize: false,
+                    metadata: BounceMetadata::default(),
+                }
             }
             "file.import_audio" => Dialog::PathPrompt { cmd: id.into(), title: "Import Audio".into(), path: home, key: "path".into() },
             "file.import_midi" => Dialog::PathPrompt { cmd: id.into(), title: "Import MIDI".into(), path: home, key: "path".into() },
@@ -396,7 +435,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         ));
                     }
                 }
-                Dialog::Bounce { path, format, bit_depth, normalize } => {
+                Dialog::Bounce { path, format, bit_depth, normalize, metadata } => {
                     ui.horizontal(|ui| {
                         ui.label("File");
                         ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
@@ -426,6 +465,30 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         });
                     });
                     crate::widgets::checkbox(ui, normalize, "Normalize to -0.1 dBFS");
+                    egui::CollapsingHeader::new("Metadata (optional)").default_open(metadata.expanded).show(ui, |ui| {
+                        metadata.expanded = true;
+                        egui::Grid::new("bounce_metadata").num_columns(2).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
+                            for (label, field) in [
+                                ("Title", &mut metadata.title),
+                                ("Artist", &mut metadata.artist),
+                                ("Album", &mut metadata.album),
+                                ("Genre", &mut metadata.genre),
+                                ("Year", &mut metadata.year),
+                                ("Comment", &mut metadata.comment),
+                            ] {
+                                ui.label(label);
+                                ui.add(egui::TextEdit::singleline(field).desired_width(300.0));
+                                ui.end_row();
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Written into the file as tags (WAV LIST/INFO, AIFF NAME/AUTH/ANNO, FLAC Vorbis comment). Left blank, nothing is written.",
+                            )
+                            .small()
+                            .color(Tokens::current().text_dim),
+                        );
+                    });
                     ui.label(
                         egui::RichText::new("Bounces the edit selection, or the whole session when nothing is selected.")
                             .small()
@@ -433,10 +496,11 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     );
                     if buttons(ui, "Bounce", enter) {
                         let p = std::path::Path::new(path.as_str()).with_extension(if format == "aiff" { "aif" } else { format.as_str() });
-                        crate::bounce::start(
-                            app,
-                            &json!({"path": p.to_string_lossy(), "format": format, "bit_depth": bit_depth, "normalize": normalize}),
-                        );
+                        let mut params = json!({"path": p.to_string_lossy(), "format": format, "bit_depth": bit_depth, "normalize": normalize});
+                        if let (Value::Object(map), Value::Object(m)) = (&mut params, metadata.to_json()) {
+                            map.insert("metadata".into(), Value::Object(m));
+                        }
+                        crate::bounce::start(app, &params);
                         keep = false;
                     }
                 }

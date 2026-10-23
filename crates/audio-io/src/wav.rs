@@ -327,6 +327,29 @@ fn bext_chunk(bwf: &BwfInfo) -> Vec<u8> {
     c
 }
 
+/// `LIST/INFO` chunk: the standard RIFF tag-list form. `None` when every field is empty.
+fn metadata_chunk(m: &crate::Metadata) -> Option<Vec<u8>> {
+    if m.is_empty() {
+        return None;
+    }
+    let mut info = Vec::new();
+    info.extend_from_slice(b"INFO");
+    let field = |out: &mut Vec<u8>, id: &[u8; 4], v: &str| {
+        if !v.is_empty() {
+            push_chunk(out, id, v.as_bytes());
+        }
+    };
+    field(&mut info, b"INAM", &m.title);
+    field(&mut info, b"IART", &m.artist);
+    field(&mut info, b"IPRD", &m.album);
+    field(&mut info, b"IGNR", &m.genre);
+    field(&mut info, b"ICRD", &m.year);
+    field(&mut info, b"ICMT", &m.comment);
+    let mut out = Vec::new();
+    push_chunk(&mut out, b"LIST", &info);
+    Some(out)
+}
+
 fn push_chunk(out: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
     out.extend_from_slice(id);
     out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
@@ -345,6 +368,7 @@ pub(crate) struct Writer<W> {
     sample_rate: u32,
     format: (u16, bool),
     bwf: Option<BwfInfo>,
+    metadata: Option<crate::Metadata>,
     mask: Option<u32>,
     force_rf64: bool,
     quantizers: Vec<Quantizer>,
@@ -365,11 +389,12 @@ impl<W: Write + Seek> Writer<W> {
         bwf: Option<&BwfInfo>,
         mask: Option<u32>,
         force_rf64: bool,
+        metadata: Option<&crate::Metadata>,
     ) -> Result<Self> {
         validate_layout(channels, sample_rate)?;
         let format = sample_format(depth);
         let start = out.stream_position()?;
-        out.write_all(&header(channels, sample_rate, format, bwf, mask, 0, force_rf64)?)?;
+        out.write_all(&header(channels, sample_rate, format, bwf, mask, 0, force_rf64, metadata)?)?;
         let quantizers = Quantizer::per_channel(u32::from(format.0), dither, channels);
         Ok(Writer {
             out,
@@ -378,6 +403,7 @@ impl<W: Write + Seek> Writer<W> {
             sample_rate,
             format,
             bwf: bwf.cloned(),
+            metadata: metadata.cloned(),
             mask,
             force_rf64,
             quantizers,
@@ -388,7 +414,7 @@ impl<W: Write + Seek> Writer<W> {
     }
 
     fn header(&self, frames: u64) -> Result<Vec<u8>> {
-        header(self.channels, self.sample_rate, self.format, self.bwf.as_ref(), self.mask, frames, self.force_rf64)
+        header(self.channels, self.sample_rate, self.format, self.bwf.as_ref(), self.mask, frames, self.force_rf64, self.metadata.as_ref())
     }
 
     /// The frame count after `frames` more (RF64 has room for any bounce).
@@ -439,17 +465,18 @@ pub(crate) fn encode(
     bwf: Option<&BwfInfo>,
     force_rf64: bool,
     mask: Option<u32>,
+    metadata: Option<&crate::Metadata>,
 ) -> Result<Vec<u8>> {
     validate_buffer(buf)?;
     let channels = buf.channels.len();
     let frames = buf.frames();
     let format = sample_format(depth);
-    let head = header(channels, buf.sample_rate, format, bwf, mask, frames as u64, force_rf64)?;
+    let head = header(channels, buf.sample_rate, format, bwf, mask, frames as u64, force_rf64, metadata)?;
     let data_len = (usize::from(format.0 / 8) * channels).checked_mul(frames).ok_or_else(|| AudioError::TooLarge("data size overflow".into()))?;
     let mut out = Vec::new();
     out.try_reserve_exact(head.len().saturating_add(data_len).saturating_add(1))
         .map_err(|_| AudioError::TooLarge(format!("cannot allocate {data_len} bytes for WAV output")))?;
-    let mut w = Writer::new(Cursor::new(out), channels, buf.sample_rate, depth, dither, bwf, mask, force_rf64)?;
+    let mut w = Writer::new(Cursor::new(out), channels, buf.sample_rate, depth, dither, bwf, mask, force_rf64, metadata)?;
     w.write(&buf.channels, frames)?;
     Ok(w.finish()?.into_inner())
 }
@@ -463,6 +490,7 @@ pub(crate) fn header(
     mask: Option<u32>,
     frames: u64,
     force_rf64: bool,
+    metadata: Option<&crate::Metadata>,
 ) -> Result<Vec<u8>> {
     let block = usize::from(bits / 8).checked_mul(channels).ok_or_else(|| AudioError::TooLarge("block size overflow".into()))?;
     let block_align = u16::try_from(block).map_err(|_| AudioError::Encode("too many channels for WAV".into()))?;
@@ -495,6 +523,9 @@ pub(crate) fn header(
     push_chunk(&mut meta, b"fmt ", &fmt);
     if is_float {
         push_chunk(&mut meta, b"fact", &u32::try_from(frames).unwrap_or(u32::MAX).to_le_bytes());
+    }
+    if let Some(info) = metadata.and_then(metadata_chunk) {
+        meta.extend_from_slice(&info);
     }
     let total = ((4 + (8 + rf64_body_len) + meta.len() + 8) as u64)
         .checked_add(data_len)
