@@ -673,8 +673,11 @@ impl SoundApp {
     pub fn open_slot_editor(&mut self, track: TrackId, slot: usize) -> Result<(), String> {
         let remembered = self.slot_plugin_id(track, slot).and_then(|id| self.ui.editor_scales.get(&id).copied());
         let Some(p) = self.player.as_ref() else { return Err("no audio engine".into()) };
-        if let Some(scale) = remembered.filter(|s| *s != soundcraft_dsp::EditorScale::default())
-            && let Err(e) = p.set_editor_scale(track, slot, scale)
+        // The default is sent too: another instance of the plugin may have been scaled since this
+        // one last opened. Only a remembered scale's refusal is worth a status line.
+        let scale = remembered.unwrap_or_default();
+        if let Err(e) = p.set_editor_scale(track, slot, scale)
+            && remembered.is_some()
         {
             self.ui.status = e;
         }
