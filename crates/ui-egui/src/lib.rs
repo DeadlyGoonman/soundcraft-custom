@@ -311,8 +311,8 @@ pub struct SoundApp {
     last_rev: u64,
     fonts_ready: bool,
     fonts_installed: bool,
-    /// The palette last applied to the context (light?), so visuals are set only on a change.
-    theme_applied: Option<bool>,
+    /// The palette last applied to the context, so visuals are set only on a change.
+    theme_applied: Option<theme::Palette>,
     /// Last panel host context, used to cancel renderer-owned gestures on explicit replacement.
     pub(crate) docking_context: Option<egui::Context>,
     /// Transport simulation when there is no player (tests, offscreen renders).
@@ -1238,10 +1238,10 @@ impl SoundApp {
                 ctx.request_repaint();
             }
         }
-        let light = theme::wants_light(ctx, self.ui.theme);
-        if self.theme_applied != Some(light) || theme::is_light() != light {
-            theme::apply(ctx, light);
-            self.theme_applied = Some(light);
+        let palette = theme::palette_for(ctx, self.ui.theme);
+        if self.theme_applied != Some(palette) || theme::active_palette() != palette {
+            theme::apply_palette(ctx, palette);
+            self.theme_applied = Some(palette);
         }
         let now = ctx.input(|i| i.time);
         let dt = self.last_frame.replace(now).map_or(1.0 / 60.0, |t| (now - t) as f32).clamp(0.0, 0.25);

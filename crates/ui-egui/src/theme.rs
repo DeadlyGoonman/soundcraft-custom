@@ -1,10 +1,37 @@
 //! Design tokens. Colours were chosen by eye to give a dark, studio-style look; they are ours.
 
 use egui::{Color32, FontFamily, FontId};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Whether the Light palette is active. Dark is the default (the incumbent is dark-only).
-static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
+/// The colour palette in use. Dark is the default (the incumbent is dark-only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Palette {
+    Dark,
+    Light,
+    /// Dark with pure-black surfaces, for OLED panels.
+    Oled,
+}
+
+impl Palette {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Dark => 0,
+            Self::Light => 1,
+            Self::Oled => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Light,
+            2 => Self::Oled,
+            _ => Self::Dark,
+        }
+    }
+}
+
+/// The active [`Palette`], as its [`Palette::code`].
+static ACTIVE: AtomicU8 = AtomicU8::new(0);
 
 /// Unit tests that change or read the process-wide palette must own it until their assertions
 /// finish. The lock is re-entrant per thread, so a test may hold it and still build apps
@@ -66,7 +93,7 @@ mod palette_lock {
     }
 }
 
-/// The Appearance setting (`ui.theme {mode}`). Dark by default; System and Light are opt-in.
+/// The Appearance setting (`ui.theme {mode}`). Dark by default; OLED, System and Light are opt-in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeMode {
@@ -74,16 +101,18 @@ pub enum ThemeMode {
     Light,
     #[default]
     Dark,
+    Oled,
 }
 
 impl ThemeMode {
-    pub const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::System];
+    pub const ALL: [Self; 4] = [Self::Dark, Self::Oled, Self::Light, Self::System];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::System => "System",
             Self::Light => "Light",
             Self::Dark => "Dark",
+            Self::Oled => "OLED Black",
         }
     }
 
@@ -93,6 +122,7 @@ impl ThemeMode {
             Self::System => "system",
             Self::Light => "light",
             Self::Dark => "dark",
+            Self::Oled => "oled",
         }
     }
 
@@ -298,6 +328,40 @@ impl Tokens {
         slot_mark: Color32::from_rgb(159, 159, 159),
     };
 
+    /// Dark with pure-black surfaces. Only background-ish tokens change: main panels and the
+    /// playlist are `#000000`, secondary surfaces are a near-black grey so hierarchy and widget
+    /// edges stay visible, and borders are lifted so they still read against black. Text, accent,
+    /// meters, selection and track colours are Dark's.
+    pub const OLED: Tokens = Tokens {
+        window_bg: Color32::from_rgb(0, 0, 0),
+        panel_bg: Color32::from_rgb(0, 0, 0),
+        panel_bg2: Color32::from_rgb(10, 10, 10),
+        toolbar_bg: Color32::from_rgb(0, 0, 0),
+        toolbar_group: Color32::from_rgb(10, 10, 10),
+        border: Color32::from_rgb(28, 28, 28),
+        group_border: Color32::from_rgb(30, 30, 30),
+        counter_bg: Color32::from_rgb(0, 0, 0),
+        button: Color32::from_rgb(22, 22, 22),
+        button_hi: Color32::from_rgb(36, 36, 36),
+        button_border: Color32::from_rgb(80, 80, 80),
+        ruler_bg: Color32::from_rgb(10, 10, 10),
+        ruler_label_bg: Color32::from_rgb(10, 10, 10),
+        marker_ruler: Color32::from_rgb(10, 10, 10),
+        playlist_bg: Color32::from_rgb(0, 0, 0),
+        playlist_alt: Color32::from_rgb(10, 10, 10),
+        playlist_lane: Color32::from_rgb(10, 10, 10),
+        strip_bg: Color32::from_rgb(20, 20, 20),
+        strip_section: Color32::from_rgb(10, 10, 10),
+        slot_bg: Color32::from_rgb(10, 10, 10),
+        slot_well: Color32::from_rgb(20, 20, 20),
+        slot_empty: Color32::from_rgb(17, 17, 17),
+        menu_bar: Color32::from_rgb(0, 0, 0),
+        universe_bg: Color32::from_rgb(0, 0, 0),
+        meter_bg: Color32::from_rgb(0, 0, 0),
+        knob_bg: Color32::from_rgb(20, 20, 20),
+        ..Self::DARK
+    };
+
     pub const LIGHT: Tokens = Tokens {
         window_bg: Color32::from_rgb(184, 186, 190),
         panel_bg: Color32::from_rgb(204, 206, 210),
@@ -384,21 +448,32 @@ impl Tokens {
     };
 
     pub fn current() -> Tokens {
-        if is_light() { Self::LIGHT } else { Self::DARK }
+        match active_palette() {
+            Palette::Light => Self::LIGHT,
+            Palette::Oled => Self::OLED,
+            Palette::Dark => Self::DARK,
+        }
     }
+}
+
+/// The palette that is currently applied.
+pub fn active_palette() -> Palette {
+    Palette::from_code(ACTIVE.load(Ordering::Relaxed))
 }
 
 /// Whether the Light palette is the active one.
 pub fn is_light() -> bool {
-    LIGHT_THEME.load(Ordering::Relaxed)
+    active_palette() == Palette::Light
 }
 
-/// Resolve each frame from the integration's current OS appearance. Unknown uses Dark.
-pub fn wants_light(ctx: &egui::Context, mode: ThemeMode) -> bool {
+/// The palette a mode resolves to this frame. System follows the OS appearance; unknown uses Dark.
+pub fn palette_for(ctx: &egui::Context, mode: ThemeMode) -> Palette {
     match mode {
-        ThemeMode::Light => true,
-        ThemeMode::Dark => false,
-        ThemeMode::System => ctx.system_theme() == Some(egui::Theme::Light),
+        ThemeMode::Light => Palette::Light,
+        ThemeMode::Dark => Palette::Dark,
+        ThemeMode::Oled => Palette::Oled,
+        ThemeMode::System if ctx.system_theme() == Some(egui::Theme::Light) => Palette::Light,
+        ThemeMode::System => Palette::Dark,
     }
 }
 
@@ -465,13 +540,21 @@ pub fn mono(size: f32) -> FontId {
 
 /// Make `light` (or dark) the active palette and apply its visuals. Call only when it changes.
 pub fn apply(ctx: &egui::Context, light: bool) {
-    LIGHT_THEME.store(light, Ordering::Relaxed);
+    apply_palette(ctx, if light { Palette::Light } else { Palette::Dark });
+}
+
+/// Make `palette` the active one and apply its visuals. Call only when it changes.
+pub fn apply_palette(ctx: &egui::Context, palette: Palette) {
+    ACTIVE.store(palette.code(), Ordering::Relaxed);
     let t = Tokens::current();
-    let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
+    let mut v = if palette == Palette::Light { egui::Visuals::light() } else { egui::Visuals::dark() };
     v.panel_fill = t.panel_bg;
     v.window_fill = t.panel_bg2;
     v.extreme_bg_color = t.slot_bg;
     v.faint_bg_color = t.panel_bg2;
+    if palette == Palette::Oled {
+        v.code_bg_color = t.slot_bg;
+    }
     v.selection.bg_fill = t.accent;
     v.widgets.inactive.weak_bg_fill = t.button;
     v.widgets.inactive.bg_fill = t.button;
@@ -545,6 +628,67 @@ mod tests {
         }
         assert_eq!(ThemeMode::parse(" Light "), Some(ThemeMode::Light));
         assert_eq!(ThemeMode::parse("sepia"), None);
+    }
+
+    fn relative_luminance(c: Color32) -> f64 {
+        let channel = |v: u8| {
+            let s = f64::from(v) / 255.0;
+            if s <= 0.03928 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+    }
+
+    /// WCAG contrast ratio between two colours (1.0 to 21.0).
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (hi, lo) = {
+            let (x, y) = (relative_luminance(a), relative_luminance(b));
+            if x >= y { (x, y) } else { (y, x) }
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn oled_is_a_black_dark_palette() {
+        assert_eq!(ThemeMode::ALL[1], ThemeMode::Oled, "OLED sits right after Dark in the Appearance list");
+        assert_eq!(ThemeMode::Oled.label(), "OLED Black");
+        assert_eq!(ThemeMode::Oled.id(), "oled");
+        assert_eq!(serde_json::to_value(ThemeMode::Oled).unwrap(), json!("oled"));
+        assert_eq!(ThemeMode::parse("oled"), Some(ThemeMode::Oled));
+        assert_eq!(ThemeMode::parse(" OLED "), Some(ThemeMode::Oled));
+
+        let _palette = lock_test_palette();
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        assert_eq!(app.run("ui.theme", json!({"mode": "oled"})), Ok(json!({"mode": "oled"})));
+        assert_eq!(app.ui.theme, ThemeMode::Oled);
+
+        let ctx = egui::Context::default();
+        apply_palette(&ctx, Palette::Oled);
+        assert_eq!(active_palette(), Palette::Oled);
+        assert!(!is_light());
+        let t = Tokens::current();
+        assert_eq!(t.panel_bg, Color32::BLACK);
+        assert_eq!(t.window_bg, Color32::BLACK);
+        assert_eq!(t.playlist_bg, Color32::BLACK);
+        let visuals = ctx.global_style().visuals.clone();
+        assert_eq!(visuals.panel_fill, Color32::BLACK);
+        assert!(visuals.dark_mode, "OLED is a dark mode");
+        assert_eq!(visuals.extreme_bg_color, t.slot_bg);
+        // Text, accent, meters, selection and track colours are Dark's.
+        assert_eq!(t.text, Tokens::DARK.text);
+        assert_eq!(t.accent, Tokens::DARK.accent);
+        assert_eq!(t.meter_green, Tokens::DARK.meter_green);
+        assert_eq!(t.selection, Tokens::DARK.selection);
+        // Secondary surfaces stay visibly separate from black, and text stays readable on them.
+        assert!(t.panel_bg2.r() >= 8 && t.panel_bg2.r() <= 24, "secondary surface is a near-black grey");
+        assert!(contrast(t.text, t.panel_bg) >= 7.0, "text on the panel");
+        assert!(contrast(t.text, t.button) >= 7.0, "text on a button");
+        assert!(contrast(t.text_dim, t.panel_bg2) >= 4.5, "dim text on a secondary surface");
+        assert!(contrast(t.button_border, t.button) >= 2.0, "button edge stays visible");
+        assert!(contrast(t.border, t.panel_bg) >= 1.2, "separators stay visible");
+
+        // Leave the process-wide palette as the other tests expect it.
+        apply_palette(&ctx, Palette::Dark);
+        assert_eq!(active_palette(), Palette::Dark);
     }
 
     #[test]
