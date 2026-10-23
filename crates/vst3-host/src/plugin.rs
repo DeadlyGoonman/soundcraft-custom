@@ -1,7 +1,7 @@
 //! `Vst3Plugin`: a loaded VST3 instance behind the safe `soundcraft_dsp::Plugin` trait.
 
 use crate::ffi::{AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Instance, NoteEvent, PARAM_QUEUE_CAP, PITCH_BEND};
-use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, Transport, Unit};
+use soundcraft_dsp::{EditorScale, Plugin, PluginEditor, PluginInfo, Transport, Unit};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -547,6 +547,14 @@ impl PluginEditor for Vst3Editor {
 
     fn is_open(&self) -> bool {
         self.link.is_open()
+    }
+
+    fn native_scaling(&mut self) -> bool {
+        self.link.native_scaling()
+    }
+
+    fn set_scale(&mut self, scale: EditorScale) -> Result<(), String> {
+        self.link.set_scale(scale)
     }
 
     fn idle(&mut self) -> Vec<(String, f32)> {

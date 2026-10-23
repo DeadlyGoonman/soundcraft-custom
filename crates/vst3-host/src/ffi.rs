@@ -15,7 +15,7 @@
 #![allow(clippy::unnecessary_cast)]
 
 use crate::{Vst3Error, scan};
-use soundcraft_dsp::Transport;
+use soundcraft_dsp::{EditorScale, EditorScaleMode, Transport};
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::mem::ManuallyDrop;
@@ -29,7 +29,10 @@ use vst3::Steinberg::Vst::{
     IHostApplicationTrait, IMessageTrait, IMidiMappingTrait, IParamValueQueueTrait, IParameterChangesTrait,
 };
 use vst3::Steinberg::{self as sb};
-use vst3::Steinberg::{FUnknown, IBStreamTrait, IPlugFrameTrait, IPlugViewTrait, IPluginBaseTrait, IPluginFactory2Trait, IPluginFactoryTrait};
+use vst3::Steinberg::{
+    FUnknown, IBStreamTrait, IPlugFrameTrait, IPlugViewContentScaleSupportTrait, IPlugViewTrait, IPluginBaseTrait, IPluginFactory2Trait,
+    IPluginFactoryTrait,
+};
 use vst3::{Class, ComPtr, ComWrapper, Interface};
 
 /// Most classes one factory may report (hostile-input cap).
@@ -1892,10 +1895,43 @@ fn split_state(data: &[u8]) -> Option<(&[u8], &[u8])> {
 
 // ---- editor (IPlugView) --------------------------------------------------------------------
 
+/// Why `scale` can't be applied to an editor (`native`: the plugin scales itself), if it can't.
+fn scale_error(scale: EditorScale, native: bool) -> Option<&'static str> {
+    match scale.mode {
+        EditorScaleMode::Upscale(_) => Some("upscaling is not wired up yet"),
+        EditorScaleMode::Auto if !native && scale.clamped_factor() != 1.0 => Some("upscaling is not wired up yet"),
+        EditorScaleMode::Native if !native => Some("this plugin cannot scale its editor natively"),
+        EditorScaleMode::Auto | EditorScaleMode::Native => None,
+    }
+}
+
 /// The `IPlugFrame` handed to a plugin view: `resizeView` resizes our host window.
 pub(crate) struct PlugFrame {
     /// The host window (an `NSWindow*` on macOS), not owned; null when there is none.
     window: std::sync::atomic::AtomicPtr<c_void>,
+    /// The size the host window was last set to, packed by [`pack_size`] (the link compares the
+    /// window's own size against it to notice a user resize).
+    size: AtomicU64,
+}
+
+/// Packs a width and height (each at most 16 384) into one atomic word.
+fn pack_size(w: f64, h: f64) -> u64 {
+    ((w as u64) << 32) | (h as u64 & 0xffff_ffff)
+}
+
+impl PlugFrame {
+    fn new(window: *mut c_void, w: f64, h: f64) -> PlugFrame {
+        PlugFrame { window: std::sync::atomic::AtomicPtr::new(window), size: AtomicU64::new(pack_size(w, h)) }
+    }
+
+    fn set_size(&self, size: (f64, f64)) {
+        self.size.store(pack_size(size.0, size.1), Ordering::Relaxed);
+    }
+
+    fn size(&self) -> (f64, f64) {
+        let v = self.size.load(Ordering::Relaxed);
+        ((v >> 32) as f64, (v & 0xffff_ffff) as f64)
+    }
 }
 
 impl Class for PlugFrame {
@@ -1908,6 +1944,7 @@ impl IPlugFrameTrait for PlugFrame {
         let Some(r) = (unsafe { new_size.as_mut() }) else { return sb::kInvalidArgument };
         let (w, h) = rect_size(r);
         window::resize(self.window.load(Ordering::Relaxed), w, h);
+        self.set_size((w, h));
         // SAFETY: the plugin passes its own live view (or null, handled).
         if let Some(v) = unsafe { vst3::ComRef::from_raw(view) } {
             // SAFETY: valid view; `r` is the plugin's own writable rect.
@@ -1933,6 +1970,16 @@ struct EditorInner {
     view: Option<ComPtr<sb::IPlugView>>,
     frame: Option<ComWrapper<PlugFrame>>,
     window: Option<window::HostWindow>,
+    /// The scale the user asked for; applied to the open view and to the next open.
+    scale: EditorScale,
+    /// The content scale last handed to the view (1.0 when none).
+    applied: f32,
+    /// The view's size at scale 1 (captured before any scaling), for the host-resized path.
+    base: (f64, f64),
+    /// Whether the host window is user-resizable (the view reports `canResize`).
+    resizable: bool,
+    /// Whether the plugin can draw itself at another size; cached once probed.
+    native: Option<bool>,
 }
 
 /// The link between an instance and its editor and state handles. The instance may process on
@@ -2002,12 +2049,35 @@ impl EditorLink {
         if unsafe { view.isPlatformTypeSupported(platform) } != sb::kResultTrue {
             return Err("the editor does not support this platform's windows".into());
         }
+        let native = EditorLink::supports_native(&view);
+        g.native = Some(native);
+        if let Some(msg) = scale_error(g.scale, native) {
+            return Err(msg.into());
+        }
+        let factor = g.scale.clamped_factor();
         let mut r = sb::ViewRect { left: 0, top: 0, right: 400, bottom: 300 };
         // SAFETY: valid view; `r` is writable. On failure the default size stays.
         unsafe { view.getSize(&mut r) };
-        let (w, h) = rect_size(&r);
-        let win = window::HostWindow::new(title, w, h)?;
-        let frame = ComWrapper::new(PlugFrame { window: std::sync::atomic::AtomicPtr::new(win.raw()) });
+        let base = rect_size(&r);
+        // The content scale goes in before the view is attached (as the SDK asks).
+        let mut applied = 1.0_f32;
+        if factor != 1.0
+            && let Some(cs) = view.cast::<sb::IPlugViewContentScaleSupport>()
+        {
+            // SAFETY: valid content-scale interface of the view, not yet attached.
+            if ok(unsafe { cs.setContentScaleFactor(factor) }) {
+                applied = factor;
+            }
+        }
+        let resizable = EditorLink::can_resize(&view);
+        let mut size = base;
+        if applied != 1.0 {
+            size = EditorLink::view_size(&view).unwrap_or(base);
+        } else if factor != 1.0 {
+            size = (base.0 * f64::from(factor), base.1 * f64::from(factor));
+        }
+        let win = window::HostWindow::new(title, size.0, size.1, resizable)?;
+        let frame = ComWrapper::new(PlugFrame::new(win.raw(), size.0, size.1));
         if let Some(f) = frame.as_com_ref::<sb::IPlugFrame>() {
             // SAFETY: valid view; the frame outlives the view's attachment (kept in `g.frame`
             // and detached in `teardown`).
@@ -2020,11 +2090,147 @@ impl EditorLink {
             win.close();
             return Err("the editor could not attach to its window".into());
         }
+        if applied == 1.0 && factor != 1.0 {
+            // Host-sized view: the plugin's size limits apply to the scaled size.
+            let fitted = EditorLink::fit_view(&view, size);
+            window::resize(win.raw(), fitted.0, fitted.1);
+            frame.set_size(fitted);
+        }
         win.raise();
         g.view = Some(view);
         g.frame = Some(frame);
         g.window = Some(win);
+        g.applied = applied;
+        g.base = base;
+        g.resizable = resizable;
         Ok(())
+    }
+
+    /// Whether the view can be resized (`canResize`).
+    fn can_resize(view: &ComPtr<sb::IPlugView>) -> bool {
+        // SAFETY: valid view; no arguments.
+        let r = unsafe { view.canResize() };
+        r == sb::kResultTrue
+    }
+
+    /// Whether the view scales natively: it has the content-scale interface or is resizable.
+    fn supports_native(view: &ComPtr<sb::IPlugView>) -> bool {
+        view.cast::<sb::IPlugViewContentScaleSupport>().is_some() || EditorLink::can_resize(view)
+    }
+
+    /// The view's current size, if it reports one.
+    fn view_size(view: &ComPtr<sb::IPlugView>) -> Option<(f64, f64)> {
+        let mut r = sb::ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: valid view; `r` is writable.
+        ok(unsafe { view.getSize(&mut r) }).then(|| rect_size(&r))
+    }
+
+    /// Clamps a host-chosen size to what the view accepts (`checkSizeConstraint`) and tells the
+    /// view its new size (`onSize`). Returns the clamped size.
+    fn fit_view(view: &ComPtr<sb::IPlugView>, size: (f64, f64)) -> (f64, f64) {
+        let mut r = sb::ViewRect { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 };
+        // SAFETY: valid view; `r` is writable. On failure the rect keeps the requested size.
+        unsafe { view.checkSizeConstraint(&mut r) };
+        let fitted = rect_size(&r);
+        let mut sized = sb::ViewRect { left: 0, top: 0, right: fitted.0 as i32, bottom: fitted.1 as i32 };
+        // SAFETY: valid view; `sized` is a live rect for the duration of the call.
+        unsafe { view.onSize(&mut sized) };
+        fitted
+    }
+
+    /// Whether the plugin can draw itself at another size. Probes a view when none is open (the
+    /// answer is cached); `false` off the main thread until probed.
+    fn native_support(g: &mut EditorInner) -> bool {
+        if let Some(n) = g.native {
+            return n;
+        }
+        if !window::on_main_thread() {
+            return false;
+        }
+        let probed = if let Some(v) = g.view.as_ref() {
+            Some(EditorLink::supports_native(v))
+        } else {
+            EditorLink::create_view(g).ok().map(|v| EditorLink::supports_native(&v))
+        };
+        if let Some(n) = probed {
+            g.native = Some(n);
+        }
+        probed.unwrap_or(false)
+    }
+
+    /// Whether the plugin can draw itself at another size (`IPlugViewContentScaleSupport` or a
+    /// resizable view). Main thread only; `false` elsewhere until probed.
+    pub fn native_scaling(&self) -> bool {
+        let mut g = self.lock();
+        EditorLink::native_support(&mut g)
+    }
+
+    /// Stores the editor's scale and applies it to an open editor. Errors name why this scale
+    /// can't be used for this plugin (upscaling is not wired up yet).
+    pub fn set_scale(&self, scale: EditorScale) -> Result<(), String> {
+        if let EditorScaleMode::Upscale(_) = scale.mode {
+            return Err("upscaling is not wired up yet".into());
+        }
+        let mut g = self.lock();
+        let native = EditorLink::native_support(&mut g);
+        if let Some(msg) = scale_error(scale, native) {
+            return Err(msg.into());
+        }
+        let new = EditorScale { factor: scale.clamped_factor(), mode: scale.mode };
+        if new == g.scale {
+            return Ok(());
+        }
+        g.scale = new;
+        if g.view.is_some() {
+            EditorLink::apply_live(&mut g);
+        }
+        Ok(())
+    }
+
+    /// Applies the stored scale to the open view and resizes the host window to match. Main
+    /// thread only (called from `set_scale`, which the UI calls there).
+    fn apply_live(g: &mut EditorInner) {
+        let (Some(view), Some(win), Some(frame)) = (&g.view, &g.window, &g.frame) else { return };
+        if !window::on_main_thread() {
+            return;
+        }
+        let factor = g.scale.clamped_factor();
+        let size = if let Some(cs) = view.cast::<sb::IPlugViewContentScaleSupport>() {
+            if g.applied != factor {
+                // SAFETY: valid content-scale interface of the open view, main thread.
+                if ok(unsafe { cs.setContentScaleFactor(factor) }) {
+                    g.applied = factor;
+                }
+            }
+            // The plugin's own size at the new scale; keep the window's size when it reports none.
+            let size = EditorLink::view_size(view).unwrap_or_else(|| frame.size());
+            let mut r = sb::ViewRect { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 };
+            // SAFETY: valid view (open, main thread); `r` is a live, writable rect.
+            unsafe { view.onSize(&mut r) };
+            size
+        } else {
+            let want = (g.base.0 * f64::from(factor), g.base.1 * f64::from(factor));
+            EditorLink::fit_view(view, want)
+        };
+        window::resize(win.raw(), size.0, size.1);
+        frame.set_size(size);
+    }
+
+    /// Host-side resize follow-up: when the user resized a resizable window, clamps the new
+    /// size to the view's limits, tells the view and resizes the window to the clamped size.
+    fn follow_window(g: &mut EditorInner) {
+        if !g.resizable {
+            return;
+        }
+        let (Some(view), Some(win), Some(frame)) = (&g.view, &g.window, &g.frame) else { return };
+        let Some(cur) = window::client_size(win.raw()) else { return };
+        // A minimised window reports no client area; the view keeps its size then.
+        if cur.0 < 1.0 || cur.1 < 1.0 || cur == frame.size() {
+            return;
+        }
+        let fitted = EditorLink::fit_view(view, cur);
+        window::resize(win.raw(), fitted.0, fitted.1);
+        frame.set_size(fitted);
     }
 
     fn teardown(g: &mut EditorInner) {
@@ -2101,7 +2307,9 @@ impl EditorLink {
         let mut g = self.lock();
         if g.window.as_ref().is_some_and(|w| !w.is_visible()) {
             EditorLink::teardown(&mut g);
+            return;
         }
+        EditorLink::follow_window(&mut g);
     }
 
     /// Normalized → plain through the controller (main thread).
@@ -2221,7 +2429,7 @@ mod window {
             unsafe { self.window.as_ref() }
         }
 
-        pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
+        pub fn new(title: &str, w: f64, h: f64, _resizable: bool) -> Result<HostWindow, String> {
             let mtm = MainThreadMarker::new().ok_or_else(|| "not on the main thread".to_string())?;
             let _app = NSApplication::sharedApplication(mtm);
             let rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(w, h));
@@ -2278,6 +2486,11 @@ mod window {
     }
 
     /// Resizes a host window's content (`window` from [`HostWindow::raw`]); main thread only.
+    /// Host windows are not user-resizable on this platform yet.
+    pub fn client_size(_window: *mut c_void) -> Option<(f64, f64)> {
+        None
+    }
+
     pub fn resize(window: *mut c_void, w: f64, h: f64) {
         if MainThreadMarker::new().is_none() {
             return;
@@ -2302,8 +2515,9 @@ mod window {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AdjustWindowRectEx, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWL_STYLE,
-        GetWindowLongPtrW, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WM_CLOSE, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_OVERLAPPED, WS_SYSMENU,
+        GetClientRect, GetWindowLongPtrW, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WM_CLOSE, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_MAXIMIZEBOX,
+        WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME,
     };
 
     pub const PLATFORM_TYPE: Option<*const c_char> = Some(vst3::Steinberg::kPlatformTypeHWND);
@@ -2382,13 +2596,14 @@ mod window {
             (on_main_thread() && unsafe { IsWindow(self.hwnd) } != 0).then_some(self.hwnd)
         }
 
-        pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
+        pub fn new(title: &str, w: f64, h: f64, resizable: bool) -> Result<HostWindow, String> {
             if !on_main_thread() {
                 return Err("not on the main thread".into());
             }
             let class = class_name().ok_or_else(|| "cannot register the editor window class".to_string())?;
             let title = wide(title);
-            let (ow, oh) = outer_size(STYLE, 0, w, h);
+            let style = if resizable { STYLE | WS_THICKFRAME | WS_MAXIMIZEBOX } else { STYLE };
+            let (ow, oh) = outer_size(style, 0, w, h);
             // SAFETY: main thread; the active window (or null) of this thread's queue.
             let owner = unsafe { GetActiveWindow() };
             // SAFETY: registered class and NUL-terminated strings that outlive the call; the
@@ -2398,7 +2613,7 @@ mod window {
                     0,
                     class.as_ptr(),
                     title.as_ptr(),
-                    STYLE,
+                    style,
                     CW_USEDEFAULT,
                     CW_USEDEFAULT,
                     ow,
@@ -2448,6 +2663,20 @@ mod window {
         }
     }
 
+    /// The client area's size of a host window (`window` from [`HostWindow::raw`]); main thread only.
+    pub fn client_size(window: *mut c_void) -> Option<(f64, f64)> {
+        // SAFETY: `IsWindow` accepts any value.
+        if !on_main_thread() || window.is_null() || unsafe { IsWindow(window) } == 0 {
+            return None;
+        }
+        let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: a live window of this thread; `r` is a valid, writable rect.
+        if unsafe { GetClientRect(window, &mut r) } == 0 {
+            return None;
+        }
+        Some((f64::from(r.right - r.left), f64::from(r.bottom - r.top)))
+    }
+
     /// Resizes a host window's client area (`window` from [`HostWindow::raw`]); main thread only.
     pub fn resize(window: *mut c_void, w: f64, h: f64) {
         // SAFETY: `IsWindow` accepts any value.
@@ -2476,7 +2705,7 @@ mod window {
     pub struct HostWindow;
 
     impl HostWindow {
-        pub fn new(_title: &str, _w: f64, _h: f64) -> Result<HostWindow, String> {
+        pub fn new(_title: &str, _w: f64, _h: f64, _resizable: bool) -> Result<HostWindow, String> {
             Err("VST3 editors are not hosted on this platform yet".into())
         }
         pub fn raw(&self) -> *mut c_void {
@@ -2493,6 +2722,11 @@ mod window {
     }
 
     pub fn resize(_window: *mut c_void, _w: f64, _h: f64) {}
+
+    /// Host windows are not user-resizable on this platform yet.
+    pub fn client_size(_window: *mut c_void) -> Option<(f64, f64)> {
+        None
+    }
 }
 
 #[cfg(test)]
