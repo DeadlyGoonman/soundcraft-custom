@@ -14,6 +14,9 @@ const AUTO_UPDATE_SECS: f64 = 2.0;
 pub struct ExtraState {
     pub show_renderer: bool,
     pub show_ui_customization: bool,
+    /// The Custom… popup of the Appearance window, and the hex text in it.
+    pub show_custom_theme: bool,
+    pub custom_hex: String,
     pub auto_update_config: bool,
     pub ui_scale: f32,
     pub reduce_motion: bool,
@@ -27,6 +30,8 @@ impl Default for ExtraState {
         Self {
             show_renderer: false,
             show_ui_customization: false,
+            show_custom_theme: false,
+            custom_hex: String::new(),
             auto_update_config: false,
             ui_scale: 1.0,
             reduce_motion: false,
@@ -161,17 +166,23 @@ fn ui_customization(app: &mut SoundApp, ctx: &egui::Context) {
                 crate::widgets::checkbox(ui, &mut app.extra.reduce_motion, "");
                 ui.end_row();
                 ui.label("Theme");
-                let mut chosen = None;
-                egui::ComboBox::from_id_salt("theme_mode").selected_text(app.ui.theme.label()).show_ui(ui, |ui| {
-                    for mode in crate::theme::ThemeMode::ALL {
-                        if ui.selectable_label(app.ui.theme == mode, mode.label()).clicked() {
-                            chosen = Some(mode);
+                ui.horizontal(|ui| {
+                    let mut chosen = None;
+                    egui::ComboBox::from_id_salt("theme_mode").selected_text(app.ui.theme.label()).show_ui(ui, |ui| {
+                        for mode in crate::theme::ThemeMode::ALL {
+                            if ui.selectable_label(app.ui.theme == mode, mode.label()).clicked() {
+                                chosen = Some(mode);
+                            }
                         }
+                    });
+                    if let Some(mode) = chosen {
+                        let _ = app.run("ui.theme", json!({"mode": mode.id()}));
+                    }
+                    if ui.button("Custom…").clicked() {
+                        app.extra.show_custom_theme = true;
+                        app.extra.custom_hex = crate::theme::format_hex(app.ui.custom_bg);
                     }
                 });
-                if let Some(mode) = chosen {
-                    let _ = app.run("ui.theme", json!({"mode": mode.id()}));
-                }
                 ui.end_row();
                 ui.label("Auto-update configuration");
                 crate::widgets::checkbox(ui, &mut app.extra.auto_update_config, "");
@@ -185,4 +196,59 @@ fn ui_customization(app: &mut SoundApp, ctx: &egui::Context) {
         },
     );
     app.extra.show_ui_customization = open;
+    custom_theme_window(app, ctx);
+}
+
+/// Make Custom the mode with `rgb` as its colour (the `ui.theme` command, so it stays validated).
+fn choose_custom(app: &mut SoundApp, rgb: [u8; 3]) {
+    let _ = app.run("ui.theme", json!({"mode": "custom", "color": crate::theme::format_hex(rgb)}));
+}
+
+/// The Custom… popup: a colour picker, a hex field and presets. Every change applies at once.
+fn custom_theme_window(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.extra.show_custom_theme;
+    if !open {
+        return;
+    }
+    egui::Window::new(egui::RichText::new("Custom Theme").font(bold(13.0)))
+        .open(&mut open)
+        .resizable(false)
+        .collapsible(false)
+        .default_width(250.0)
+        .show(ctx, |ui| {
+            let mut color = crate::theme::rgb(app.ui.custom_bg);
+            if egui::widgets::color_picker::color_picker_color32(ui, &mut color, egui::widgets::color_picker::Alpha::Opaque) {
+                let rgb = [color.r(), color.g(), color.b()];
+                app.extra.custom_hex = crate::theme::format_hex(rgb);
+                choose_custom(app, rgb);
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Hex");
+                let response = ui.add(egui::TextEdit::singleline(&mut app.extra.custom_hex).desired_width(96.0).hint_text("#RRGGBB"));
+                match crate::theme::parse_hex(&app.extra.custom_hex) {
+                    Some(rgb) => {
+                        if response.changed() {
+                            choose_custom(app, rgb);
+                        }
+                    }
+                    None => {
+                        ui.painter().rect_stroke(response.rect, 2.0, Stroke::new(1.5, Color32::RED), egui::StrokeKind::Outside);
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            for (name, rgb) in crate::theme::CUSTOM_PRESETS {
+                ui.horizontal(|ui| {
+                    let (swatch, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    ui.painter().rect_filled(swatch, 2.0, crate::theme::rgb(rgb));
+                    ui.painter().rect_stroke(swatch, 2.0, Stroke::new(1.0, Tokens::current().border), egui::StrokeKind::Inside);
+                    if ui.button(name).clicked() {
+                        app.extra.custom_hex = crate::theme::format_hex(rgb);
+                        choose_custom(app, rgb);
+                    }
+                });
+            }
+        });
+    app.extra.show_custom_theme = open;
 }

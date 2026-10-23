@@ -1,7 +1,10 @@
 //! Design tokens. Colours were chosen by eye to give a dark, studio-style look; they are ours.
 
 use egui::{Color32, FontFamily, FontId};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{
+    PoisonError, RwLock,
+    atomic::{AtomicU32, Ordering},
+};
 
 /// The colour palette in use. Dark is the default (the incumbent is dark-only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,28 +13,37 @@ pub enum Palette {
     Light,
     /// Dark with pure-black surfaces, for OLED panels.
     Oled,
+    /// Surfaces shaded from a user colour (see [`custom_tokens`]).
+    Custom([u8; 3]),
 }
 
 impl Palette {
-    const fn code(self) -> u8 {
+    /// Code in the low byte, the custom colour (R, G, B) in the three bytes above it.
+    const fn pack(self) -> u32 {
         match self {
             Self::Dark => 0,
             Self::Light => 1,
             Self::Oled => 2,
+            Self::Custom([r, g, b]) => 3 | ((r as u32) << 8) | ((g as u32) << 16) | ((b as u32) << 24),
         }
     }
 
-    const fn from_code(code: u8) -> Self {
+    const fn unpack(value: u32) -> Self {
+        let [code, r, g, b] = value.to_le_bytes();
         match code {
             1 => Self::Light,
             2 => Self::Oled,
+            3 => Self::Custom([r, g, b]),
             _ => Self::Dark,
         }
     }
 }
 
-/// The active [`Palette`], as its [`Palette::code`].
-static ACTIVE: AtomicU8 = AtomicU8::new(0);
+/// The active [`Palette`], as its [`Palette::pack`].
+static ACTIVE: AtomicU32 = AtomicU32::new(0);
+
+/// The tokens of the last custom colour applied, so frames do not recompute them.
+static CUSTOM_CACHE: RwLock<Option<([u8; 3], Tokens)>> = RwLock::new(None);
 
 /// Unit tests that change or read the process-wide palette must own it until their assertions
 /// finish. The lock is re-entrant per thread, so a test may hold it and still build apps
@@ -102,10 +114,12 @@ pub enum ThemeMode {
     #[default]
     Dark,
     Oled,
+    /// Surfaces shaded from the custom colour saved in the UI prefs (`custom_bg`).
+    Custom,
 }
 
 impl ThemeMode {
-    pub const ALL: [Self; 4] = [Self::Dark, Self::Oled, Self::Light, Self::System];
+    pub const ALL: [Self; 5] = [Self::Dark, Self::Oled, Self::Light, Self::System, Self::Custom];
 
     pub const fn label(self) -> &'static str {
         match self {
@@ -113,6 +127,7 @@ impl ThemeMode {
             Self::Light => "Light",
             Self::Dark => "Dark",
             Self::Oled => "OLED Black",
+            Self::Custom => "Custom",
         }
     }
 
@@ -123,12 +138,44 @@ impl ThemeMode {
             Self::Light => "light",
             Self::Dark => "dark",
             Self::Oled => "oled",
+            Self::Custom => "custom",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|m| m.id().eq_ignore_ascii_case(s.trim()))
     }
+}
+
+/// Soft Pink, the default custom colour.
+pub const SOFT_PINK: [u8; 3] = [0xDD, 0xB5, 0xC7];
+/// Dark Pink, a preset.
+pub const DARK_PINK: [u8; 3] = [0xBE, 0x86, 0xA3];
+/// The Custom popup's presets: name and colour. "Grey (Dark)" is Dark's `panel_bg`.
+pub const CUSTOM_PRESETS: [(&str, [u8; 3]); 4] =
+    [("Soft Pink", SOFT_PINK), ("Dark Pink", DARK_PINK), ("Grey (Dark)", [37, 37, 38]), ("OLED Black", [0, 0, 0])];
+
+/// Parse `#RRGGBB`, `RRGGBB`, `#RGB` or `RGB` (hex digits only, either case). Anything else is `None`.
+pub fn parse_hex(text: &str) -> Option<[u8; 3]> {
+    let s = text.trim();
+    let s = s.strip_prefix('#').unwrap_or(s);
+    // Hex digits are ASCII, so every byte offset below is a char boundary; this also rejects signs
+    // such as `+f00` that `from_str_radix` would accept, and empty or non-ASCII input.
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let nibble = |i: usize| s.get(i..i.checked_add(1)?).and_then(|h| u8::from_str_radix(h, 16).ok());
+    let byte = |i: usize| s.get(i..i.checked_add(2)?).and_then(|h| u8::from_str_radix(h, 16).ok());
+    match s.len() {
+        3 => Some([nibble(0)?.saturating_mul(17), nibble(1)?.saturating_mul(17), nibble(2)?.saturating_mul(17)]),
+        6 => Some([byte(0)?, byte(2)?, byte(4)?]),
+        _ => None,
+    }
+}
+
+/// `#RRGGBB`, upper case.
+pub fn format_hex(c: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2])
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -452,28 +499,178 @@ impl Tokens {
             Palette::Light => Self::LIGHT,
             Palette::Oled => Self::OLED,
             Palette::Dark => Self::DARK,
+            Palette::Custom(bg) => custom_cached(bg),
         }
     }
 }
 
 /// The palette that is currently applied.
 pub fn active_palette() -> Palette {
-    Palette::from_code(ACTIVE.load(Ordering::Relaxed))
+    Palette::unpack(ACTIVE.load(Ordering::Relaxed))
 }
 
-/// Whether the Light palette is the active one.
+/// Whether the palette is a light one (Light, or a custom colour that is light).
 pub fn is_light() -> bool {
-    active_palette() == Palette::Light
+    palette_is_light(active_palette())
+}
+
+fn palette_is_light(palette: Palette) -> bool {
+    match palette {
+        Palette::Light => true,
+        Palette::Custom(bg) => custom_is_light(rgb(bg)),
+        Palette::Dark | Palette::Oled => false,
+    }
 }
 
 /// The palette a mode resolves to this frame. System follows the OS appearance; unknown uses Dark.
-pub fn palette_for(ctx: &egui::Context, mode: ThemeMode) -> Palette {
+/// `custom` is the saved custom colour, used by [`ThemeMode::Custom`].
+pub fn palette_for(ctx: &egui::Context, mode: ThemeMode, custom: [u8; 3]) -> Palette {
     match mode {
         ThemeMode::Light => Palette::Light,
         ThemeMode::Dark => Palette::Dark,
         ThemeMode::Oled => Palette::Oled,
+        ThemeMode::Custom => Palette::Custom(custom),
         ThemeMode::System if ctx.system_theme() == Some(egui::Theme::Light) => Palette::Light,
         ThemeMode::System => Palette::Dark,
+    }
+}
+
+/// The text colours a custom palette may use: pure white and pure black.
+const INK_LIGHT: Color32 = Color32::WHITE;
+const INK_DARK: Color32 = Color32::BLACK;
+/// The contrast every primary text colour keeps on the surfaces it sits on (WCAG AA).
+const TEXT_MIN_CONTRAST: f64 = 4.5;
+/// The contrast weaker text keeps on the surfaces it sits on.
+const WEAK_TEXT_MIN_CONTRAST: f64 = 3.0;
+
+/// WCAG relative luminance of an sRGB colour (0.0 to 1.0).
+fn relative_luminance(c: Color32) -> f64 {
+    let channel = |v: u8| {
+        let s = f64::from(v) / 255.0;
+        if s <= 0.03928 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+}
+
+/// WCAG contrast ratio between two colours (1.0 to 21.0).
+pub fn contrast(a: Color32, b: Color32) -> f64 {
+    let (x, y) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if x >= y { (x, y) } else { (y, x) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// A custom colour is light when white text would have less contrast on it than black text.
+pub fn custom_is_light(bg: Color32) -> bool {
+    contrast(INK_LIGHT, bg) < contrast(INK_DARK, bg)
+}
+
+/// `from` moved `amount` (0..1) toward `toward`.
+fn toward(from: Color32, toward: Color32, amount: f32) -> Color32 {
+    from.lerp_to_gamma(toward, amount.clamp(0.0, 1.0))
+}
+
+/// A surface `amount` of the way from `bg` toward the text colour `ink`. If the text would lose
+/// its contrast on it, the step is backed off toward `bg` (which always keeps it).
+fn surface_toward(bg: Color32, ink: Color32, amount: f32) -> Color32 {
+    const STEPS: u32 = 40;
+    (0..=STEPS).rev().map(|i| toward(bg, ink, amount * i as f32 / STEPS as f32)).find(|c| contrast(ink, *c) >= TEXT_MIN_CONTRAST).unwrap_or(bg)
+}
+
+/// The text colour `ink` pulled toward `anchor` by the most that still keeps `WEAK_TEXT_MIN_CONTRAST`
+/// on every surface in `surfaces`; `ink` itself when nothing weaker passes.
+fn weak_text(ink: Color32, anchor: Color32, surfaces: &[Color32]) -> Color32 {
+    (0..=4)
+        .rev()
+        .map(|i| toward(ink, anchor, 0.1 * i as f32))
+        .find(|c| surfaces.iter().all(|s| contrast(*c, *s) >= WEAK_TEXT_MIN_CONTRAST))
+        .unwrap_or(ink)
+}
+
+/// Tokens for a custom background colour. The base set (Light or Dark, by the colour's luminance)
+/// keeps its accent, meter, selection and track colours. The background family is shades of `bg`:
+/// panels are `bg`, secondary surfaces step toward the text colour, and borders step further. The
+/// text colour is white or black, whichever contrasts more with `bg`, and every surface keeps
+/// primary text at 4.5:1 or better.
+pub fn custom_tokens(bg: Color32) -> Tokens {
+    let light = custom_is_light(bg);
+    let base = if light { Tokens::LIGHT } else { Tokens::DARK };
+    let ink = if light { INK_DARK } else { INK_LIGHT };
+    let surface = |k: f32| surface_toward(bg, ink, k);
+    let line = |k: f32| toward(bg, ink, k);
+
+    let panel2 = surface(0.06);
+    let toolbar_group = surface(0.08);
+    let button = surface(0.12);
+    let button_hi = surface(0.2);
+    let ruler = surface(0.06);
+    let counter = surface(0.04);
+    let strip_section = surface(0.05);
+    let text_dim = weak_text(ink, bg, &[bg, panel2, button]);
+    let counter_label = weak_text(ink, bg, &[counter]);
+    let section_label = weak_text(ink, bg, &[strip_section]);
+    let ruler_text = weak_text(ink, bg, &[ruler]);
+    let visible_dot = weak_text(ink, bg, &[panel2]);
+
+    Tokens {
+        window_bg: bg,
+        panel_bg: bg,
+        playlist_bg: bg,
+        panel_bg2: panel2,
+        toolbar_bg: surface(0.03),
+        toolbar_group,
+        menu_bar: surface(0.02),
+        border: line(0.22),
+        border_light: line(0.16),
+        edge_light: line(0.12),
+        group_border: line(0.2),
+        text: ink,
+        text_dim,
+        header_text: ink,
+        marker_text: ink,
+        automation_line: ink,
+        insertion: ink,
+        counter_bg: counter,
+        counter_off: surface(0.1),
+        counter_label,
+        counter_border: line(0.2),
+        counter_rule: line(0.12),
+        big_counter_bg: surface(0.02),
+        button,
+        button_hi,
+        button_border: line(0.3),
+        name_field: surface(0.1),
+        name_field_sel: surface(0.16),
+        ruler_bg: ruler,
+        ruler_label_bg: ruler,
+        marker_ruler: ruler,
+        ruler_text,
+        ruler_tick: line(0.3),
+        grid_line: line(0.08),
+        bar_line: line(0.16),
+        playlist_alt: surface(0.03),
+        playlist_lane: surface(0.03),
+        strip_bg: surface(0.08),
+        strip_section,
+        section_label,
+        slot_bg: surface(0.04),
+        slot_well: surface(0.08),
+        slot_empty: surface(0.05),
+        slot_face: [surface(0.14), surface(0.1)],
+        fader_track: line(0.2),
+        tool_bracket_off: line(0.2),
+        visible_dot,
+        universe_bg: surface(0.04),
+        knob_bg: surface(0.1),
+        ..base
+    }
+}
+
+/// [`custom_tokens`] for `bg`, reusing the last result while the colour is unchanged.
+fn custom_cached(bg: [u8; 3]) -> Tokens {
+    let cached = *CUSTOM_CACHE.read().unwrap_or_else(PoisonError::into_inner);
+    match cached {
+        Some((colour, tokens)) if colour == bg => tokens,
+        _ => custom_tokens(rgb(bg)),
     }
 }
 
@@ -545,9 +742,13 @@ pub fn apply(ctx: &egui::Context, light: bool) {
 
 /// Make `palette` the active one and apply its visuals. Call only when it changes.
 pub fn apply_palette(ctx: &egui::Context, palette: Palette) {
-    ACTIVE.store(palette.code(), Ordering::Relaxed);
+    if let Palette::Custom(bg) = palette {
+        let tokens = custom_tokens(rgb(bg));
+        *CUSTOM_CACHE.write().unwrap_or_else(PoisonError::into_inner) = Some((bg, tokens));
+    }
+    ACTIVE.store(palette.pack(), Ordering::Relaxed);
     let t = Tokens::current();
-    let mut v = if palette == Palette::Light { egui::Visuals::light() } else { egui::Visuals::dark() };
+    let mut v = if palette_is_light(palette) { egui::Visuals::light() } else { egui::Visuals::dark() };
     v.panel_fill = t.panel_bg;
     v.window_fill = t.panel_bg2;
     v.extreme_bg_color = t.slot_bg;
@@ -630,23 +831,6 @@ mod tests {
         assert_eq!(ThemeMode::parse("sepia"), None);
     }
 
-    fn relative_luminance(c: Color32) -> f64 {
-        let channel = |v: u8| {
-            let s = f64::from(v) / 255.0;
-            if s <= 0.03928 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
-        };
-        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
-    }
-
-    /// WCAG contrast ratio between two colours (1.0 to 21.0).
-    fn contrast(a: Color32, b: Color32) -> f64 {
-        let (hi, lo) = {
-            let (x, y) = (relative_luminance(a), relative_luminance(b));
-            if x >= y { (x, y) } else { (y, x) }
-        };
-        (hi + 0.05) / (lo + 0.05)
-    }
-
     #[test]
     fn oled_is_a_black_dark_palette() {
         assert_eq!(ThemeMode::ALL[1], ThemeMode::Oled, "OLED sits right after Dark in the Appearance list");
@@ -701,6 +885,137 @@ mod tests {
         assert_eq!(app.ui.theme, ThemeMode::Light);
         assert_eq!(app.run("ui.theme", json!({"mode": "system"})), Ok(json!({"mode": "system"})));
         assert!(crate::menus::UI_COMMANDS.iter().any(|c| c.0 == "ui.theme"));
+    }
+
+    #[test]
+    fn hex_parsing_accepts_both_lengths_and_rejects_hostile_input() {
+        assert_eq!(parse_hex("#DDB5C7"), Some(SOFT_PINK));
+        assert_eq!(parse_hex("ddb5c7"), Some(SOFT_PINK));
+        assert_eq!(parse_hex("  #dDb5C7 "), Some(SOFT_PINK));
+        assert_eq!(parse_hex("#FFF"), Some([255, 255, 255]));
+        assert_eq!(parse_hex("abc"), Some([0xAA, 0xBB, 0xCC]));
+        assert_eq!(format_hex(SOFT_PINK), "#DDB5C7");
+        assert_eq!(format_hex([1, 2, 3]), "#010203");
+        for bad in [
+            "",
+            "#",
+            "#12",
+            "#1234",
+            "#12345",
+            "#1234567",
+            "#GGGGGG",
+            "#ggg",
+            "+ff0000",
+            "-f0000",
+            "#ff 000",
+            "0x12345",
+            "##FFFFFF",
+            "#FFFF\u{0}0",
+            "ß",
+            "#ä12345",
+            "#😀",
+            "F\n",
+            "#FFFF00 ;",
+        ] {
+            assert_eq!(parse_hex(bad), None, "{bad:?}");
+        }
+        assert_eq!(parse_hex(&"F".repeat(100_000)), None, "a long paste is rejected without work");
+    }
+
+    #[test]
+    fn custom_palettes_keep_text_readable() {
+        for hex in ["#000000", "#FFFFFF", "#DDB5C7", "#BE86A3", "#808080", "#FF0000", "#0000FF", "#FFFF00", "#777777"] {
+            let bg = rgb(parse_hex(hex).expect("table colour"));
+            let t = custom_tokens(bg);
+            assert_eq!(t.panel_bg, bg, "{hex}: panel is the colour");
+            assert_eq!(t.playlist_bg, bg, "{hex}: playlist is the colour");
+            assert!(contrast(t.text, t.panel_bg) >= 4.5, "{hex}: primary text on the panel");
+            for fill in [t.button, t.button_hi, t.panel_bg2, t.slot_face[0], t.name_field_sel] {
+                assert!(contrast(t.text, fill) >= 4.5, "{hex}: primary text on a fill {fill:?}");
+            }
+            for weak in [t.text_dim, t.visible_dot] {
+                assert!(contrast(weak, t.panel_bg2) >= 3.0, "{hex}: weak text on a secondary surface");
+                assert!(contrast(weak, t.panel_bg) >= 3.0, "{hex}: weak text on the panel");
+            }
+            assert!(contrast(t.counter_label, t.counter_bg) >= 3.0, "{hex}: counter label");
+            assert!(contrast(t.section_label, t.strip_section) >= 3.0, "{hex}: section label");
+            assert!(contrast(t.ruler_text, t.ruler_bg) >= 3.0, "{hex}: ruler text");
+            // Surfaces step toward the text colour, so the hierarchy stays visible.
+            assert_ne!(t.panel_bg2, t.panel_bg, "{hex}: secondary surface differs from the panel");
+            assert_ne!(t.button, t.panel_bg, "{hex}: buttons differ from the panel");
+        }
+    }
+
+    #[test]
+    fn custom_colour_picks_its_base_set_by_luminance() {
+        assert!(custom_is_light(rgb(SOFT_PINK)), "Soft Pink is light");
+        assert!(custom_is_light(rgb(parse_hex("#FFFF00").expect("yellow"))));
+        // Dark Pink (luminance about 0.31) still reads better with black text, so it is light too.
+        assert!(custom_is_light(rgb(DARK_PINK)), "Dark Pink takes the light base");
+        assert!(!custom_is_light(rgb([0x30, 0x30, 0x30])));
+        assert!(!custom_is_light(rgb([0, 0, 0])));
+        // The base's accent and track colours carry over.
+        let light = custom_tokens(rgb(SOFT_PINK));
+        assert_eq!(light.accent, Tokens::LIGHT.accent);
+        assert_eq!(light.meter_green, Tokens::LIGHT.meter_green);
+        let dark = custom_tokens(rgb([0x30, 0x30, 0x30]));
+        assert_eq!(dark.accent, Tokens::DARK.accent);
+        assert_eq!(dark.selection, Tokens::DARK.selection);
+    }
+
+    #[test]
+    fn custom_mode_and_colour_round_trip_through_prefs() {
+        assert_eq!(ThemeMode::parse("custom"), Some(ThemeMode::Custom));
+        assert_eq!(ThemeMode::Custom.label(), "Custom");
+        assert_eq!(serde_json::to_value(ThemeMode::Custom).expect("serialises"), json!("custom"));
+        let ui = UiState { theme: ThemeMode::Custom, custom_bg: [1, 2, 3], ..UiState::default() };
+        let value = serde_json::to_value(&ui).expect("serialises");
+        assert_eq!(value["custom_bg"], json!([1, 2, 3]));
+        let back: UiState = serde_json::from_value(value).expect("loads");
+        assert_eq!(back.theme, ThemeMode::Custom);
+        assert_eq!(back.custom_bg, [1, 2, 3]);
+        let old: UiState = serde_json::from_value(json!({"theme": "dark"})).expect("an older ui.json loads");
+        assert_eq!(old.custom_bg, SOFT_PINK, "a missing colour gets Soft Pink");
+        assert_eq!(CUSTOM_PRESETS[2].1, [Tokens::DARK.panel_bg.r(), Tokens::DARK.panel_bg.g(), Tokens::DARK.panel_bg.b()]);
+    }
+
+    #[test]
+    fn ui_theme_custom_command_validates_the_colour() {
+        let _palette = lock_test_palette();
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        assert_eq!(app.run("ui.theme", json!({"mode": "custom", "color": "#BE86A3"})), Ok(json!({"mode": "custom", "color": "#BE86A3"})));
+        assert_eq!(app.ui.theme, ThemeMode::Custom);
+        assert_eq!(app.ui.custom_bg, DARK_PINK);
+        assert_eq!(app.run("ui.theme", json!({"mode": "custom"})), Ok(json!({"mode": "custom", "color": "#BE86A3"})), "color is optional");
+        assert!(app.run("ui.theme", json!({"mode": "custom", "color": "#GGGGGG"})).is_err());
+        assert!(app.run("ui.theme", json!({"mode": "custom", "color": 5})).is_err());
+        assert!(app.run("ui.theme", json!({"mode": "sepia", "color": "#000000"})).is_err());
+        assert_eq!(app.ui.custom_bg, DARK_PINK, "a rejected call changes nothing");
+        assert_eq!(app.ui.theme, ThemeMode::Custom);
+        assert_eq!(app.run("ui.theme", json!({"mode": "dark"})), Ok(json!({"mode": "dark"})));
+        assert_eq!(app.ui.custom_bg, DARK_PINK, "leaving Custom keeps the colour for later");
+        assert_eq!(app.run("ui.theme", json!({"color": "#000000"})), Ok(json!({"mode": "dark"})), "a colour alone keeps the mode");
+        assert_eq!(app.ui.custom_bg, [0, 0, 0]);
+    }
+
+    #[test]
+    fn custom_palette_applies_its_tokens_and_base_polarity() {
+        let _palette = lock_test_palette();
+        let ctx = egui::Context::default();
+        apply_palette(&ctx, Palette::Custom(SOFT_PINK));
+        assert_eq!(active_palette(), Palette::Custom(SOFT_PINK));
+        assert!(is_light());
+        assert_eq!(Tokens::current().panel_bg, rgb(SOFT_PINK));
+        assert!(!ctx.global_style().visuals.dark_mode, "a light colour gets light visuals");
+        assert_eq!(ctx.global_style().visuals.panel_fill, rgb(SOFT_PINK));
+        // A new colour replaces the cached tokens.
+        apply_palette(&ctx, Palette::Custom(DARK_PINK));
+        assert_eq!(Tokens::current().panel_bg, rgb(DARK_PINK));
+        apply_palette(&ctx, Palette::Custom([0, 0, 0]));
+        assert!(!is_light());
+        assert!(ctx.global_style().visuals.dark_mode, "a dark colour gets dark visuals");
+        apply_palette(&ctx, Palette::Dark);
+        assert_eq!(active_palette(), Palette::Dark);
     }
 
     #[test]
