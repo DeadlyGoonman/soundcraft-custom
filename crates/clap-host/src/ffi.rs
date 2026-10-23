@@ -279,7 +279,7 @@ impl Bundle {
         inst.state_ext = inst.extension::<clap_plugin_state>(CLAP_EXT_STATE);
         let gui = inst.extension::<clap_plugin_gui>(CLAP_EXT_GUI);
         inst.gui = Arc::new(GuiLink {
-            inner: Mutex::new(GuiInner { plugin, gui, state: inst.state_ext, alive: true, created: false, visible: false, window: None }),
+            inner: Mutex::new(GuiInner { plugin, gui, state: inst.state_ext, alive: true, created: false, visible: false, window: None, scale: 1.0 }),
             host: Arc::clone(&inst.state),
         });
         Ok(inst)
@@ -752,6 +752,8 @@ struct GuiInner {
     visible: bool,
     /// The host window of an embedded editor (`None` for floating editors).
     window: Option<hostwin::HostWindow>,
+    /// The scale factor applied to each GUI as it is created (1.0 = the plugin's own size).
+    scale: f32,
 }
 
 /// The link between an instance and its editor and state handles. The instance may process on
@@ -776,6 +778,7 @@ impl Default for GuiLink {
                 created: false,
                 visible: false,
                 window: None,
+                scale: 1.0,
             }),
             host: Arc::new(HostState::default()),
         }
@@ -786,9 +789,86 @@ impl Default for GuiLink {
 // plugin exists; CLAP's threading rules (main-thread GUI calls) are checked at each call.
 unsafe impl Send for GuiInner {}
 
+/// `dim` times `factor`, rounded and kept to a sane window dimension (`factor` is finite).
+fn scaled_dim(dim: u32, factor: f32) -> u32 {
+    (f64::from(dim) * f64::from(factor)).round().clamp(1.0, 16_384.0) as u32
+}
+
+/// Scales a created GUI (main thread) before it is shown. Factor 1.0 calls `set_scale(1.0)` when
+/// present and ignores the answer, as the host always did. Any other factor needs `set_scale` to
+/// succeed; a plugin that refuses it is sized instead through `can_resize`, `adjust_size` and
+/// `set_size`. Cocoa uses logical pixels and never gets `set_scale`.
+fn apply_scale(g: &GuiInner, vt: clap_plugin_gui, factor: f32) -> Result<(), String> {
+    let set_scale = if cfg!(target_os = "macos") { None } else { vt.set_scale };
+    if factor == 1.0 {
+        if let Some(f) = set_scale {
+            // SAFETY: live plugin with a created GUI; main thread (callers check).
+            unsafe { f(g.plugin, 1.0) };
+        }
+        return Ok(());
+    }
+    if let Some(f) = set_scale {
+        // SAFETY: as above.
+        if unsafe { f(g.plugin, f64::from(factor)) } {
+            return Ok(());
+        }
+    }
+    let unsupported = || "the plugin cannot draw itself at this scale".to_string();
+    let (Some(can_resize), Some(get_size), Some(adjust_size), Some(set_size)) = (vt.can_resize, vt.get_size, vt.adjust_size, vt.set_size) else {
+        return Err(unsupported());
+    };
+    // SAFETY: live plugin with a created GUI; main thread.
+    if !unsafe { can_resize(g.plugin) } {
+        return Err(unsupported());
+    }
+    let (mut w, mut h) = (0u32, 0u32);
+    // SAFETY: as above; both out-pointers are valid locals.
+    if !unsafe { get_size(g.plugin, &mut w, &mut h) } || w == 0 || h == 0 {
+        return Err("the plugin reported no editor size".into());
+    }
+    let (mut tw, mut th) = (scaled_dim(w, factor), scaled_dim(h, factor));
+    // SAFETY: as above; the plugin may adjust the size through the valid locals (a false answer
+    // leaves them as requested).
+    unsafe { adjust_size(g.plugin, &mut tw, &mut th) };
+    // SAFETY: as above.
+    if !unsafe { set_size(g.plugin, tw, th) } {
+        return Err("the plugin refused its scaled size".into());
+    }
+    Ok(())
+}
+
 impl GuiLink {
     fn lock(&self) -> std::sync::MutexGuard<'_, GuiInner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the plugin can draw itself at another scale: a `set_scale` (not on Cocoa) or a
+    /// resizable GUI. Main thread only (`false` elsewhere).
+    pub fn native_scaling(&self) -> bool {
+        if !on_main_thread() {
+            return false;
+        }
+        let g = self.lock();
+        let Some(vt) = GuiLink::vt(&g) else { return false };
+        if !cfg!(target_os = "macos") && vt.set_scale.is_some() {
+            return true;
+        }
+        match vt.can_resize {
+            // SAFETY: live plugin (`vt` exists only while `alive`); main thread (checked above).
+            Some(f) if g.created => unsafe { f(g.plugin) },
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// The scale factor the next open applies (1.0 unless changed).
+    pub fn editor_scale(&self) -> f32 {
+        self.lock().scale
+    }
+
+    /// Stores the scale factor for the next open. The caller reopens an editor that is open.
+    pub fn set_editor_scale(&self, factor: f32) {
+        self.lock().scale = if factor.is_finite() { factor.clamp(0.5, 4.0) } else { 1.0 };
     }
 
     pub fn available(&self) -> bool {
@@ -840,11 +920,10 @@ impl GuiLink {
             return Err("the plugin could not create its editor".into());
         }
         g.created = true;
-        if !cfg!(target_os = "macos")
-            && let Some(f) = vt.set_scale
-        {
-            // SAFETY: live plugin with a created GUI. (Cocoa uses logical pixels: not called.)
-            unsafe { f(g.plugin, 1.0) };
+        let scale = g.scale;
+        if let Err(e) = apply_scale(&g, vt, scale) {
+            GuiLink::destroy(&mut g);
+            return Err(e);
         }
         if let (Some(f), Ok(t)) = (vt.suggest_title, CString::new(title)) {
             // SAFETY: live plugin with a created floating GUI; `t` outlives the call.
@@ -874,10 +953,12 @@ impl GuiLink {
             return Err("the plugin could not create its editor".into());
         }
         g.created = true;
-        if let Some(f) = vt.set_scale {
-            // SAFETY: live plugin with a created GUI.
-            unsafe { f(g.plugin, 1.0) };
+        let scale = g.scale;
+        if let Err(e) = apply_scale(g, vt, scale) {
+            GuiLink::destroy(g);
+            return Err(e);
         }
+        // The size read below is the scaled one, so the host window opens at the right size.
         let (mut w, mut h) = (640u32, 480u32);
         if let Some(f) = vt.get_size {
             let (mut a, mut b) = (0u32, 0u32);
@@ -1655,6 +1736,15 @@ pub(crate) use hostwin::cursor_screen_pos;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scaled_sizes_round_and_stay_in_bounds() {
+        assert_eq!(scaled_dim(640, 1.5), 960);
+        assert_eq!(scaled_dim(481, 1.25), 601);
+        assert_eq!(scaled_dim(100, 4.0), 400);
+        assert_eq!(scaled_dim(0, 2.0), 1);
+        assert_eq!(scaled_dim(u32::MAX, 4.0), 16_384);
+    }
 
     #[test]
     fn the_transport_reaches_clap_in_fixed_point() {

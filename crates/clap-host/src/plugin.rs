@@ -2,7 +2,7 @@
 
 use crate::ffi::{EVENT_CAP, Event, GuiLink, Instance, NotePort, PortBuffers};
 use clap_sys::ext::note_ports::{CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI};
-use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, Transport};
+use soundcraft_dsp::{EditorScale, EditorScaleMode, Plugin, PluginEditor, PluginInfo, Transport};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -10,6 +10,8 @@ use std::sync::atomic::Ordering;
 const MAX_BLOCK: usize = 1 << 16;
 /// Most channels a host strip may ask for.
 const MAX_CHANNELS: usize = 64;
+/// Host-side upscaling is not wired up yet (floating GUIs can't be upscaled at all).
+const UPSCALE_UNSUPPORTED: &str = "upscaling is not wired up yet";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum NoteMode {
@@ -338,6 +340,33 @@ impl PluginEditor for ClapEditor {
         self.link.is_open()
     }
 
+    fn native_scaling(&mut self) -> bool {
+        self.link.native_scaling()
+    }
+
+    fn set_scale(&mut self, scale: EditorScale) -> Result<(), String> {
+        let factor = scale.clamped_factor();
+        // Upscaling (host-side stretching) is not wired up yet.
+        if matches!(scale.mode, EditorScaleMode::Upscale(_)) {
+            return Err(UPSCALE_UNSUPPORTED.into());
+        }
+        if factor != 1.0 && !self.link.native_scaling() {
+            return Err(match scale.mode {
+                EditorScaleMode::Native => "this plugin cannot draw itself at another size".into(),
+                _ => UPSCALE_UNSUPPORTED.into(),
+            });
+        }
+        let prev = self.link.editor_scale();
+        let was_open = self.link.is_open();
+        self.link.set_editor_scale(factor);
+        // Applied on open: an open editor is closed and reopened at the new scale.
+        if !was_open || prev == factor {
+            return Ok(());
+        }
+        self.link.close();
+        self.link.open(self.info.name).inspect_err(|_| self.link.set_editor_scale(prev))
+    }
+
     fn idle(&mut self) -> Vec<(String, f32)> {
         let raw = self.link.idle();
         let _ = self.link.host().dirty.swap(false, Ordering::Relaxed);
@@ -353,5 +382,41 @@ impl PluginEditor for ClapEditor {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soundcraft_dsp::{Category, UpscaleFilter};
+
+    fn editor() -> ClapEditor {
+        static INFO: PluginInfo =
+            PluginInfo { id: "test", name: "Test", short_name: "Test", category: Category::Eq, params: &[], is_instrument: false, audiosuite: false };
+        ClapEditor { link: Arc::new(GuiLink::default()), info: &INFO, ids: Vec::new() }
+    }
+
+    #[test]
+    fn upscale_modes_are_refused_for_now() {
+        let mut e = editor();
+        for mode in [EditorScaleMode::Upscale(UpscaleFilter::Fsr1), EditorScaleMode::Upscale(UpscaleFilter::Bilinear)] {
+            assert_eq!(e.set_scale(EditorScale { factor: 1.5, mode }), Err(UPSCALE_UNSUPPORTED.to_string()));
+        }
+    }
+
+    #[test]
+    fn auto_at_another_scale_needs_native_support() {
+        // No GUI behind this link, so nothing can be scaled natively.
+        let mut e = editor();
+        assert!(!e.native_scaling());
+        assert_eq!(e.set_scale(EditorScale { factor: 2.0, mode: EditorScaleMode::Auto }), Err(UPSCALE_UNSUPPORTED.to_string()));
+        assert!(e.set_scale(EditorScale { factor: 2.0, mode: EditorScaleMode::Native }).is_err());
+    }
+
+    #[test]
+    fn factor_one_is_always_accepted_and_remembered() {
+        let mut e = editor();
+        assert!(e.set_scale(EditorScale::default()).is_ok());
+        assert_eq!(e.link.editor_scale(), 1.0);
     }
 }
