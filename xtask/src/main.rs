@@ -27,6 +27,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("vst3-host", 1),
     ("au-host", 1),
     ("asio", 1),
+    ("editor-scale", 1),
     ("model", 2),
     ("mix", 3),
     ("engine", 4),

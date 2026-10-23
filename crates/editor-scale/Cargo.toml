@@ -1,0 +1,39 @@
+[package]
+name = "soundcraft-editor-scale"
+description = "SoundCraft's host-side plugin editor upscaler: captures an editor drawn at its own size and stretches it (AMD FSR 1 or bilinear) into a D3D11 window, forwarding input; Windows only, a safe stub elsewhere"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+soundcraft-dsp.workspace = true
+log.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# An isolated unsafe helper crate (craftrules never-crash), like soundcraft-asio: this crate opts out
+# of the workspace `unsafe_code = "forbid"` for itself only. It denies unsafe everywhere and allows
+# it solely in the Win32/D3D11 module (`src/win.rs`). The rest mirrors `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"

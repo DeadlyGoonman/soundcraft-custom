@@ -28,6 +28,7 @@ People trust SoundCraft with their recordings; a crash loses takes. **This outra
 - The same exception, same rules, for `soundcraft-vst3-host` (`crates/vst3-host`), the isolated unsafe helper crate for VST3 plugin FFI (COM vtables via the `vst3` bindings, module loading, host-side COM objects).
 - And for `soundcraft-au-host` (`crates/au-host`), the isolated unsafe helper crate for Audio Unit FFI (hand-written AudioToolbox/CoreFoundation declarations, macOS only; a safe stub elsewhere).
 - And for `soundcraft-asio` (`crates/asio`), the isolated unsafe helper crate for the native ASIO host (hand-written ASIO ABI and COM declarations, Windows x86_64 only; a safe stub elsewhere). Never copy from the Steinberg SDK.
+- And for `soundcraft-editor-scale` (`crates/editor-scale`), the isolated unsafe helper crate for the host-side plugin editor upscaler (Win32 windows, GDI capture and D3D11 compute through the `windows` crate; `unsafe` only in `src/win.rs`; a safe stub elsewhere). It vendors the MIT AMD FidelityFX FSR 1 headers under `shaders/`, listed in `ATTRIBUTION.md`.
 - Errors are `Result<T, E>` + `?`. An unfinished feature returns an "unsupported" error.
 - Input-derived numbers are hostile (files, commands, MCP/control params): `get()` not `[i]`, checked/saturating arithmetic, no NaN casts, cap allocations.
 - The audio callback never blocks, allocates in steady state, or panics.

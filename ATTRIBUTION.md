@@ -37,3 +37,7 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 | `assets/app-icon/soundcraft.ico` | SoundCraft contributors | original, rendered from `icon.svg` | MIT OR Apache-2.0 |
 | `assets/app-icon/hicolor/` | SoundCraft contributors | original, rendered from `icon.svg` (16–512 px PNGs and the scalable SVG) | MIT OR Apache-2.0 |
 | `docs/images/` | SoundCraft contributors | screenshots of SoundCraft rendered from the synthesised demo session | MIT OR Apache-2.0 |
+| `crates/editor-scale/shaders/ffx_a.h` | AMD (Advanced Micro Devices, Inc.) | vendored unmodified from [GPUOpen-Effects/FidelityFX-FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR) `ffx-fsr/ffx_a.h` | MIT (`crates/editor-scale/shaders/LICENSE-FidelityFX-FSR.txt`) |
+| `crates/editor-scale/shaders/ffx_fsr1.h` | AMD (Advanced Micro Devices, Inc.) | vendored unmodified from [GPUOpen-Effects/FidelityFX-FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR) `ffx-fsr/ffx_fsr1.h` | MIT (`crates/editor-scale/shaders/LICENSE-FidelityFX-FSR.txt`) |
+| `crates/editor-scale/shaders/LICENSE-FidelityFX-FSR.txt` | AMD (Advanced Micro Devices, Inc.) | vendored unmodified from [GPUOpen-Effects/FidelityFX-FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR) `license.txt` | MIT |
+| `crates/editor-scale/shaders/fsr_easu.hlsl`, `fsr_rcas.hlsl`, `bilinear.hlsl` | SoundCraft contributors | original entry points that include the FSR 1 headers (or a bilinear pass) | MIT OR Apache-2.0 |
