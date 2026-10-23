@@ -658,7 +658,7 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
                 return Some(Ok(json!({"mode": app.ui.theme.id()})));
             };
             let Some(mode) = crate::theme::ThemeMode::parse(mode) else {
-                return Some(Err(format!("unknown theme `{mode}` (system, light or dark)")));
+                return Some(Err(format!("unknown theme `{mode}` (system, light, dark or oled)")));
             };
             app.ui.theme = mode;
             json!({"mode": mode.id()})
