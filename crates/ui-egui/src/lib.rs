@@ -120,6 +120,8 @@ pub struct UiState {
     pub configurations: Vec<(String, Value)>,
     /// Appearance (`ui.theme`): dark by default, light or follow the system on request.
     pub theme: theme::ThemeMode,
+    /// The colour behind the Custom theme (`ui.theme {"mode":"custom"}`), kept across mode changes.
+    pub custom_bg: [u8; 3],
     /// The main window's size (logical points) and maximized state, and the interface scale, as
     /// the desktop app last saw them; it restores them at launch.
     pub window_size: [f32; 2],
@@ -182,6 +184,7 @@ impl Default for UiState {
             workspace_dir: String::new(),
             configurations: Vec::new(),
             theme: theme::ThemeMode::Dark,
+            custom_bg: theme::SOFT_PINK,
             window_size: [1600.0, 1000.0],
             window_maximized: false,
             ui_scale: 1.0,
@@ -1238,7 +1241,7 @@ impl SoundApp {
                 ctx.request_repaint();
             }
         }
-        let palette = theme::palette_for(ctx, self.ui.theme);
+        let palette = theme::palette_for(ctx, self.ui.theme, self.ui.custom_bg);
         if self.theme_applied != Some(palette) || theme::active_palette() != palette {
             theme::apply_palette(ctx, palette);
             self.theme_applied = Some(palette);

@@ -654,14 +654,38 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
             return Some(Err("ui.bounce_dialog opens a dialog from the menu only; call file.bounce_mix with a path".into()));
         }
         "ui.theme" => {
-            let Some(mode) = p.get("mode").and_then(Value::as_str) else {
+            // Validate everything before changing anything: a bad colour or mode leaves the theme as it was.
+            let color = match p.get("color") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let Some(text) = value.as_str() else {
+                        return Some(Err("color must be a \"#RRGGBB\" string".into()));
+                    };
+                    let Some(rgb) = crate::theme::parse_hex(text) else {
+                        return Some(Err(format!("bad color `{text}` (expected #RRGGBB or #RGB)")));
+                    };
+                    Some(rgb)
+                }
+            };
+            let mode = match p.get("mode").and_then(Value::as_str) {
+                None => None,
+                Some(text) => match crate::theme::ThemeMode::parse(text) {
+                    Some(mode) => Some(mode),
+                    None => return Some(Err(format!("unknown theme `{text}` (system, light, dark, oled or custom)"))),
+                },
+            };
+            if let Some(rgb) = color {
+                app.ui.custom_bg = rgb;
+            }
+            let Some(mode) = mode else {
                 return Some(Ok(json!({"mode": app.ui.theme.id()})));
             };
-            let Some(mode) = crate::theme::ThemeMode::parse(mode) else {
-                return Some(Err(format!("unknown theme `{mode}` (system, light, dark or oled)")));
-            };
             app.ui.theme = mode;
-            json!({"mode": mode.id()})
+            if mode == crate::theme::ThemeMode::Custom {
+                json!({"mode": mode.id(), "color": crate::theme::format_hex(app.ui.custom_bg)})
+            } else {
+                json!({"mode": mode.id()})
+            }
         }
         "ui.set" => match serde_json::to_value(&app.ui) {
             Ok(mut cur) => {
