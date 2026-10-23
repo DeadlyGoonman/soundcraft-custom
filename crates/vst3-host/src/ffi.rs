@@ -16,7 +16,8 @@
 
 use crate::{Vst3Error, scan};
 use soundcraft_dsp::Transport;
-use std::ffi::{c_char, c_int, c_void};
+use std::collections::HashMap;
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -24,8 +25,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, TryLockError, mpsc};
 use std::time::Duration;
 use vst3::Steinberg::Vst::{self as sv};
 use vst3::Steinberg::Vst::{
-    IAudioProcessorTrait, IComponentHandlerTrait, IComponentTrait, IConnectionPointTrait, IEditControllerTrait, IEventListTrait,
-    IHostApplicationTrait, IMidiMappingTrait, IParamValueQueueTrait, IParameterChangesTrait,
+    IAttributeListTrait, IAudioProcessorTrait, IComponentHandlerTrait, IComponentTrait, IConnectionPointTrait, IEditControllerTrait, IEventListTrait,
+    IHostApplicationTrait, IMessageTrait, IMidiMappingTrait, IParamValueQueueTrait, IParameterChangesTrait,
 };
 use vst3::Steinberg::{self as sb};
 use vst3::Steinberg::{FUnknown, IBStreamTrait, IPlugFrameTrait, IPlugViewTrait, IPluginBaseTrait, IPluginFactory2Trait, IPluginFactoryTrait};
@@ -526,6 +527,7 @@ impl Bundle {
             active: false,
             processing: false,
             max_frames: 0,
+            sample_rate: 0.0,
             in_params: ComWrapper::new(ParamChanges::new(PARAM_QUEUE_CAP)),
             out_params: ComWrapper::new(ParamChanges::new(PARAM_QUEUE_CAP)),
             in_events: ComWrapper::new(EventList::new(EVENT_CAP)),
@@ -606,16 +608,26 @@ pub(crate) fn hex(cid: &[u8; 16]) -> String {
 pub(crate) struct HostContext {
     pub latency_changed: AtomicBool,
     pub restart_requested: AtomicBool,
+    /// The `restartComponent` flags seen since the editor last looked (OR of them).
+    pub restart_flags: AtomicI32,
     /// `performEdit` values (normalized), bounded by `EDIT_CAP`.
     pub edits: Mutex<Vec<(u32, f64)>>,
+    /// Parameters between `beginEdit` and `endEdit` (a gesture in the plugin's GUI), bounded by
+    /// `GESTURE_CAP`.
+    pub gestures: Mutex<Vec<u32>>,
 }
+
+/// Most parameters one host context tracks as being in a gesture.
+const GESTURE_CAP: usize = 64;
 
 impl Default for HostContext {
     fn default() -> Self {
         HostContext {
             latency_changed: AtomicBool::new(false),
             restart_requested: AtomicBool::new(false),
+            restart_flags: AtomicI32::new(0),
             edits: Mutex::new(Vec::with_capacity(EDIT_CAP)),
+            gestures: Mutex::new(Vec::with_capacity(GESTURE_CAP)),
         }
     }
 }
@@ -627,6 +639,21 @@ impl HostContext {
         let out = e.clone();
         e.clear();
         out
+    }
+
+    /// The parameters the plugin's GUI is dragging right now.
+    pub fn gestures(&self) -> Vec<u32> {
+        self.gestures.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Whether the plugin asked (`restartComponent`, `kParamValuesChanged`) for its parameter values
+    /// to be read again since the last call. Clears the request.
+    pub fn take_values_changed(&self) -> bool {
+        if !self.restart_requested.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        let flags = self.restart_flags.swap(0, Ordering::Relaxed);
+        flags as u32 & sv::RestartFlags_::kParamValuesChanged as u32 != 0
     }
 }
 
@@ -646,18 +673,50 @@ impl IHostApplicationTrait for HostContext {
         }
     }
 
-    unsafe fn createInstance(&self, _cid: *mut sb::TUID, _iid: *mut sb::TUID, obj: *mut *mut c_void) -> sb::tresult {
-        // IMessage / IAttributeList are not provided yet; plugins must cope with that.
-        // SAFETY: `obj` is the plugin's out-pointer (or null, handled).
-        if let Some(o) = unsafe { obj.as_mut() } {
-            *o = std::ptr::null_mut();
+    unsafe fn createInstance(&self, cid: *mut sb::TUID, iid: *mut sb::TUID, obj: *mut *mut c_void) -> sb::tresult {
+        // SAFETY: `obj` is the plugin's out-pointer; null is refused.
+        let Some(out) = (unsafe { obj.as_mut() }) else { return sb::kInvalidArgument };
+        *out = std::ptr::null_mut();
+        // SAFETY: the plugin passes TUIDs (16 readable bytes each) or null.
+        let cid = unsafe { cid.as_ref() }.map(tuid_bytes);
+        // SAFETY: as above.
+        let iid = unsafe { iid.as_ref() }.map(tuid_bytes);
+        let message_iid = <sv::IMessage as Interface>::IID;
+        let list_iid = <sv::IAttributeList as Interface>::IID;
+        let asks = |want: &[u8; 16]| cid.as_ref() == Some(want) || iid.as_ref() == Some(want);
+        // Hosts check the class id or the interface id, so either one may name what they want.
+        let target = if asks(&message_iid) {
+            message_iid
+        } else if asks(&list_iid) {
+            list_iid
+        } else {
+            return sb::kResultFalse;
+        };
+        let unknown_iid = <sb::FUnknown as Interface>::IID;
+        if iid.is_some_and(|i| i != target && i != unknown_iid) {
+            return sb::kNoInterface;
         }
-        sb::kResultFalse
+        let raw = if target == message_iid {
+            ComWrapper::new(HostMessage::new()).to_com_ptr::<sv::IMessage>().map(|p| p.into_raw().cast::<c_void>())
+        } else {
+            ComWrapper::new(HostAttributes::new()).to_com_ptr::<sv::IAttributeList>().map(|p| p.into_raw().cast::<c_void>())
+        };
+        match raw {
+            Some(p) => {
+                *out = p;
+                sb::kResultOk
+            }
+            None => sb::kResultFalse,
+        }
     }
 }
 
 impl IComponentHandlerTrait for HostContext {
-    unsafe fn beginEdit(&self, _id: sv::ParamID) -> sb::tresult {
+    unsafe fn beginEdit(&self, id: sv::ParamID) -> sb::tresult {
+        let mut g = self.gestures.lock().unwrap_or_else(PoisonError::into_inner);
+        if !g.contains(&id) && g.len() < GESTURE_CAP {
+            g.push(id);
+        }
         sb::kResultOk
     }
     unsafe fn performEdit(&self, id: sv::ParamID, value: sv::ParamValue) -> sb::tresult {
@@ -672,15 +731,289 @@ impl IComponentHandlerTrait for HostContext {
         }
         sb::kResultOk
     }
-    unsafe fn endEdit(&self, _id: sv::ParamID) -> sb::tresult {
+    unsafe fn endEdit(&self, id: sv::ParamID) -> sb::tresult {
+        self.gestures.lock().unwrap_or_else(PoisonError::into_inner).retain(|&g| g != id);
         sb::kResultOk
     }
     unsafe fn restartComponent(&self, flags: sb::int32) -> sb::tresult {
         if flags as u32 & sv::RestartFlags_::kLatencyChanged as u32 != 0 {
             self.latency_changed.store(true, Ordering::Relaxed);
         }
+        self.restart_flags.fetch_or(flags, Ordering::Relaxed);
         self.restart_requested.store(true, Ordering::Relaxed);
         sb::kResultOk
+    }
+}
+
+// ---- host-side messages and attribute lists ------------------------------------------------
+
+/// Most bytes of a message or attribute id read from a plugin.
+const MAX_ID_BYTES: usize = 256;
+/// Most UTF-16 units of a string attribute read from a plugin.
+const MAX_STRING_UNITS: usize = 1 << 14;
+/// Largest binary attribute stored.
+const MAX_BINARY_BYTES: usize = 1 << 20;
+/// Most attributes one list holds.
+const MAX_ATTRIBUTES: usize = 256;
+
+/// Live host message and attribute-list objects, counted in tests to check for leaks.
+#[cfg(test)]
+static LIVE_HOST_OBJECTS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Reads a plugin's NUL-terminated id, bounded by `MAX_ID_BYTES`. `None` for null or an id that
+/// has no terminator within the bound.
+///
+/// # Safety
+/// `p` is null or points to a readable, NUL-terminated string (the VST3 contract for ids).
+unsafe fn read_id(p: *const c_char) -> Option<Vec<u8>> {
+    if p.is_null() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for i in 0..MAX_ID_BYTES {
+        // SAFETY: the plugin passes a NUL-terminated id; the loop stops at its NUL.
+        let b = unsafe { *p.add(i) } as u8;
+        if b == 0 {
+            return Some(out);
+        }
+        out.push(b);
+    }
+    None
+}
+
+/// Reads a plugin's NUL-terminated UTF-16 string, bounded by `MAX_STRING_UNITS`.
+///
+/// # Safety
+/// `p` points to a readable, NUL-terminated UTF-16 string (the VST3 contract for strings).
+unsafe fn read_units(p: *const u16) -> Vec<u16> {
+    let mut out = Vec::new();
+    for i in 0..MAX_STRING_UNITS {
+        // SAFETY: the plugin passes a NUL-terminated string; the loop stops at its NUL.
+        let u = unsafe { *p.add(i) };
+        if u == 0 {
+            break;
+        }
+        out.push(u);
+    }
+    out
+}
+
+/// One value in a host attribute list.
+#[derive(Debug, Clone, PartialEq)]
+enum AttrValue {
+    Int(i64),
+    Float(f64),
+    /// UTF-16 units without the terminator.
+    String(Vec<u16>),
+    Binary(Vec<u8>),
+}
+
+/// A host-created attribute list (`IAttributeList`), keyed by the attribute id's bytes.
+#[derive(Default)]
+pub(crate) struct HostAttributes {
+    values: Mutex<HashMap<Vec<u8>, AttrValue>>,
+}
+
+impl HostAttributes {
+    fn new() -> HostAttributes {
+        #[cfg(test)]
+        LIVE_HOST_OBJECTS.fetch_add(1, Ordering::Relaxed);
+        HostAttributes::default()
+    }
+
+    fn store(&self, id: Vec<u8>, value: AttrValue) -> sb::tresult {
+        let mut v = self.values.lock().unwrap_or_else(PoisonError::into_inner);
+        if !v.contains_key(&id) && v.len() >= MAX_ATTRIBUTES {
+            return sb::kResultFalse;
+        }
+        v.insert(id, value);
+        sb::kResultOk
+    }
+
+    fn with<R>(&self, id: &[u8], f: impl FnOnce(Option<&AttrValue>) -> R) -> R {
+        let v = self.values.lock().unwrap_or_else(PoisonError::into_inner);
+        f(v.get(id))
+    }
+}
+
+impl Drop for HostAttributes {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        LIVE_HOST_OBJECTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Class for HostAttributes {
+    type Interfaces = (sv::IAttributeList,);
+}
+
+impl IAttributeListTrait for HostAttributes {
+    unsafe fn setInt(&self, id: *const c_char, value: i64) -> sb::tresult {
+        // SAFETY: the plugin's id, per the VST3 contract.
+        match unsafe { read_id(id) } {
+            Some(k) => self.store(k, AttrValue::Int(value)),
+            None => sb::kInvalidArgument,
+        }
+    }
+
+    unsafe fn getInt(&self, id: *const c_char, value: *mut i64) -> sb::tresult {
+        // SAFETY: the plugin's id, per the VST3 contract.
+        let Some(k) = (unsafe { read_id(id) }) else { return sb::kInvalidArgument };
+        // SAFETY: the plugin's out-pointer; null is refused.
+        let Some(out) = (unsafe { value.as_mut() }) else { return sb::kInvalidArgument };
+        self.with(&k, |v| match v {
+            Some(AttrValue::Int(x)) => {
+                *out = *x;
+                sb::kResultOk
+            }
+            _ => sb::kResultFalse,
+        })
+    }
+
+    unsafe fn setFloat(&self, id: *const c_char, value: f64) -> sb::tresult {
+        // SAFETY: the plugin's id, per the VST3 contract.
+        match unsafe { read_id(id) } {
+            Some(k) => self.store(k, AttrValue::Float(value)),
+            None => sb::kInvalidArgument,
+        }
+    }
+
+    unsafe fn getFloat(&self, id: *const c_char, value: *mut f64) -> sb::tresult {
+        // SAFETY: the plugin's id, per the VST3 contract.
+        let Some(k) = (unsafe { read_id(id) }) else { return sb::kInvalidArgument };
+        // SAFETY: the plugin's out-pointer; null is refused.
+        let Some(out) = (unsafe { value.as_mut() }) else { return sb::kInvalidArgument };
+        self.with(&k, |v| match v {
+            Some(AttrValue::Float(x)) => {
+                *out = *x;
+                sb::kResultOk
+            }
+            _ => sb::kResultFalse,
+        })
+    }
+
+    unsafe fn setString(&self, id: *const c_char, string: *const u16) -> sb::tresult {
+        // SAFETY: the plugin's id, per the VST3 contract.
+        let Some(k) = (unsafe { read_id(id) }) else { return sb::kInvalidArgument };
+        if string.is_null() {
+            return sb::kInvalidArgument;
+        }
+        // SAFETY: the plugin's NUL-terminated string, per the VST3 contract.
+        let units = unsafe { read_units(string) };
+        self.store(k, AttrValue::String(units))
+    }
+
+    unsafe fn getString(&self, id: *const c_char, string: *mut u16, size_in_bytes: u32) -> sb::tresult {
+        // SAFETY: the plugin's id, per the VST3 contract.
+        let Some(k) = (unsafe { read_id(id) }) else { return sb::kInvalidArgument };
+        // Units that fit, the last one reserved for the terminator.
+        let cap = (size_in_bytes / 2) as usize;
+        if string.is_null() || cap == 0 {
+            return sb::kInvalidArgument;
+        }
+        self.with(&k, |v| match v {
+            Some(AttrValue::String(s)) => {
+                let n = s.len().min(cap - 1);
+                for (i, &u) in s.iter().take(n).enumerate() {
+                    // SAFETY: `i < n < cap`, and the plugin's buffer holds `size_in_bytes` bytes.
+                    unsafe { string.add(i).write(u) };
+                }
+                // SAFETY: `n < cap`, inside the same buffer.
+                unsafe { string.add(n).write(0) };
+                sb::kResultOk
+            }
+            _ => sb::kResultFalse,
+        })
+    }
+
+    unsafe fn setBinary(&self, id: *const c_char, data: *const c_void, size_in_bytes: u32) -> sb::tresult {
+        // SAFETY: the plugin's id, per the VST3 contract.
+        let Some(k) = (unsafe { read_id(id) }) else { return sb::kInvalidArgument };
+        let n = size_in_bytes as usize;
+        if n > MAX_BINARY_BYTES {
+            return sb::kResultFalse;
+        }
+        if n == 0 {
+            return self.store(k, AttrValue::Binary(Vec::new()));
+        }
+        if data.is_null() {
+            return sb::kInvalidArgument;
+        }
+        // SAFETY: the plugin passes `size_in_bytes` readable bytes at `data`, per the VST3 contract.
+        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), n) }.to_vec();
+        self.store(k, AttrValue::Binary(bytes))
+    }
+
+    unsafe fn getBinary(&self, id: *const c_char, data: *mut *const c_void, size_in_bytes: *mut u32) -> sb::tresult {
+        // SAFETY: the plugin's id, per the VST3 contract.
+        let Some(k) = (unsafe { read_id(id) }) else { return sb::kInvalidArgument };
+        // SAFETY: the plugin's out-pointers; null is refused.
+        let (Some(out_p), Some(out_n)) = (unsafe { data.as_mut() }, unsafe { size_in_bytes.as_mut() }) else {
+            return sb::kInvalidArgument;
+        };
+        self.with(&k, |v| match v {
+            // The pointer stays valid while this list holds the value (a `setBinary` of the same
+            // id replaces it, as VST3 allows).
+            Some(AttrValue::Binary(b)) => match u32::try_from(b.len()) {
+                Ok(len) => {
+                    *out_p = b.as_ptr().cast::<c_void>();
+                    *out_n = len;
+                    sb::kResultOk
+                }
+                Err(_) => sb::kResultFalse,
+            },
+            _ => sb::kResultFalse,
+        })
+    }
+}
+
+/// A host-created message (`IMessage`): an id and an attribute list. Plugins send their
+/// processor → controller messages through it (`IConnectionPoint::notify`).
+pub(crate) struct HostMessage {
+    id: Mutex<Option<CString>>,
+    attributes: ComWrapper<HostAttributes>,
+}
+
+impl HostMessage {
+    fn new() -> HostMessage {
+        #[cfg(test)]
+        LIVE_HOST_OBJECTS.fetch_add(1, Ordering::Relaxed);
+        HostMessage { id: Mutex::new(None), attributes: ComWrapper::new(HostAttributes::new()) }
+    }
+}
+
+impl Drop for HostMessage {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        LIVE_HOST_OBJECTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Class for HostMessage {
+    type Interfaces = (sv::IMessage,);
+}
+
+impl IMessageTrait for HostMessage {
+    unsafe fn getMessageID(&self) -> *const c_char {
+        let id = self.id.lock().unwrap_or_else(PoisonError::into_inner);
+        // The pointer is valid until the next `setMessageID`, as VST3 allows.
+        match id.as_ref() {
+            Some(s) => s.as_ptr(),
+            None => c"".as_ptr(),
+        }
+    }
+
+    unsafe fn setMessageID(&self, id: *const c_char) {
+        // SAFETY: the plugin's id, per the VST3 contract; a null or unterminated id clears it.
+        let value = unsafe { read_id(id) }.and_then(|b| CString::new(b).ok());
+        *self.id.lock().unwrap_or_else(PoisonError::into_inner) = value;
+    }
+
+    unsafe fn getAttributes(&self) -> *mut sv::IAttributeList {
+        // A borrowed pointer, valid while the message lives: plugins call
+        // `msg->getAttributes()->setInt(...)` and never release it, so handing out a counted
+        // reference would leak one list per message (analyzers send dozens per second).
+        self.attributes.as_com_ref::<sv::IAttributeList>().map_or(std::ptr::null_mut(), |r| r.as_ptr())
     }
 }
 
@@ -1117,6 +1450,8 @@ pub(crate) struct Instance {
     active: bool,
     processing: bool,
     max_frames: usize,
+    /// The rate `configure` set up, filled into every block's process context.
+    sample_rate: f64,
     in_params: ComWrapper<ParamChanges>,
     out_params: ComWrapper<ParamChanges>,
     in_events: ComWrapper<EventList>,
@@ -1397,6 +1732,7 @@ impl Instance {
         self.active = true;
         self.max_frames = max_frames;
         self.context.sampleRate = sample_rate;
+        self.sample_rate = sample_rate;
         self.context.tempo = 120.0;
         self.context.timeSigNumerator = 4;
         self.context.timeSigDenominator = 4;
@@ -1476,6 +1812,7 @@ impl Instance {
         inputs.refresh();
         outputs.refresh();
         self.context.continousTimeSamples = project_time;
+        self.context.sampleRate = self.sample_rate;
         match transport {
             Some(t) => apply_transport(&mut self.context, t),
             None => self.context.projectTimeSamples = project_time,
@@ -1812,6 +2149,16 @@ impl EditorLink {
             // SAFETY: valid controller, main thread.
             unsafe { c.setParamNormalized(id, n.clamp(0.0, 1.0)) };
         }
+    }
+
+    /// The controller's own normalized value (`getParamNormalized`). `None` once the instance is
+    /// gone or for a non-finite answer.
+    pub fn normalized(&self, id: u32) -> Option<f64> {
+        let g = self.lock();
+        let c = g.controller.as_ref()?;
+        // SAFETY: valid controller (the instance clears it under this lock before it terminates).
+        let v = unsafe { c.getParamNormalized(id) };
+        v.is_finite().then(|| v.clamp(0.0, 1.0))
     }
 
     /// Called by the instance before it terminates: closes the editor and cuts the handles off.
@@ -2267,5 +2614,106 @@ mod tests {
         assert_eq!(read_c16(&name), "SoundCraft");
         assert!(h.latency_changed.load(Ordering::Relaxed));
         assert_eq!(hex(&[0xAB; 16]), "AB".repeat(16));
+    }
+
+    fn tuid(g: [u8; 16]) -> sb::TUID {
+        g.map(|b| b as c_char)
+    }
+
+    #[test]
+    fn host_messages_round_trip_and_free() {
+        use std::ffi::CStr;
+        let before = LIVE_HOST_OBJECTS.load(Ordering::Relaxed);
+        let h = HostContext::default();
+        let mut cid = tuid(<sv::IMessage as Interface>::IID);
+        let mut iid = cid;
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: the host's own object, called as a plugin would; `raw` is writable.
+        unsafe {
+            assert_eq!(h.createInstance(&mut cid, &mut iid, &mut raw), sb::kResultOk);
+        }
+        // SAFETY: `raw` is an `IMessage` holding the one reference this test now owns.
+        let msg = unsafe { ComPtr::<sv::IMessage>::from_raw(raw.cast::<sv::IMessage>()) }.expect("message");
+        // SAFETY: the message above; the C strings are static and NUL-terminated.
+        unsafe {
+            assert_eq!(CStr::from_ptr(msg.getMessageID()).to_bytes(), b"");
+            msg.setMessageID(c"ping".as_ptr());
+            assert_eq!(CStr::from_ptr(msg.getMessageID()).to_bytes(), b"ping");
+        }
+        // SAFETY: as above; `getAttributes` lends the message's own list (no reference to release).
+        let list = unsafe { vst3::ComRef::<sv::IAttributeList>::from_raw(msg.getAttributes()) }.expect("list");
+        // SAFETY: the list above; buffers are valid for the sizes passed.
+        unsafe {
+            let units: Vec<u16> = "héllo".encode_utf16().chain([0]).collect();
+            assert_eq!(list.setInt(c"i".as_ptr(), -7), sb::kResultOk);
+            assert_eq!(list.setFloat(c"f".as_ptr(), 0.5), sb::kResultOk);
+            assert_eq!(list.setString(c"s".as_ptr(), units.as_ptr()), sb::kResultOk);
+            assert_eq!(list.setBinary(c"b".as_ptr(), [1u8, 2, 3].as_ptr().cast(), 3), sb::kResultOk);
+
+            let mut i = 0i64;
+            assert_eq!(list.getInt(c"i".as_ptr(), &mut i), sb::kResultOk);
+            assert_eq!(i, -7);
+            assert_eq!(list.getInt(c"f".as_ptr(), &mut i), sb::kResultFalse, "wrong type");
+            let mut f = 0.0f64;
+            assert_eq!(list.getFloat(c"f".as_ptr(), &mut f), sb::kResultOk);
+            assert_eq!(f, 0.5);
+
+            let mut buf = [0u16; 16];
+            assert_eq!(list.getString(c"s".as_ptr(), buf.as_mut_ptr(), 32), sb::kResultOk);
+            assert_eq!(String::from_utf16_lossy(&buf[..5]), "héllo");
+            assert_eq!(buf[5], 0);
+            let mut small = [9u16; 4];
+            assert_eq!(list.getString(c"s".as_ptr(), small.as_mut_ptr(), 4), sb::kResultOk, "truncated, terminated");
+            assert_eq!(&small[..2], &[u16::from(b'h'), 0]);
+
+            let mut data: *const c_void = std::ptr::null();
+            let mut size = 0u32;
+            assert_eq!(list.getBinary(c"b".as_ptr(), &mut data, &mut size), sb::kResultOk);
+            assert_eq!(size, 3);
+            assert_eq!(std::slice::from_raw_parts(data.cast::<u8>(), 3), &[1, 2, 3]);
+            assert_eq!(list.getInt(c"missing".as_ptr(), &mut i), sb::kResultFalse);
+            assert_eq!(list.getInt(c"i".as_ptr(), std::ptr::null_mut()), sb::kInvalidArgument);
+        }
+        // SAFETY: as above; asking again lends the same list, with its values.
+        let again = unsafe { vst3::ComRef::<sv::IAttributeList>::from_raw(msg.getAttributes()) }.expect("list again");
+        assert_eq!(again.as_ptr(), list.as_ptr());
+        // SAFETY: the lent list, alive while `msg` is.
+        unsafe {
+            let mut i = 0i64;
+            assert_eq!(again.getInt(c"i".as_ptr(), &mut i), sb::kResultOk);
+            assert_eq!(i, -7);
+        }
+        // Dropping the message frees its list too (the live-object counter below checks it).
+        drop(msg);
+
+        // Refusals: an unknown class, a mismatched interface, and no out-pointer.
+        let h = HostContext::default();
+        let mut unknown = tuid([0xEE; 16]);
+        let mut unknown_iid = unknown;
+        let mut none: *mut c_void = std::ptr::null_mut();
+        let mut list_cid = tuid(<sv::IAttributeList as Interface>::IID);
+        let mut list_cid_copy = list_cid;
+        let mut message_cid = tuid(<sv::IMessage as Interface>::IID);
+        let mut list_iid_for_message = list_cid;
+        let mut mismatch: *mut c_void = std::ptr::null_mut();
+        // SAFETY: the host's own object, called with valid TUIDs and out-pointers.
+        unsafe {
+            assert_eq!(h.createInstance(&mut unknown, &mut unknown_iid, &mut none), sb::kResultFalse);
+            assert!(none.is_null());
+            // The class names a message but the interface asks for a list: refused.
+            assert_eq!(h.createInstance(&mut message_cid, &mut list_iid_for_message, &mut mismatch), sb::kNoInterface);
+            assert!(mismatch.is_null());
+            assert_eq!(h.createInstance(&mut list_cid, &mut list_cid_copy, std::ptr::null_mut()), sb::kInvalidArgument);
+        }
+        // A list asked for by its interface id alone (as hosts do), then released.
+        let mut list_iid = tuid(<sv::IAttributeList as Interface>::IID);
+        let mut raw_list: *mut c_void = std::ptr::null_mut();
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(h.createInstance(std::ptr::null_mut(), &mut list_iid, &mut raw_list), sb::kResultOk);
+        }
+        // SAFETY: `raw_list` is an `IAttributeList` holding one reference owned by this test.
+        drop(unsafe { ComPtr::<sv::IAttributeList>::from_raw(raw_list.cast::<sv::IAttributeList>()) });
+        assert_eq!(LIVE_HOST_OBJECTS.load(Ordering::Relaxed), before, "every message and list is freed");
     }
 }

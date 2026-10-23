@@ -4,7 +4,7 @@ use crate::ffi::{AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Ins
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, Transport, Unit};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use vst3::ComWrapper;
 
 /// Largest block we set a plugin up for.
@@ -13,6 +13,15 @@ const MAX_BLOCK: usize = 1 << 16;
 const MAX_CHANNELS: usize = 64;
 /// An `unsynced` slot with no value waiting (a NaN pattern, which `set_param` never stores).
 const SYNCED: u64 = u64::MAX;
+
+/// Plain values the editor re-read from the controller after the plugin asked for it
+/// (`restartComponent` with `kParamValuesChanged`). The processor side adopts them on its next
+/// block: no lock and no allocation on the audio thread.
+struct ValueMirror {
+    dirty: AtomicBool,
+    /// Plain values as `f32` bits, in `Vst3Plugin::ids` order.
+    values: Box<[AtomicU32]>,
+}
 
 /// How a SoundCraft parameter value maps to the VST3 normalized value.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,6 +49,8 @@ pub struct Vst3Plugin {
     /// of an `f64`, or [`SYNCED`]). `set_param` may run on the audio thread, so it never calls the
     /// controller; the state reader, which already does, hands them over first.
     unsynced: Arc<[AtomicU64]>,
+    /// Values the editor re-read from the controller (see [`ValueMirror`]).
+    mirror: Arc<ValueMirror>,
     /// Pending notes, kept sorted by time. Never grows past `EVENT_CAP`.
     notes: Vec<NoteEvent>,
     /// The parameter each MIDI controller drives (see `Instance::midi_mapping`).
@@ -84,11 +95,13 @@ impl Vst3Plugin {
                 }
             })
             .collect();
+        let mirror = Arc::new(ValueMirror { dirty: AtomicBool::new(false), values: ids.iter().map(|_| AtomicU32::new(0)).collect() });
         let mut p = Vst3Plugin {
             info,
             values: Vec::with_capacity(ids.len()),
             pending: Vec::with_capacity(ids.len().min(PARAM_QUEUE_CAP)),
             unsynced: ids.iter().map(|_| AtomicU64::new(SYNCED)).collect(),
+            mirror,
             notes: Vec::with_capacity(EVENT_CAP),
             midi_map: Vec::new(),
             controls: Vec::with_capacity(EVENT_CAP),
@@ -141,6 +154,14 @@ impl Vst3Plugin {
             Mapping::Linear => linear,
         };
         n.is_finite().then(|| n.clamp(0.0, 1.0))
+    }
+
+    /// The controller's own normalized value of a parameter, read on the calling thread. For
+    /// diagnostics and tests (the controller is the UI side's; call from the main thread).
+    #[doc(hidden)]
+    pub fn controller_normalized(&self, id: &str) -> Option<f64> {
+        let i = self.info.params.iter().position(|p| p.id == id)?;
+        self.inst.normalized_value(*self.ids.get(i)?)
     }
 
     /// The editor's size in pixels without opening it (creates and releases a view). For
@@ -244,6 +265,11 @@ impl Plugin for Vst3Plugin {
     }
 
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+        if self.mirror.dirty.swap(false, Ordering::Acquire) {
+            for (slot, a) in self.values.iter_mut().zip(self.mirror.values.iter()) {
+                *slot = f32::from_bits(a.load(Ordering::Relaxed));
+            }
+        }
         if !self.inst.is_active() || self.max_block == 0 {
             return;
         }
@@ -409,6 +435,9 @@ impl Plugin for Vst3Plugin {
             units: self.ids.iter().map(|id| units.remove(id).unwrap_or_default()).collect(),
             ids: self.ids.clone(),
             maps: self.maps.clone(),
+            unsynced: Arc::clone(&self.unsynced),
+            mirror: Arc::clone(&self.mirror),
+            prev_edits: Vec::new(),
         }))
     }
 
@@ -439,9 +468,46 @@ struct Vst3Editor {
     units: Vec<String>,
     ids: Vec<u32>,
     maps: Vec<Mapping>,
+    /// The processor-side values the controller has not seen yet (shared with the plugin).
+    unsynced: Arc<[AtomicU64]>,
+    /// Re-read values for the processor side (shared with the plugin).
+    mirror: Arc<ValueMirror>,
+    /// Ids the GUI edited in the previous `idle`: their session echo arrives after it.
+    prev_edits: Vec<u32>,
 }
 
 impl Vst3Editor {
+    /// Hands the controller the session's values it has not seen. A parameter the GUI edited since
+    /// the last idle (its echo comes back through the session after it) or the one before keeps
+    /// the GUI's value, so the session's copy is dropped; a parameter being dragged waits for the
+    /// gesture to end.
+    fn push_session_values(&mut self, edited: &[u32]) {
+        let gesturing = self.host.gestures();
+        for (&vid, u) in self.ids.iter().zip(self.unsynced.iter()) {
+            if edited.contains(&vid) || self.prev_edits.contains(&vid) {
+                u.store(SYNCED, Ordering::Relaxed);
+            } else if !gesturing.contains(&vid) {
+                let bits = u.swap(SYNCED, Ordering::Relaxed);
+                if bits != SYNCED {
+                    self.link.set_normalized(vid, f64::from_bits(bits));
+                }
+            }
+        }
+        self.prev_edits = edited.to_vec();
+    }
+
+    /// Re-reads every parameter from the controller into the processor side's values (after the
+    /// plugin changed them itself, `kParamValuesChanged`).
+    fn reread_values(&self) {
+        for (i, &vid) in self.ids.iter().enumerate() {
+            let Some(v) = self.link.normalized(vid).and_then(|n| self.plain(i, n)) else { continue };
+            if let Some(a) = self.mirror.values.get(i) {
+                a.store(v.to_bits(), Ordering::Relaxed);
+            }
+        }
+        self.mirror.dirty.store(true, Ordering::Release);
+    }
+
     fn plain(&self, i: usize, n: f64) -> Option<f32> {
         let pi = self.info.params.get(i)?;
         let id = *self.ids.get(i)?;
@@ -485,8 +551,14 @@ impl PluginEditor for Vst3Editor {
 
     fn idle(&mut self) -> Vec<(String, f32)> {
         self.link.idle();
+        let edits = self.host.take_edits();
+        let edited: Vec<u32> = edits.iter().map(|&(vid, _)| vid).collect();
+        self.push_session_values(&edited);
+        if self.host.take_values_changed() {
+            self.reread_values();
+        }
         let mut out = Vec::new();
-        for (vid, n) in self.host.take_edits() {
+        for (vid, n) in edits {
             let Some(i) = self.ids.iter().position(|&x| x == vid) else { continue };
             if let (Some(p), Some(v)) = (self.info.params.get(i), self.plain(i, n)) {
                 out.push((p.id.to_string(), v));

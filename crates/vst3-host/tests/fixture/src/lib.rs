@@ -19,11 +19,11 @@
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
-use vst3::{Class, ComRef, ComWrapper, uid};
+use vst3::{Class, ComPtr, ComRef, ComWrapper, Interface, uid};
 
 const GAIN_CID: TUID = uid(0x5C0A1D00, 0x11112222, 0x33334444, 0x55556666);
 const GAIN_CTRL_CID: TUID = uid(0x5C0A1D01, 0x11112222, 0x33334444, 0x55556666);
@@ -68,6 +68,12 @@ struct GainProcessor {
     /// Normalized gain (plain = 2 × normalized).
     gain: AtomicU64,
     arrangement: AtomicU64,
+    /// The host context from `initialize`, as an address (0 before).
+    host: AtomicUsize,
+    /// The controller's connection point from `connect`, as an address (0 when none).
+    peer: AtomicUsize,
+    /// Activations so far: from the second one a "ping" is sent, from the third a "restart".
+    activations: AtomicUsize,
     _live: Live,
 }
 
@@ -75,9 +81,31 @@ impl Class for GainProcessor {
     type Interfaces = (IComponent, IAudioProcessor, IConnectionPoint);
 }
 
+/// Sends one message to the controller the way a real plugin does: the message comes from the
+/// host (`IHostApplication::createInstance`) and goes through the connection point's `notify`.
+fn send_message(host: &AtomicUsize, peer: &AtomicUsize, id: &CStr, value: f64) {
+    let Some(h) = (unsafe { ComRef::from_raw(host.load(Ordering::Relaxed) as *mut FUnknown) }) else { return };
+    let Some(app) = h.cast::<IHostApplication>() else { return };
+    let mut cid: TUID = <IMessage as Interface>::IID.map(|b| b as c_char);
+    let mut iid: TUID = cid;
+    let mut obj: *mut c_void = std::ptr::null_mut();
+    if unsafe { app.createInstance(&mut cid, &mut iid, &mut obj) } != kResultOk {
+        return;
+    }
+    let Some(msg) = (unsafe { ComPtr::<IMessage>::from_raw(obj.cast::<IMessage>()) }) else { return };
+    unsafe { msg.setMessageID(id.as_ptr()) };
+    if let Some(attrs) = unsafe { ComRef::<IAttributeList>::from_raw(msg.getAttributes()) } {
+        unsafe { attrs.setFloat(c"v".as_ptr(), value) };
+    }
+    if let Some(c) = unsafe { ComRef::from_raw(peer.load(Ordering::Relaxed) as *mut IConnectionPoint) } {
+        unsafe { c.notify(msg.as_ptr()) };
+    }
+}
+
 impl IPluginBaseTrait for GainProcessor {
     unsafe fn initialize(&self, context: *mut FUnknown) -> tresult {
         assert!(!context.is_null(), "host context");
+        self.host.store(context as usize, Ordering::Relaxed);
         kResultOk
     }
     unsafe fn terminate(&self) -> tresult {
@@ -87,9 +115,14 @@ impl IPluginBaseTrait for GainProcessor {
 
 impl IConnectionPointTrait for GainProcessor {
     unsafe fn connect(&self, other: *mut IConnectionPoint) -> tresult {
-        if other.is_null() { kInvalidArgument } else { kResultOk }
+        if other.is_null() {
+            return kInvalidArgument;
+        }
+        self.peer.store(other as usize, Ordering::Relaxed);
+        kResultOk
     }
     unsafe fn disconnect(&self, _other: *mut IConnectionPoint) -> tresult {
+        self.peer.store(0, Ordering::Relaxed);
         kResultOk
     }
     unsafe fn notify(&self, _message: *mut IMessage) -> tresult {
@@ -121,7 +154,17 @@ impl IComponentTrait for GainProcessor {
     unsafe fn activateBus(&self, _m: MediaType, _d: BusDirection, _i: i32, _s: TBool) -> tresult {
         kResultOk
     }
-    unsafe fn setActive(&self, _state: TBool) -> tresult {
+    unsafe fn setActive(&self, state: TBool) -> tresult {
+        if state != 0 {
+            // The first activation is the instance's own `prepare`; later ones send the messages.
+            let n = self.activations.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= 2 {
+                send_message(&self.host, &self.peer, c"ping", 0.25);
+            }
+            if n >= 3 {
+                send_message(&self.host, &self.peer, c"restart", 0.0);
+            }
+        }
         kResultOk
     }
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
@@ -214,6 +257,8 @@ impl IAudioProcessorTrait for GainProcessor {
 struct GainController {
     gain: AtomicU64,
     freq: AtomicU64,
+    /// The host's component handler from `setComponentHandler`, as an address (0 when none).
+    handler: AtomicUsize,
     _live: Live,
 }
 
@@ -293,8 +338,35 @@ impl IConnectionPointTrait for GainController {
     unsafe fn disconnect(&self, _other: *mut IConnectionPoint) -> tresult {
         kResultOk
     }
-    unsafe fn notify(&self, _message: *mut IMessage) -> tresult {
-        kResultOk
+    unsafe fn notify(&self, message: *mut IMessage) -> tresult {
+        let Some(m) = (unsafe { ComRef::from_raw(message) }) else { return kInvalidArgument };
+        let id = unsafe { CStr::from_ptr(m.getMessageID()) };
+        // The attribute list is lent by the message (VST3 convention): not released here.
+        let Some(attrs) = (unsafe { ComRef::<IAttributeList>::from_raw(m.getAttributes()) }) else { return kInvalidArgument };
+        match id.to_bytes() {
+            b"ping" => {
+                // The "plugin GUI" edits Gain to the value the processor sent.
+                let mut v = 0.0f64;
+                if unsafe { attrs.getFloat(c"v".as_ptr(), &mut v) } != kResultOk {
+                    return kResultFalse;
+                }
+                let h = self.handler.load(Ordering::Relaxed) as *mut IComponentHandler;
+                if let Some(h) = unsafe { ComRef::from_raw(h) } {
+                    unsafe { h.performEdit(7, v) };
+                }
+                kResultOk
+            }
+            b"restart" => {
+                // The plugin changes its own Freq, then asks the host to read the values again.
+                self.freq.store(0.9f64.to_bits(), Ordering::Relaxed);
+                let h = self.handler.load(Ordering::Relaxed) as *mut IComponentHandler;
+                if let Some(h) = unsafe { ComRef::from_raw(h) } {
+                    unsafe { h.restartComponent(RestartFlags_::kParamValuesChanged as i32) };
+                }
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
     }
 }
 
@@ -398,6 +470,7 @@ impl IEditControllerTrait for GainController {
         kResultOk
     }
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
+        self.handler.store(handler as usize, Ordering::Relaxed);
         // Exercise the host's handler: an edit from the "plugin GUI" must be accepted.
         if let Some(h) = unsafe { ComRef::from_raw(handler) } {
             assert_eq!(unsafe { h.beginEdit(7) }, kResultOk);
@@ -670,6 +743,9 @@ impl IPluginFactoryTrait for Factory {
             ComWrapper::new(GainProcessor {
                 gain: AtomicU64::new(0.25f64.to_bits()),
                 arrangement: AtomicU64::new(SpeakerArr::kStereo),
+                host: AtomicUsize::new(0),
+                peer: AtomicUsize::new(0),
+                activations: AtomicUsize::new(0),
                 _live: Live::new(&OBJECTS),
             })
             .to_com_ptr::<FUnknown>()
@@ -677,6 +753,7 @@ impl IPluginFactoryTrait for Factory {
             ComWrapper::new(GainController {
                 gain: AtomicU64::new(0.5f64.to_bits()),
                 freq: AtomicU64::new(0.5f64.to_bits()),
+                handler: AtomicUsize::new(0),
                 _live: Live::new(&OBJECTS),
             })
             .to_com_ptr::<FUnknown>()
