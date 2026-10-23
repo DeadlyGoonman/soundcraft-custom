@@ -281,6 +281,59 @@ pub trait PluginEditor: Send {
     fn value_text(&mut self, _id: &str, _value: f32) -> Option<String> {
         None
     }
+    /// True when the plugin can draw itself at another size (VST3 content scale or a resizable
+    /// view, CLAP `set_scale`/`set_size`). Main thread only.
+    fn native_scaling(&mut self) -> bool {
+        false
+    }
+    /// Sets how the editor is scaled. Applies to an open editor (it may close and reopen) and to
+    /// the next open. An error says why this mode can't be used for this plugin.
+    fn set_scale(&mut self, _scale: EditorScale) -> Result<(), String> {
+        Err("this editor cannot be scaled".into())
+    }
+}
+
+/// The filter that stretches a plugin editor drawn at its own size (host-side upscaling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum UpscaleFilter {
+    /// AMD FidelityFX Super Resolution 1 (EASU upscale + RCAS sharpen).
+    #[default]
+    Fsr1,
+    /// NVIDIA Image Scaling.
+    Nis,
+    Bilinear,
+}
+
+/// How a plugin editor reaches its scale factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum EditorScaleMode {
+    /// Native when the plugin supports it, otherwise upscaled with FSR 1.
+    #[default]
+    Auto,
+    /// The plugin draws itself at the scale (error when it can't).
+    Native,
+    /// The plugin draws at its own size and the host stretches the picture.
+    Upscale(UpscaleFilter),
+}
+
+/// A plugin editor's scale: `factor` 1.0 is the plugin's own size (valid range 0.5..=4.0).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EditorScale {
+    pub factor: f32,
+    pub mode: EditorScaleMode,
+}
+
+impl Default for EditorScale {
+    fn default() -> Self {
+        EditorScale { factor: 1.0, mode: EditorScaleMode::Auto }
+    }
+}
+
+impl EditorScale {
+    /// The factor clamped to 0.5..=4.0 (1.0 for NaN).
+    pub fn clamped_factor(&self) -> f32 {
+        if self.factor.is_finite() { self.factor.clamp(0.5, 4.0) } else { 1.0 }
+    }
 }
 
 /// Reads a plugin's state on the main (UI) thread while the instance processes on the audio
