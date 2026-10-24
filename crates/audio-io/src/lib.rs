@@ -155,11 +155,13 @@ pub struct EncodeOptions {
     pub bwf: Option<BwfInfo>,
     /// Title/artist/album/genre/year/comment tags, written in each format's native way.
     pub metadata: Option<Metadata>,
+    /// FLAC compression level, 0 (fastest) to 8 (smallest); lossless at every level.
+    pub flac_level: u8,
 }
 
 impl Default for EncodeOptions {
     fn default() -> Self {
-        Self { format: FileFormat::Wav, bit_depth: BitDepth::Int24, dither: false, bwf: None, metadata: None }
+        Self { format: FileFormat::Wav, bit_depth: BitDepth::Int24, dither: false, bwf: None, metadata: None, flac_level: 5 }
     }
 }
 
@@ -288,7 +290,7 @@ pub fn encode(buf: &AudioBuffer, opts: &EncodeOptions) -> Result<Vec<u8>> {
     match opts.format {
         FileFormat::Wav => wav::encode(buf, opts.bit_depth, opts.dither, opts.bwf.as_ref(), false, None, opts.metadata.as_ref()),
         FileFormat::Aiff => aiff::encode(buf, opts.bit_depth, opts.dither, opts.metadata.as_ref()),
-        FileFormat::Flac => flac::encode(buf, opts.bit_depth, opts.dither, opts.metadata.as_ref()),
+        FileFormat::Flac => flac::encode(buf, opts.bit_depth, opts.dither, opts.flac_level, opts.metadata.as_ref()),
         other => Err(AudioError::Unsupported(format!("encoding {other:?} is not supported"))),
     }
 }
@@ -348,7 +350,7 @@ impl<W: Write + Seek> FileEncoder<W> {
                 Writer::Wav(wav::Writer::new(out, channels, sample_rate, depth, dither, opts.bwf.as_ref(), mask, false, opts.metadata.as_ref())?)
             }
             FileFormat::Aiff => Writer::Aiff(aiff::Writer::new(out, channels, sample_rate, depth, dither, opts.metadata.as_ref())?),
-            FileFormat::Flac => Writer::Flac(flac::Writer::new(out, channels, sample_rate, depth, dither, opts.metadata.as_ref())?),
+            FileFormat::Flac => Writer::Flac(flac::Writer::new(out, channels, sample_rate, depth, dither, opts.flac_level, opts.metadata.as_ref())?),
             other => return Err(AudioError::Unsupported(format!("encoding {other:?} is not supported"))),
         }))
     }

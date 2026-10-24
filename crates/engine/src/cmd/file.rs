@@ -89,7 +89,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 crate::io::import_video_bytes(e, &path, bytes, at)
             }
         ),
-        cmd!(noundo "file.bounce_mix", "Bounce Mix...", ["File"], Some("Cmd+Alt+B"), "{path, format?: wav|aiff|flac|mp3 (mp3 needs ffmpeg, bit_depth ignored), bitrate?: 32-320 kbps (mp3, default 320), bit_depth?: 16|24|32f, start?, end?, source?: main|bus name, normalize?: false, dither?: true, fold_down?: stereo, metadata?: {title?, artist?, album?, genre?, year?, comment?}}", always, bounce),
+        cmd!(noundo "file.bounce_mix", "Bounce Mix...", ["File"], Some("Cmd+Alt+B"), "{path, format?: wav|aiff|flac|mp3 (mp3 needs ffmpeg, bit_depth ignored), bitrate?: 32-320 kbps (mp3, default 320), flac_level?: 0-8 (flac, default 5; higher is smaller and slower; lossless at every level), bit_depth?: 16|24|32f, start?, end?, source?: main|bus name, normalize?: false, dither?: true, fold_down?: stereo, metadata?: {title?, artist?, album?, genre?, year?, comment?}}", always, bounce),
         cmd!(noundo "file.bounce_stems", "Bounce Stems...", [], None, "{dir, format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?, fold_down?: stereo, metadata?: {title?, artist?, album?, genre?, year?, comment?}}", has_tracks, |e, p| {
             let dir = str_param(p, "dir").ok_or_else(|| bad("file.bounce_stems", "`dir` required"))?.to_string();
             let r = range_param(e, "file.bounce_stems", p)?;
@@ -105,7 +105,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 _ => soundcraft_audio_io::BitDepth::Int24,
             };
             let fold = fold_down_param(p, "file.bounce_stems")?;
-            let opts = soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: true, bwf: None, metadata: metadata_param(p) };
+            let opts = soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: true, bwf: None, metadata: metadata_param(p), flac_level: flac_level_param(p) };
             let files = crate::io::bounce_stems_with(e, &dir, r, &opts, fold)?;
             Ok(json!({"files": files}))
         }),
@@ -329,6 +329,7 @@ pub fn bounce_job(e: &Engine, p: &Value) -> Result<crate::io::Bounce> {
             dither: false,
             bwf: None,
             metadata: None,
+            flac_level: 5,
         };
         return crate::io::Bounce::new(e.session_arc(), &wav, r, &opts, bus, normalize, true)?.to_mp3(target, &ffmpeg, metadata, kbps);
     }
@@ -343,8 +344,14 @@ pub fn bounce_job(e: &Engine, p: &Value) -> Result<crate::io::Bounce> {
         Some("32") | Some("32f") => soundcraft_audio_io::BitDepth::Float32,
         _ => soundcraft_audio_io::BitDepth::Int24,
     };
-    let opts = soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: bool_or(p, "dither", true), bwf: None, metadata };
+    let opts = soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: bool_or(p, "dither", true), bwf: None, metadata, flac_level: flac_level_param(p) };
     crate::io::Bounce::new(e.session_arc(), target, r, &opts, bus, normalize, fold)
+}
+
+/// The FLAC compression level of a bounce: 0 (fastest) to 8 (smallest), 5 by default. Every
+/// level is lossless.
+fn flac_level_param(p: &Value) -> u8 {
+    p.get("flac_level").and_then(Value::as_u64).map_or(5, |l| l.min(8) as u8)
 }
 
 /// Write the score of the chosen MIDI tracks as MusicXML (or SVG when `svg`).

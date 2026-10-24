@@ -48,7 +48,7 @@ fn wav_and_aiff_roundtrip_all_depths_and_layouts() {
             for channels in [1, 2, 6] {
                 for dither in [false, true] {
                     let src = sine(48_000, channels, 4801);
-                    let opts = EncodeOptions { format, bit_depth: depth, dither, bwf: None, metadata: None };
+                    let opts = EncodeOptions { format, bit_depth: depth, dither, bwf: None, metadata: None, flac_level: 5 };
                     let bytes = encode(&src, &opts).unwrap();
                     assert_eq!(detect_format(&bytes, None), format);
                     let info = probe(&bytes, None).unwrap();
@@ -74,8 +74,8 @@ fn flac_roundtrip_is_lossless_vs_wav() {
         for channels in [1, 2, 6] {
             // Spans several blocks plus a short final block.
             let src = sine(44_100, channels, 4096 * 2 + 17);
-            let wav = encode(&src, &EncodeOptions { format: FileFormat::Wav, bit_depth: depth, dither: false, bwf: None, metadata: None }).unwrap();
-            let flac = encode(&src, &EncodeOptions { format: FileFormat::Flac, bit_depth: depth, dither: false, bwf: None, metadata: None }).unwrap();
+            let wav = encode(&src, &EncodeOptions { format: FileFormat::Wav, bit_depth: depth, dither: false, bwf: None, metadata: None, flac_level: 5 }).unwrap();
+            let flac = encode(&src, &EncodeOptions { format: FileFormat::Flac, bit_depth: depth, dither: false, bwf: None, metadata: None, flac_level: 5 }).unwrap();
             assert_eq!(detect_format(&flac, None), FileFormat::Flac);
             let info = probe(&flac, None).unwrap();
             assert_eq!(info.format, FileFormat::Flac);
@@ -104,7 +104,7 @@ fn flac_handles_silence_noise_full_scale_and_odd_rates() {
     }
     for depth in [BitDepth::Int16, BitDepth::Int24, BitDepth::Int32] {
         for dither in [false, true] {
-            let opts = EncodeOptions { format: FileFormat::Flac, bit_depth: depth, dither, bwf: None, metadata: None };
+            let opts = EncodeOptions { format: FileFormat::Flac, bit_depth: depth, dither, bwf: None, metadata: None, flac_level: 5 };
             let flac = encode(&b, &opts).unwrap();
             let (info, out) = decode(&flac, None).unwrap();
             assert_eq!(info.sample_rate, 37_123);
@@ -117,7 +117,7 @@ fn flac_handles_silence_noise_full_scale_and_odd_rates() {
 
 #[test]
 fn flac_rejects_unsupported_layouts() {
-    let opts = EncodeOptions { format: FileFormat::Flac, bit_depth: BitDepth::Float32, dither: false, bwf: None, metadata: None };
+    let opts = EncodeOptions { format: FileFormat::Flac, bit_depth: BitDepth::Float32, dither: false, bwf: None, metadata: None, flac_level: 5 };
     assert!(encode(&sine(48_000, 2, 10), &opts).is_err());
     let opts = EncodeOptions { bit_depth: BitDepth::Int16, ..opts };
     assert!(encode(&sine(48_000, 9, 10), &opts).is_err());
@@ -140,7 +140,7 @@ fn bwf_roundtrip() {
     };
     let src = sine(96_000, 2, 1000);
     for depth in DEPTHS {
-        let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: depth, dither: false, bwf: Some(bwf.clone()), metadata: None };
+        let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: depth, dither: false, bwf: Some(bwf.clone()), metadata: None, flac_level: 5 };
         let bytes = encode(&src, &opts).unwrap();
         let info = probe(&bytes, None).unwrap();
         assert_eq!(info.bwf.as_ref(), Some(&bwf));
@@ -253,7 +253,7 @@ fn serde_types_roundtrip() {
 #[test]
 fn multichannel_wav_speaker_masks() {
     let buf = |n: usize| AudioBuffer { sample_rate: 48_000, channels: (0..n).map(|c| vec![0.01 * c as f32; 64]).collect() };
-    let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Int24, dither: false, bwf: None, metadata: None };
+    let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Int24, dither: false, bwf: None, metadata: None, flac_level: 5 };
     for (n, mask) in [(6usize, 0x3Fu32), (8, 0x63F), (12, 0x2_D63F)] {
         let bytes = soundcraft_audio_io::encode(&buf(n), &opts).unwrap();
         assert_eq!(soundcraft_audio_io::wav_channel_mask(&bytes), Some(mask), "{n} channels");
@@ -330,7 +330,7 @@ fn metadata_tags_survive_encode_and_decode_without_corrupting_audio() {
         comment: "bounced for review".into(),
     };
     for format in [FileFormat::Wav, FileFormat::Aiff, FileFormat::Flac] {
-        let opts = EncodeOptions { format, bit_depth: BitDepth::Int24, dither: false, bwf: None, metadata: Some(full.clone()) };
+        let opts = EncodeOptions { format, bit_depth: BitDepth::Int24, dither: false, bwf: None, metadata: Some(full.clone()), flac_level: 5 };
         let bytes = encode(&src, &opts).unwrap();
         // The audio decodes back losslessly; tags never reach the sample data.
         let (_, decoded) = decode(&bytes, None).unwrap();
@@ -343,7 +343,28 @@ fn metadata_tags_survive_encode_and_decode_without_corrupting_audio() {
         }
     }
     // Empty metadata writes no tag chunk at all and changes nothing else about the file.
-    let plain = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Int24, dither: false, bwf: None, metadata: None };
+    let plain = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Int24, dither: false, bwf: None, metadata: None, flac_level: 5 };
     let tagged_empty = EncodeOptions { metadata: Some(Metadata::default()), ..plain.clone() };
     assert_eq!(encode(&src, &plain).unwrap(), encode(&src, &tagged_empty).unwrap(), "empty metadata must be a no-op");
+}
+
+#[test]
+fn flac_every_level_is_lossless_and_higher_levels_are_smaller() {
+    for depth in [BitDepth::Int16, BitDepth::Int24] {
+        // Several blocks of a tone with a second partial, so LPC has structure to find.
+        let src = sine(44_100, 2, 4096 * 3 + 5);
+        let opts = |level| EncodeOptions { format: FileFormat::Flac, bit_depth: depth, dither: false, bwf: None, metadata: None, flac_level: level };
+        let wav = encode(&src, &EncodeOptions { format: FileFormat::Wav, ..opts(0) }).unwrap();
+        let (_, from_wav) = decode(&wav, None).unwrap();
+        let sizes: Vec<usize> = (0..=8u8)
+            .map(|level| {
+                let flac = encode(&src, &opts(level)).unwrap();
+                let (_, from_flac) = decode(&flac, None).unwrap();
+                assert_eq!(from_flac, from_wav, "{depth:?} level {level}");
+                flac.len()
+            })
+            .collect();
+        assert!(sizes[8] <= sizes[0], "{depth:?}: level 8 ({}) must not be larger than level 0 ({})", sizes[8], sizes[0]);
+        assert!(sizes[5] <= sizes[0], "{depth:?}: level 5 ({}) must not be larger than level 0 ({})", sizes[5], sizes[0]);
+    }
 }

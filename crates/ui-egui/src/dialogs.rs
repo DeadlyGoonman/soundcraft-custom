@@ -45,7 +45,7 @@ impl BounceMetadata {
 pub enum Dialog {
     NewTracks { count: u32, format: String, kind: String, timebase: String, name: String },
     NewSession { name: String, sample_rate: u32, demo: bool },
-    Bounce { path: String, format: String, bit_depth: String, bitrate: u32, normalize: bool, metadata: BounceMetadata },
+    Bounce { path: String, format: String, bit_depth: String, bitrate: u32, flac_level: u8, normalize: bool, metadata: BounceMetadata },
     RenameTrack { id: TrackId, name: String },
     RenameClip { id: ClipId, name: String },
     RenameMarker { id: soundcraft_model::MarkerId, name: String },
@@ -155,6 +155,7 @@ impl Dialogs {
                     format: "wav".into(),
                     bit_depth: "24".into(),
                     bitrate: 320,
+                    flac_level: 5,
                     normalize: false,
                     metadata: BounceMetadata::default(),
                 }
@@ -501,7 +502,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         ));
                     }
                 }
-                Dialog::Bounce { path, format, bit_depth, bitrate, normalize, metadata } => {
+                Dialog::Bounce { path, format, bit_depth, bitrate, flac_level, normalize, metadata } => {
                     let (mut dir, mut name) = split_bounce_path(path);
                     let (old_dir, old_name) = (dir.clone(), name.clone());
                     let mut picked = None;
@@ -553,6 +554,9 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                                     ui.selectable_value(bit_depth, b.to_string(), format!("{b}-bit"));
                                 }
                             });
+                            if format == "flac" {
+                                ui.add(egui::Slider::new(flac_level, 0..=8).text("Compression (0 fastest, 8 smallest)"));
+                            }
                         }
                     });
                     crate::widgets::checkbox(ui, normalize, "Normalize to -0.1 dBFS");
@@ -587,7 +591,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     );
                     if buttons(ui, "Bounce", enter) {
                         let p = with_audio_ext(path, format);
-                        let mut params = json!({"path": p,"format": format, "bit_depth": bit_depth, "bitrate": bitrate, "normalize": normalize});
+                        let mut params = json!({"path": p,"format": format, "bit_depth": bit_depth, "bitrate": bitrate, "flac_level": flac_level, "normalize": normalize});
                         if let (Value::Object(map), Value::Object(m)) = (&mut params, metadata.to_json()) {
                             map.insert("metadata".into(), Value::Object(m));
                         }

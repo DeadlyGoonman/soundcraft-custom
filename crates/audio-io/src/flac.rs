@@ -228,7 +228,126 @@ fn write_residual(w: &mut BitWriter, u: &[u64], block_len: usize, pred_order: us
     }
 }
 
-fn write_subframe(w: &mut BitWriter, x: &[i64], bps: u32) {
+/// Largest LPC order each compression level (0 to 8) searches; level 0 uses fixed predictors only.
+const LPC_MAX_ORDER: [usize; 9] = [0, 4, 6, 8, 8, 12, 12, 16, 32];
+/// The LPC orders tried, up to the level's largest.
+const LPC_ORDERS: [usize; 8] = [2, 4, 8, 12, 16, 20, 24, 32];
+/// Bits per quantized LPC coefficient (signed).
+const LPC_PRECISION: u32 = 14;
+/// Largest right shift of the quantized coefficients (kept non-negative).
+const LPC_MAX_SHIFT: i32 = 15;
+
+/// How a subframe's samples are predicted.
+enum Predictor {
+    /// A fixed polynomial predictor of this order (0 to 4).
+    Fixed(usize),
+    /// Linear prediction with quantized coefficients `coefs`, applied as `(sum >> shift)`.
+    Lpc { order: usize, coefs: Vec<i64>, shift: u32 },
+}
+
+/// A way to code a subframe: its size in bits, the predictor, the zigzagged residuals and their
+/// Rice plan.
+type Candidate = (u64, Predictor, Vec<u64>, RicePlan);
+
+/// Autocorrelation of the Hann-windowed block at lags 0 to `max_order`.
+fn autocorrelation(x: &[i64], max_order: usize) -> Vec<f64> {
+    let denom = (x.len().max(2) - 1) as f64;
+    let w: Vec<f64> = x.iter().enumerate().map(|(i, &s)| s as f64 * (0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / denom).cos())).collect();
+    (0..=max_order).map(|lag| w.iter().skip(lag).zip(&w).map(|(a, b)| a * b).sum()).collect()
+}
+
+/// Levinson-Durbin recursion: the predictor of each order 1 to `max` (`result[k - 1]` predicts
+/// from the `k` previous samples). Stops early where the error is no longer positive.
+fn levinson(r: &[f64], max: usize) -> Vec<Vec<f64>> {
+    let mut out = Vec::new();
+    let mut a: Vec<f64> = Vec::new();
+    let mut err = r[0];
+    for k in 1..=max {
+        if err <= 0.0 || !err.is_finite() {
+            break;
+        }
+        let acc = r[k] - a.iter().enumerate().map(|(j, c)| c * r[k - 1 - j]).sum::<f64>();
+        let lambda = acc / err;
+        let mut next: Vec<f64> = a.iter().enumerate().map(|(j, c)| c - lambda * a[k - 2 - j]).collect();
+        next.push(lambda);
+        a = next;
+        err *= 1.0 - lambda * lambda;
+        out.push(a.clone());
+    }
+    out
+}
+
+/// Quantizes predictor coefficients to [`LPC_PRECISION`] bits under one shared right shift. The
+/// rounding error of each coefficient is carried into the next, so the errors cancel.
+fn quantize(a: &[f64], max_weight: f64) -> (Vec<i64>, u32) {
+    let max = a.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+    let weight: f64 = a.iter().map(|c| c.abs()).sum();
+    let qmax = (1i64 << (LPC_PRECISION - 1)) - 1;
+    // The largest shift that keeps the coefficients' weight (their absolute sum) under `max_weight`.
+    let fits = if weight > 0.0 { (max_weight / weight).log2().floor() as i32 } else { LPC_MAX_SHIFT };
+    let shift = if max > 0.0 { ((qmax as f64 / max).log2().floor() as i32).min(fits).clamp(0, LPC_MAX_SHIFT) } else { 0 };
+    let scale = f64::from(shift).exp2();
+    let mut err = 0.0;
+    let coefs = a
+        .iter()
+        .map(|c| {
+            let v = c * scale + err;
+            let q = (v.round() as i64).clamp(-qmax - 1, qmax);
+            err = v - q as f64;
+            q
+        })
+        .collect();
+    (coefs, shift as u32)
+}
+
+/// The LPC residuals of `x` after its first `coefs.len()` warm-up samples, or `None` when one
+/// leaves the i32 range.
+fn lpc_residual(x: &[i64], coefs: &[i64], shift: u32) -> Option<Vec<i64>> {
+    let mut res = Vec::with_capacity(x.len().saturating_sub(coefs.len()));
+    for n in coefs.len()..x.len() {
+        let sum: i64 = coefs.iter().enumerate().map(|(j, c)| c * x[n - 1 - j]).sum();
+        let r = x[n] - (sum >> shift);
+        i32::try_from(r).ok()?;
+        res.push(r);
+    }
+    Some(res)
+}
+
+/// The LPC candidates of a block for a compression level.
+fn lpc_candidates(x: &[i64], bps: u32, level: u8) -> Vec<Candidate> {
+    let n = x.len();
+    let max = LPC_MAX_ORDER[usize::from(level.min(8))];
+    let mut out = Vec::new();
+    if max == 0 || n <= max {
+        return out;
+    }
+    let r = autocorrelation(x, max);
+    if r[0] <= 0.0 || !r[0].is_finite() {
+        return out;
+    }
+    let peak = x.iter().fold(0i64, |m, s| m.max(s.abs()));
+    let predictors = levinson(&r, max);
+    for &order in LPC_ORDERS.iter().filter(|&&o| o <= max) {
+        let Some(a) = predictors.get(order - 1) else { continue };
+        // Decoders add each prediction in 32 bits, so the largest possible sum (peak sample times
+        // the coefficients' absolute sum) must fit: the shift is chosen to keep it there.
+        let limit = ((1i64 << 31) - 1) / peak.max(1);
+        let (coefs, shift) = quantize(a, limit as f64);
+        let weight: i64 = coefs.iter().map(|c| c.abs()).sum();
+        if peak.saturating_mul(weight) >= 1i64 << 31 {
+            continue;
+        }
+        let Some(res) = lpc_residual(x, &coefs, shift) else { continue };
+        let u: Vec<u64> = res.into_iter().map(zigzag).collect();
+        let plan = plan_residual(&u, n, order);
+        // Warm-up samples, precision and shift fields, and the coefficients.
+        let header = order as u64 * (u64::from(bps) + u64::from(LPC_PRECISION)) + 4 + 5;
+        out.push((plan.bits.saturating_add(header), Predictor::Lpc { order, coefs, shift }, u, plan));
+    }
+    out
+}
+
+fn write_subframe(w: &mut BitWriter, x: &[i64], bps: u32, level: u8) {
     let n = x.len();
     let first = x.first().copied().unwrap_or(0);
     if x.iter().all(|&s| s == first) {
@@ -239,23 +358,36 @@ fn write_subframe(w: &mut BitWriter, x: &[i64], bps: u32) {
         return;
     }
     let verbatim_bits = n as u64 * u64::from(bps);
-    let mut best: Option<(usize, Vec<u64>, RicePlan)> = None;
+    let mut cands: Vec<Candidate> = Vec::new();
     for order in 0..=4usize.min(n.saturating_sub(1)) {
         let Some(res) = fixed_residual(x, order) else { continue };
         let u: Vec<u64> = res.into_iter().map(zigzag).collect();
         let plan = plan_residual(&u, n, order);
         let bits = plan.bits.saturating_add(order as u64 * u64::from(bps));
-        if bits < verbatim_bits && best.as_ref().is_none_or(|b| bits < b.2.bits.saturating_add(b.0 as u64 * u64::from(bps))) {
-            best = Some((order, u, plan));
-        }
+        cands.push((bits, Predictor::Fixed(order), u, plan));
     }
-    match best {
-        Some((order, u, plan)) => {
+    cands.extend(lpc_candidates(x, bps, level));
+    match cands.into_iter().filter(|c| c.0 < verbatim_bits).min_by_key(|c| c.0) {
+        Some((_, Predictor::Fixed(order), u, plan)) => {
             w.write(0, 1);
             w.write(8 + order as u64, 6);
             w.write(0, 1);
             for &s in x.iter().take(order) {
                 w.write_signed(s, bps);
+            }
+            write_residual(w, &u, n, order, &plan);
+        }
+        Some((_, Predictor::Lpc { order, coefs, shift }, u, plan)) => {
+            w.write(0, 1);
+            w.write(32 + order as u64 - 1, 6);
+            w.write(0, 1);
+            for &s in x.iter().take(order) {
+                w.write_signed(s, bps);
+            }
+            w.write(u64::from(LPC_PRECISION - 1), 4);
+            w.write_signed(i64::from(shift), 5);
+            for &c in &coefs {
+                w.write_signed(c, LPC_PRECISION);
             }
             write_residual(w, &u, n, order, &plan);
         }
@@ -356,6 +488,8 @@ pub(crate) struct Writer<W> {
     frames: u64,
     frame_no: u64,
     has_comment: bool,
+    /// Compression level 0 (fastest) to 8 (smallest): how far LPC prediction is searched.
+    level: u8,
     /// Set when a frame write has failed: `write_frame` clears the pending samples before
     /// writing, so a failed frame is lost while `frames` still counts it; the writer refuses
     /// every later call.
@@ -369,6 +503,7 @@ impl<W: Write + Seek> Writer<W> {
         sample_rate: u32,
         depth: BitDepth,
         dither: bool,
+        level: u8,
         metadata: Option<&crate::Metadata>,
     ) -> Result<Self> {
         let bps = check(channels, sample_rate, depth)?;
@@ -390,6 +525,7 @@ impl<W: Write + Seek> Writer<W> {
             frames: 0,
             frame_no: 0,
             has_comment: comment.is_some(),
+            level: level.min(8),
             failed: false,
         })
     }
@@ -457,7 +593,7 @@ impl<W: Write + Seek> Writer<W> {
         }
         w.write(u64::from(crc8(&header)), 8);
         for p in &mut self.pending {
-            write_subframe(&mut w, p, self.bps);
+            write_subframe(&mut w, p, self.bps, self.level);
             p.clear();
         }
         let mut frame = w.into_bytes();
@@ -482,14 +618,14 @@ impl<W: Write + Seek> Writer<W> {
     }
 }
 
-pub(crate) fn encode(buf: &AudioBuffer, depth: BitDepth, dither: bool, metadata: Option<&crate::Metadata>) -> Result<Vec<u8>> {
+pub(crate) fn encode(buf: &AudioBuffer, depth: BitDepth, dither: bool, level: u8, metadata: Option<&crate::Metadata>) -> Result<Vec<u8>> {
     validate_buffer(buf)?;
     let bps = check(buf.channels.len(), buf.sample_rate, depth)?;
     let frames = buf.frames();
     let mut out = Vec::new();
     out.try_reserve(frames.saturating_mul(buf.channels.len()).saturating_mul(bps as usize / 8) / 2)
         .map_err(|_| AudioError::TooLarge("cannot allocate FLAC output".into()))?;
-    let mut w = Writer::new(Cursor::new(out), buf.channels.len(), buf.sample_rate, depth, dither, metadata)?;
+    let mut w = Writer::new(Cursor::new(out), buf.channels.len(), buf.sample_rate, depth, dither, level, metadata)?;
     w.write(&buf.channels, frames)?;
     Ok(w.finish()?.into_inner())
 }

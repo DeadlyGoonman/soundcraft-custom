@@ -71,6 +71,7 @@ pub fn export(e: &Engine, ids: &[ClipId], path: &str) -> Result<usize> {
                     dither: false,
                     bwf: None,
                     metadata: None,
+                    flac_level: 5,
                 };
                 let bytes = soundcraft_audio_io::encode(&buf.buffer, &opts).map_err(|err| EngineError::Io(err.to_string()))?;
                 crate::io::write_path(dir.join(&rel), bytes)?;
