@@ -19,6 +19,8 @@ pub struct MidiEditorState {
     pub clip: Option<ClipId>,
     /// Rubber-band selection start (screen position).
     pub band: Option<egui::Pos2>,
+    /// The piano roll's rect and the pass it was drawn in: its arrow keys win over the Edit window's.
+    pub roll: Option<(egui::Rect, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +318,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         }
     }
     // Keyboard: Cmd+A select all; arrows transpose (Shift = octave) and move by the grid.
+    app.midi.roll = Some((roll, ui.ctx().cumulative_pass_nr()));
     if ui.rect_contains_pointer(roll) && !ui.ctx().egui_wants_keyboard_input() {
         let (all, up, down, left, right, shift) = ui.input(|i| {
             let arrows = !i.modifiers.alt && !i.modifiers.command && !i.modifiers.ctrl;

@@ -71,8 +71,9 @@ pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
     });
     // Cmd and Ctrl are separate keys only on macOS (asked at runtime so the web build in a Mac browser agrees).
     let mac = ctx.os() == egui::os::OperatingSystem::Mac;
+    let roll = over_piano_roll(app, ctx);
     for (key, mods) in events {
-        if fixed(app, key, mods, mac) {
+        if fixed(app, key, mods, mac, roll) {
             continue;
         }
         if let Some(id) = command_for(key, mods, mac) {
@@ -98,7 +99,7 @@ fn command_for(key: Key, mods: Modifiers, mac: bool) -> Option<&'static str> {
 }
 
 /// Keys with context-dependent meaning. Returns true when handled.
-fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool) -> bool {
+fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool, over_roll: bool) -> bool {
     let plain = !m.command && !m.alt && !m.ctrl && !m.shift;
     match key {
         Key::Space if !m.command && !m.alt => {
@@ -209,6 +210,21 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool) -> bool {
             let _ = app.run(id, json!({}));
             true
         }
+        // Shift+Up/Down move the selected clips a track up/down, keeping their time; the MIDI
+        // editor's piano roll keeps them (octave transpose) while the pointer is over it.
+        Key::ArrowUp | Key::ArrowDown
+            if m.shift
+                && !m.command
+                && !m.ctrl
+                && !m.alt
+                && app.ui.window == MainWindow::Edit
+                && !app.engine.session().edit.selected_clips.is_empty()
+                && !over_roll =>
+        {
+            let direction = if key == Key::ArrowUp { "up" } else { "down" };
+            let _ = app.run("clip.move_to_adjacent_track", json!({"direction": direction}));
+            true
+        }
         // Commands Keyboard Focus: single-key editing (Edit window only).
         k if !m.command
             && !m.alt
@@ -227,6 +243,12 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether the pointer is over the MIDI editor's piano roll as drawn in the last pass or two.
+fn over_piano_roll(app: &SoundApp, ctx: &egui::Context) -> bool {
+    let Some((roll, pass)) = app.midi.roll else { return false };
+    ctx.cumulative_pass_nr().saturating_sub(pass) <= 2 && ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| roll.contains(p))
 }
 
 /// F1–F4 (and Alt+1–4) choose Shuffle, Slip, Spot and Grid; F4 in Grid switches between Absolute and

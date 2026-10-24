@@ -176,6 +176,15 @@ pub fn specs() -> Vec<CommandSpec> {
             move_clips
         ),
         cmd!(
+            "clip.move_to_adjacent_track",
+            "Move Clips to Adjacent Track",
+            [],
+            Some("Shift+Up/Down"),
+            "{direction: up|down, clips?: [id]} — moves the clips one shown track up or down (past tracks that can't hold them), keeping their timeline position; all or none",
+            has_selection,
+            move_to_adjacent_track
+        ),
+        cmd!(
             "edit.trim_clip",
             "Trim Clip",
             [],
@@ -934,6 +943,38 @@ fn move_clips(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({"moved": n, "by": delta}))
 }
 
+/// Shift+Up/Down: the clips on each track go to the nearest shown track above or below that can
+/// hold them (same kind, MIDI and instrument alike), keeping their timeline position, through the
+/// same placement as a drag. Nothing moves when one of them has no such track.
+fn move_to_adjacent_track(e: &mut Engine, p: &Value) -> Result<Value> {
+    const ID: &str = "clip.move_to_adjacent_track";
+    let down = match str_param(p, "direction") {
+        Some("up") => false,
+        Some("down") => true,
+        _ => return Err(bad(ID, "`direction` must be up or down")),
+    };
+    let ids = clip_ids_param(e, p);
+    let s = e.session();
+    let from: Vec<&soundcraft_model::Track> = s.tracks.iter().filter(|t| t.clips().iter().any(|c| ids.contains(&c.id))).collect();
+    if from.is_empty() {
+        return Err(bad(ID, "no clips"));
+    }
+    let rows: Vec<&soundcraft_model::Track> = s.tracks.iter().filter(|t| ops::shown(s, t) || from.iter().any(|f| f.id == t.id)).collect();
+    let mut dest = Vec::new();
+    for t in from {
+        let at = rows.iter().position(|r| r.id == t.id).unwrap_or(0);
+        let fits = |d: &&&soundcraft_model::Track| d.kind.has_playlist() && (d.kind == t.kind || d.kind.is_midi() && t.kind.is_midi());
+        let to = if down { rows.iter().skip(at + 1).find(fits) } else { rows.iter().take(at).rev().find(fits) };
+        let to = to.ok_or_else(|| bad(ID, format!("no track {} “{}” that can hold its clips", if down { "below" } else { "above" }, t.name)))?;
+        dest.push((t.id, to.id));
+    }
+    let shuffle = s.edit.edit_mode == EditMode::Shuffle;
+    let s = e.session_mut();
+    let n = if shuffle { ops::shuffle_clips(s, &ids, 0, &dest).map_err(|why| bad(ID, why))? } else { ops::move_clips(s, &ids, 0, &dest) };
+    s.edit.selected_clips = ids;
+    Ok(json!({"moved": n, "tracks": dest.iter().map(|(_, d)| d.0).collect::<Vec<_>>()}))
+}
+
 fn trim_clip(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = clip_id(p, "edit.trim_clip")?;
     let start = position_param(e, "edit.trim_clip", p, "start")?;
@@ -1208,5 +1249,78 @@ mod tests {
         e.execute("edit.restore_last_selection", &json!({})).unwrap();
         assert_eq!(e.session().edit.selection, soundcraft_time::Range::new(7_000, 9_000));
         assert_eq!(json!(tracks(&e)), json!([ids[1]]));
+    }
+
+    /// Tracks Audio 1, Keys (instrument), Audio 2, Audio 3, Keys 2; clips "a" on Audio 1, "b" on
+    /// Audio 2 and a MIDI clip on Keys.
+    fn lanes() -> (Engine, Vec<TrackId>, [ClipId; 3]) {
+        let mut s = Session::default();
+        let kinds = [TrackKind::Audio, TrackKind::Instrument, TrackKind::Audio, TrackKind::Audio, TrackKind::Instrument];
+        let t: Vec<TrackId> = kinds.iter().map(|k| s.add_track(*k, ChannelFormat::Mono, None)).collect();
+        let buf = soundcraft_audio_io::AudioBuffer { sample_rate: s.sample_rate.hz(), channels: vec![vec![0.25; 60_000]] };
+        let src = crate::io::add_source(&mut s, "src", buf, None, soundcraft_audio_io::FileFormat::Wav);
+        let (a, b, m) = (s.new_clip_id(), s.new_clip_id(), s.new_clip_id());
+        let mut ca = Clip::audio(a, "a", src, 0, 1_000, 5_000);
+        ca.gain_db = -3.0;
+        ca.fade_in = Fade { len: 400, shape: FadeShape::SCurve, curvature: 0.0 };
+        ops::place_clip(&mut s, t[0], ca);
+        ops::place_clip(&mut s, t[2], Clip::audio(b, "b", src, 0, 9_000, 2_000));
+        ops::place_clip(&mut s, t[1], Clip::midi(m, "m", 2_000, 3_000, Default::default()));
+        (Engine::new(s), t, [a, b, m])
+    }
+
+    fn on(e: &Engine, c: ClipId) -> (TrackId, Samples) {
+        let (t, clip) = e.session().find_clip(c).unwrap();
+        (t, clip.start)
+    }
+
+    #[test]
+    fn shift_down_moves_a_clip_past_incompatible_tracks_keeping_its_time_and_undoes() {
+        let (mut e, t, [a, ..]) = lanes();
+        let before = e.session().clone();
+        let clip = before.find_clip(a).unwrap().1.clone();
+        e.execute("clip.move_to_adjacent_track", &json!({"clips": [a.0], "direction": "down"})).unwrap();
+        assert_eq!(on(&e, a), (t[2], 1_000), "skips the instrument track, start unchanged");
+        let moved = e.session().find_clip(a).unwrap().1;
+        assert_eq!((moved.length, moved.gain_db, moved.fade_in), (clip.length, clip.gain_db, clip.fade_in));
+        assert_eq!(e.session().edit.selected_clips, vec![a]);
+        assert!(e.undo());
+        assert_eq!(e.session(), &before);
+    }
+
+    #[test]
+    fn shift_up_stops_at_the_first_track() {
+        let (mut e, _, [a, ..]) = lanes();
+        let before = e.session().clone();
+        assert!(e.execute("clip.move_to_adjacent_track", &json!({"clips": [a.0], "direction": "up"})).is_err());
+        assert_eq!(e.session(), &before);
+        assert!(e.execute("clip.move_to_adjacent_track", &json!({"clips": [a.0], "direction": "sideways"})).is_err());
+    }
+
+    #[test]
+    fn midi_clips_only_land_on_midi_tracks() {
+        let (mut e, t, [.., m]) = lanes();
+        e.execute("clip.move_to_adjacent_track", &json!({"clips": [m.0], "direction": "down"})).unwrap();
+        assert_eq!(on(&e, m), (t[4], 2_000));
+        assert!(e.execute("clip.move_to_adjacent_track", &json!({"clips": [m.0], "direction": "down"})).is_err());
+        e.execute("clip.move_to_adjacent_track", &json!({"clips": [m.0], "direction": "up"})).unwrap();
+        assert_eq!(on(&e, m), (t[1], 2_000));
+    }
+
+    #[test]
+    fn a_multi_clip_selection_moves_together_or_not_at_all() {
+        let (mut e, t, [a, b, _]) = lanes();
+        e.execute("edit.select", &json!({"clips": [a.0, b.0]})).unwrap();
+        e.execute("clip.move_to_adjacent_track", &json!({"direction": "down"})).unwrap();
+        assert_eq!((on(&e, a), on(&e, b)), ((t[2], 1_000), (t[3], 9_000)));
+        let before = e.session().clone();
+        assert!(e.execute("clip.move_to_adjacent_track", &json!({"direction": "down"})).is_err(), "b would fall off the end");
+        assert_eq!(on(&e, a), (t[2], 1_000), "all or none");
+        assert_eq!(e.session(), &before);
+        e.execute("clip.move_to_adjacent_track", &json!({"direction": "up"})).unwrap();
+        assert_eq!((on(&e, a), on(&e, b)), ((t[0], 1_000), (t[2], 9_000)));
+        let mut sel = e.session().edit.selected_clips.clone();
+        sel.sort();
+        assert_eq!(sel, vec![a, b]);
     }
 }
