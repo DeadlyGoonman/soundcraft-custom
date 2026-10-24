@@ -1433,6 +1433,9 @@ fn store_wav(dir: &Path, stem: &str, bytes: &[u8]) -> Result<(String, bool)> {
 
 /// Open a `.scraft` session and decode its audio files (missing files are reported, not fatal).
 pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
+    if Path::new(path).extension().is_some_and(|x| x.eq_ignore_ascii_case("ptx")) {
+        return crate::ptx::open_ptx(e, path);
+    }
     open_session_linked(e, path, Path::new(path))
 }
 

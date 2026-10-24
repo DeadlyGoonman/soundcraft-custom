@@ -17,6 +17,7 @@ pub mod inspect;
 pub mod io;
 pub mod mp3;
 pub mod plugin_scan;
+pub mod ptx;
 pub mod score;
 
 use serde_json::{Value, json};
