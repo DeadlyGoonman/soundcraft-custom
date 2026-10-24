@@ -2190,6 +2190,9 @@ impl EditorLink {
             // and detached in `teardown`).
             unsafe { view.setFrame(f.as_ptr()) };
         }
+        // Visible before the view attaches: GPU-drawn editors (Waves) set up their drawing for a
+        // shown parent and can stay black when attached to a hidden one.
+        win.raise();
         // SAFETY: valid view; the parent is the live content view of `win`, of the type named.
         if !ok(unsafe { view.attached(win.parent(), platform) }) {
             // SAFETY: valid view; detach our frame again.

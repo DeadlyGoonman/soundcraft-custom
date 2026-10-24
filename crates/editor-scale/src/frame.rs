@@ -19,7 +19,8 @@ use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     BLACK_BRUSH, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DT_CENTER, DT_SINGLELINE,
     DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FW_SEMIBOLD, FillRect, GetMonitorInfoW, GetStockObject, HBRUSH, HDC, HGDIOBJ, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
+    RedrawWindow, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -503,13 +504,15 @@ impl HostWindow {
         self.fr().map(|f| f.body.get()).unwrap_or_default()
     }
 
-    /// Shows the window and brings it to the front.
+    /// Shows the window, brings it to the front and repaints it with its children: GPU-drawn
+    /// editors (Waves) otherwise stay black after being hidden and shown again.
     pub fn raise(&self) {
         if mine(self.top) {
             // SAFETY: our live window.
             unsafe {
                 let _ = ShowWindow(self.top, SW_SHOW);
                 let _ = SetForegroundWindow(self.top);
+                let _ = RedrawWindow(Some(self.top), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
             }
         }
     }
