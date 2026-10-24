@@ -265,7 +265,7 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
                     }
                 });
                 let extra = ui_aliases();
-                for root in tree() {
+                for root in tree().into_iter().filter(|r| has_function(r, &extra)) {
                     ui.menu_button(&root.label, |ui| {
                         for c in &root.children {
                             menu_node(app, ui, c, &extra);
@@ -325,7 +325,17 @@ fn instrument_track(s: &soundcraft_model::Session) -> Option<soundcraft_model::T
     s.tracks.iter().find(|t| t.kind == soundcraft_model::TrackKind::Instrument && s.edit.selected_tracks.contains(&t.id)).map(|t| t.id)
 }
 
+/// Whether an item, or anything under it, does something. Items without a command stay in the
+/// catalog (the parity report lists them) but aren't drawn: a disabled entry that can never be
+/// enabled is only clutter.
+fn has_function(n: &MenuNode, extra: &[(&str, &str)]) -> bool {
+    if n.children.is_empty() { command_for_path(&n.path, extra).is_some() } else { n.children.iter().any(|c| has_function(c, extra)) }
+}
+
 fn menu_node(app: &mut SoundApp, ui: &mut egui::Ui, n: &MenuNode, extra: &[(&str, &str)]) {
+    if !has_function(n, extra) {
+        return;
+    }
     if !n.children.is_empty() {
         ui.menu_button(&n.label, |ui| {
             for c in &n.children {
