@@ -72,6 +72,9 @@ pub struct EditLayout {
     /// The current swipe's movement per axis until either passes 6 points; it scrolls only along the larger.
     #[serde(skip)]
     swipe: egui::Vec2,
+    /// A Ctrl+Shift+wheel swipe is still smoothing out: the timeline ignores it until egui settles.
+    #[serde(skip)]
+    wave_wheel: bool,
 }
 
 impl EditLayout {
@@ -274,6 +277,7 @@ fn main_area_content(app: &mut SoundApp, ui: &mut Ui) {
     // Horizontal scrollbar.
     let sb = Rect::from_min_max(pos2(tl.min.x, full.max.y - hscroll_h), pos2(tl.max.x, full.max.y));
     hscrollbar(app, ui, sb, tl);
+    wave_view_zoom_badge(app, ui, tl);
     // Vertical scrollbar gutter.
     let vs = Rect::from_min_max(pos2(tl.max.x, tl.min.y), pos2(full.max.x, tl.max.y));
     ui.painter().rect_filled(vs, 0.0, t.panel_bg);
@@ -337,7 +341,74 @@ pub(crate) fn click_track(app: &mut SoundApp, id: TrackId, mods: egui::Modifiers
     let _ = app.run("edit.select", json!({"tracks": ids}));
 }
 
+/// Ctrl+Shift+wheel over the tracks sets the waveform display size, Ctrl+Shift+0 resets it; the
+/// wheel is consumed so it neither scrolls nor zooms the timeline.
+fn wave_view_zoom_input(app: &mut SoundApp, ui: &Ui, area: Rect, tl: Rect) -> bool {
+    let ctx = ui.ctx();
+    if !ctx.egui_wants_keyboard_input() {
+        let reset = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Num0);
+        if ctx.input_mut(|i| i.consume_shortcut(&reset)) {
+            app.ui.wave_view_zoom = 1.0;
+        }
+    }
+    if !tl.is_positive() || !ui.rect_contains_pointer(area) {
+        return false;
+    }
+    let notches = ctx.input_mut(|i| {
+        if !(i.modifiers.command && i.modifiers.shift) {
+            return 0.0;
+        }
+        let mut n = 0.0f32;
+        for e in &i.events {
+            if let egui::Event::MouseWheel { unit, delta, .. } = e {
+                let d = delta.y + delta.x;
+                n += match unit {
+                    egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => d.signum() * d.abs().clamp(1.0, 3.0).round(),
+                    egui::MouseWheelUnit::Point => d / 50.0,
+                };
+            }
+        }
+        if n != 0.0 {
+            i.smooth_scroll_delta = egui::Vec2::ZERO;
+            i.events.retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+        }
+        n
+    });
+    if notches != 0.0 {
+        app.ui.wave_view_zoom = crate::waveform::step_vzoom(app.ui.wave_view_zoom, notches);
+    }
+    notches != 0.0
+}
+
+/// "Wave ×2.0" at the top right of the track area while the display factor is not 1; click resets.
+fn wave_view_zoom_badge(app: &mut SoundApp, ui: &mut Ui, tl: Rect) {
+    let z = app.ui.wave_view_zoom;
+    if (z - 1.0).abs() < 1e-3 || !tl.is_positive() {
+        return;
+    }
+    let t = Tokens::current();
+    let galley = ui.painter().layout_no_wrap(format!("Wave ×{z:.1}"), regular(11.0), t.text_dim);
+    let r = Rect::from_min_size(pos2(tl.max.x - galley.size().x - 14.0, tl.min.y + 2.0), galley.size() + vec2(8.0, 2.0));
+    let resp = ui.interact(r, ui.id().with("wave_view_zoom"), Sense::click());
+    ui.painter().rect_filled(r, 3.0, t.panel_bg.gamma_multiply(0.8));
+    ui.painter().galley(r.min + vec2(4.0, 1.0), galley, t.text_dim);
+    if resp.on_hover_text("Ctrl+Shift+wheel: waveform size, Ctrl+Shift+0: reset").clicked() {
+        app.ui.wave_view_zoom = 1.0;
+    }
+}
+
 fn scroll_and_zoom(app: &mut SoundApp, ui: &Ui, area: Rect, tl: Rect) {
+    // egui reports Ctrl+wheel as zoom_delta (not clearable here): skip the timeline handlers instead.
+    if wave_view_zoom_input(app, ui, area, tl) {
+        app.edit_layout.wave_wheel = true;
+        return;
+    }
+    if app.edit_layout.wave_wheel {
+        app.edit_layout.wave_wheel = ui.input(|i| i.is_scrolling());
+        if app.edit_layout.wave_wheel {
+            return;
+        }
+    }
     let (delta, zoom, pointer, scrolling) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos(), i.is_scrolling()));
     let mut swipe = if scrolling { app.edit_layout.swipe } else { egui::Vec2::ZERO };
     if swipe.max_elem() < 6.0 {
@@ -1573,7 +1644,17 @@ fn draw_live_take(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &
     let (body, _, wave) = clip_colors([t.rec.r(), t.rec.g(), t.rec.b()], false);
     painter.rect(r, CornerRadius::same(2), body, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
     if track.view != "blocks" {
-        crate::waveform::draw_live(&painter.with_clip_rect(r.intersect(lane)), s, tl, origin as f64, block_len, &take, r, wave);
+        crate::waveform::draw_live_zoomed(
+            &painter.with_clip_rect(r.intersect(lane)),
+            s,
+            tl,
+            origin as f64,
+            block_len,
+            &take,
+            r,
+            wave,
+            app.ui.wave_view_zoom,
+        );
     }
 }
 
@@ -1635,7 +1716,17 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                         preview = Clip { fade_in, fade_out, ..clip.clone() };
                         &preview
                     };
-                    crate::waveform::draw(&painter.with_clip_rect(vis), s, tl, shown, audio, track.channels(), body_r, wave);
+                    crate::waveform::draw_zoomed(
+                        &painter.with_clip_rect(vis),
+                        s,
+                        tl,
+                        shown,
+                        audio,
+                        track.channels(),
+                        body_r,
+                        wave,
+                        app.ui.wave_view_zoom,
+                    );
                     let n = track.channels().min(audio.peaks.len()).max(1);
                     for k in 1..n {
                         let y = body_r.min.y + body_r.height() / n as f32 * k as f32;
@@ -1689,7 +1780,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         } else {
             clip_colors(prev.color.unwrap_or(track.color), false).2.gamma_multiply(0.6)
         };
-        crate::waveform::draw(&painter.with_clip_rect(xf), s, tl, prev, audio, track.channels(), body_r, tail);
+        crate::waveform::draw_zoomed(&painter.with_clip_rect(xf), s, tl, prev, audio, track.channels(), body_r, tail, app.ui.wave_view_zoom);
     }
     // Clip gain line.
     let show_gain = s.edit.flag("view.clip.gain_line") && (!clip.gain_env.is_empty() || clip.gain_db.abs() > 0.01 || track.view == "clip_gain");
@@ -2849,6 +2940,35 @@ mod tests {
         h.input_mut().max_texture_side = Some(8192);
         h.run_steps(4);
         h
+    }
+
+    #[test]
+    fn ctrl_shift_wheel_sets_the_display_factor_only() {
+        let mut h = harness(2);
+        let [x0, y0, x1, y1] = h.state().edit_layout.timeline;
+        let at = pos2((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        let before = h.state().engine.session().clone();
+        let (dirty, revision) = (h.state().engine.is_dirty(), h.state().engine.revision);
+        let mods = egui::Modifiers { ctrl: true, command: true, shift: true, ..Default::default() };
+        h.hover_at(at);
+        h.event(egui::Event::ModifiersChanged(mods));
+        for _ in 0..2 {
+            h.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: vec2(0.0, 1.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: mods,
+            });
+            h.run_steps(2);
+        }
+        assert!((h.state().ui.wave_view_zoom - 1.5625).abs() < 1e-4, "{}", h.state().ui.wave_view_zoom);
+        let s = h.state().engine.session();
+        assert_eq!(s.edit.zoom, before.edit.zoom, "no timeline zoom or scroll, no waveform_zoom change");
+        assert_eq!((h.state().engine.is_dirty(), h.state().engine.revision), (dirty, revision));
+        assert_eq!(serde_json::to_value(s).unwrap(), serde_json::to_value(&before).unwrap());
+        h.event(egui::Event::Key { key: egui::Key::Num0, physical_key: None, pressed: true, repeat: false, modifiers: mods });
+        h.run_steps(2);
+        assert_eq!(h.state().ui.wave_view_zoom, 1.0);
     }
 
     #[test]

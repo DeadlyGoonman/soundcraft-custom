@@ -6,9 +6,40 @@ use soundcraft_time::Samples;
 
 /// Draw a clip's audio across `body`, one band per channel, `channels` of them at most.
 pub fn draw(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &SourceAudio, channels: usize, body: Rect, wave: Color32) {
+    draw_zoomed(painter, s, tl, clip, audio, channels, body, wave, 1.0);
+}
+
+/// `draw` with the UI-only display factor `vzoom` (Ctrl+Shift+wheel) on top of the session's waveform zoom.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_zoomed(
+    painter: &Painter,
+    s: &Session,
+    tl: Rect,
+    clip: &Clip,
+    audio: &SourceAudio,
+    channels: usize,
+    body: Rect,
+    wave: Color32,
+    vzoom: f32,
+) {
     for (ch, band) in bands(body, channels.min(audio.peaks.len()).max(1)).enumerate() {
-        channel(painter, s, tl, clip, audio, ch, band, wave);
+        channel(painter, s, tl, clip, audio, ch, band, wave, vzoom);
     }
+}
+
+/// Smallest and largest UI waveform display factor.
+pub const VZOOM_RANGE: (f32, f32) = (0.25, 16.0);
+
+/// Next display factor after `notches` wheel steps (positive: taller), clamped to `VZOOM_RANGE`.
+pub fn step_vzoom(current: f32, notches: f32) -> f32 {
+    let cur = if current.is_finite() { current } else { 1.0 };
+    (cur * 1.25f32.powf(notches)).clamp(VZOOM_RANGE.0, VZOOM_RANGE.1)
+}
+
+/// The vertical extent (points from the centre line) of sample `v` in a band of half height `half`
+/// with display factor `vzoom`; never beyond the band.
+pub fn peak_extent(v: f32, vzoom: f32, half: f32) -> f32 {
+    level(v * vzoom).abs() * half
 }
 
 fn bands(body: Rect, n: usize) -> impl Iterator<Item = Rect> {
@@ -16,12 +47,13 @@ fn bands(body: Rect, n: usize) -> impl Iterator<Item = Rect> {
     (0..n).map(move |k| Rect::from_min_size(pos2(body.min.x, body.min.y + h * k as f32), vec2(body.width(), h)))
 }
 
-fn channel(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &SourceAudio, ch: usize, band: Rect, wave: Color32) {
+#[allow(clippy::too_many_arguments)]
+fn channel(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &SourceAudio, ch: usize, band: Rect, wave: Color32, vzoom: f32) {
     let (Some(samples), Some(peaks)) = (audio.channel(ch), audio.peaks.get(ch)) else { return };
     let Some(g) = Grid::new(painter, s, tl, band) else { return };
     let (rectified, power, outlines) = (s.edit.flag("waveform.rectified"), s.edit.flag("waveform.power"), s.edit.flag("waveform.outlines"));
     let origin = clip.start.saturating_sub(clip.source_offset()) as f64;
-    let gain = |pos: f64| clip.gain_at((pos as Samples).saturating_sub(clip.start).min(clip.length).max(0)) * s.edit.zoom.waveform_zoom;
+    let gain = |pos: f64| clip.gain_at((pos as Samples).saturating_sub(clip.start).min(clip.length).max(0)) * s.edit.zoom.waveform_zoom * vzoom;
     if g.step <= 1.0 {
         let first = (g.pos_at(g.vis.min.x) - origin).floor().max(0.0) as usize;
         let last = (g.pos_at(g.vis.max.x) - origin).ceil() as usize;
@@ -60,7 +92,23 @@ fn channel(painter: &Painter, s: &Session, tl: Rect, clip: &Clip, audio: &Source
 /// (min, max) per block of input frames, the blocks `block_len` timeline samples long from
 /// timeline position `origin`.
 pub fn draw_live(painter: &Painter, s: &Session, tl: Rect, origin: f64, block_len: f64, blocks: &[Vec<(f32, f32)>], body: Rect, wave: Color32) {
-    let zoom = s.edit.zoom.waveform_zoom;
+    draw_live_zoomed(painter, s, tl, origin, block_len, blocks, body, wave, 1.0);
+}
+
+/// `draw_live` with the UI-only display factor `vzoom`.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_live_zoomed(
+    painter: &Painter,
+    s: &Session,
+    tl: Rect,
+    origin: f64,
+    block_len: f64,
+    blocks: &[Vec<(f32, f32)>],
+    body: Rect,
+    wave: Color32,
+    vzoom: f32,
+) {
+    let zoom = s.edit.zoom.waveform_zoom * vzoom;
     for (blocks, band) in blocks.iter().zip(bands(body, blocks.len())) {
         let Some(g) = Grid::new(painter, s, tl, band) else { continue };
         let ys: Vec<Option<(f32, f32)>> = (0..g.cols)
@@ -205,5 +253,29 @@ impl Grid {
                 push(mesh, &mut prev, x + half, span);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_factor_grows_peaks_and_clamps_to_the_lane() {
+        let half = 20.0;
+        assert!(peak_extent(0.1, 2.0, half) > peak_extent(0.1, 1.0, half));
+        assert!((peak_extent(0.1, 4.0, half) - 8.0).abs() < 1e-4);
+        assert_eq!(peak_extent(0.9, 16.0, half), half);
+        assert_eq!(peak_extent(-0.9, 16.0, half), half);
+        assert_eq!(peak_extent(f32::NAN, 2.0, half), 0.0);
+    }
+
+    #[test]
+    fn steps_are_multiplicative_and_clamped() {
+        assert!((step_vzoom(1.0, 1.0) - 1.25).abs() < 1e-6);
+        assert!((step_vzoom(1.25, -1.0) - 1.0).abs() < 1e-6);
+        assert_eq!(step_vzoom(16.0, 3.0), 16.0);
+        assert_eq!(step_vzoom(0.25, -3.0), 0.25);
+        assert_eq!(step_vzoom(f32::NAN, 0.0), 1.0);
     }
 }

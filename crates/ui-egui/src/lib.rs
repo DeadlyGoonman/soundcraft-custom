@@ -129,6 +129,8 @@ pub struct UiState {
     pub window_size: [f32; 2],
     pub window_maximized: bool,
     pub ui_scale: f32,
+    /// Display-only waveform height factor (Ctrl+Shift+wheel in Edit); never touches the session.
+    pub wave_view_zoom: f32,
     /// Plugin editor scale per plugin id (Editor Scale in an insert's or instrument's menu). A plugin
     /// without an entry opens at 100 % Auto.
     #[serde(default)]
@@ -194,6 +196,7 @@ impl Default for UiState {
             window_size: [1600.0, 1000.0],
             window_maximized: false,
             ui_scale: 1.0,
+            wave_view_zoom: 1.0,
             editor_scales: HashMap::new(),
         }
     }
