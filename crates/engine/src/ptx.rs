@@ -20,6 +20,28 @@ const NAME: u16 = 0x1052;
 const PLACEMENT: u16 = 0x104f;
 /// One per track, in track order: the name of the playlist the track plays.
 const ACTIVE: u16 = 0x210b;
+/// The plugins the session uses (named ones, in index order).
+const PLUGIN: u16 = 0x1017;
+/// One per track, in track order: its inserts.
+const TRACK_INSERTS: u16 = 0x2627;
+/// An insert: plugin index (0x2626 child) and slot (0x2613 child).
+const INSERT: u16 = 0x2615;
+
+/// A plugin on a track's insert.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PtxInsert {
+    pub playlist: String,
+    /// Insert slot 0-9 (`None` when the session doesn't give one).
+    pub slot: Option<usize>,
+    pub plugin: String,
+}
+
+/// A plugin the imported session uses that isn't installed here, and the slots it was on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissingPlugin {
+    pub name: String,
+    pub targets: Vec<(TrackId, Option<usize>)>,
+}
 
 /// A clip as the session defines it: a stretch of one audio file.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +68,8 @@ pub struct Ptx {
     pub placements: Vec<PtxPlacement>,
     /// The playlist each track plays, in track order; the others are alternate takes.
     pub active: Vec<String>,
+    /// Plugins on tracks' inserts (only when `active` is known, which ties them to tracks).
+    pub inserts: Vec<PtxInsert>,
 }
 
 /// Undoes the session's XOR. Block 1's padding is mostly zeros, so its most common byte is the step.
@@ -108,8 +132,20 @@ pub fn parse(b: &[u8]) -> Ptx {
             Some(PtxPlacement { playlist, clip, position })
         })
         .collect();
-    let active = blocks(b, ACTIVE).into_iter().filter_map(|i| name_at(b, i + 13).map(|(n, _)| n)).collect();
-    Ptx { clips, placements, active }
+    let active: Vec<String> = blocks(b, ACTIVE).into_iter().filter_map(|i| name_at(b, i + 13).map(|(n, _)| n)).collect();
+    let plugins: Vec<String> = blocks(b, PLUGIN).into_iter().filter_map(|i| name_at(b, i + 10).map(|(n, _)| n)).filter(|n| !n.is_empty()).collect();
+    let owners: Vec<(usize, usize)> =
+        blocks(b, TRACK_INSERTS).into_iter().filter_map(|i| Some((i, i.checked_add(7)?.checked_add(usize::try_from(uint(b, i + 3, 4)?).ok()?)?))).collect();
+    let inserts = blocks(b, INSERT)
+        .into_iter()
+        .filter_map(|s| {
+            let plugin = plugins.get(usize::try_from(uint(b, s + 18, 2)?).ok()?)?.clone();
+            let slot = uint(b, s + 29, 2).and_then(|v| usize::try_from(v).ok()).filter(|&v| v < 10);
+            let track = owners.iter().position(|&(start, end)| start < s && s < end)?;
+            Some(PtxInsert { playlist: active.get(track)?.clone(), slot, plugin })
+        })
+        .collect();
+    Ptx { clips, placements, active, inserts }
 }
 
 /// The audio file a clip name comes from: `Beat-04.L` is a piece of `Beat.L`, `Take_12-01` of `Take_12`.
@@ -123,6 +159,71 @@ fn file_stem(clip: &str) -> String {
         _ => base,
     };
     side.map_or_else(|| base.to_string(), |s| format!("{base}.{s}"))
+}
+
+/// Lower-case letters and digits only, so `SSLGChannel` and `SSL G-Channel Stereo` compare.
+fn squash(s: &str) -> String {
+    s.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
+}
+
+/// The installed plugin a Pro Tools plugin name stands for: the same name, or one that starts
+/// with it (`H-Delay` -> `H-Delay Stereo`), ignoring case, spaces and punctuation, so newer
+/// versions of a plugin match.
+pub fn installed_match(name: &str, installed: &[(String, String)]) -> Option<String> {
+    let want = squash(name);
+    if want.is_empty() {
+        return None;
+    }
+    installed
+        .iter()
+        .find(|(_, n)| squash(n) == want)
+        .or_else(|| installed.iter().find(|(_, n)| squash(n).starts_with(&want)))
+        .map(|(id, _)| id.clone())
+}
+
+/// Installed VST3 and CLAP plugins as (id, name), from the hosts' saved scans.
+pub fn installed_plugins() -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = soundcraft_vst3_host::cached().unwrap_or_default().into_iter().map(|d| (d.id, d.name)).collect();
+    v.extend(soundcraft_clap_host::cached().unwrap_or_default().into_iter().map(|d| (d.id, d.name)));
+    v
+}
+
+/// Inserts plugin `id` on `track`, in `slot` when given (else the first free one).
+pub fn insert_plugin(e: &mut Engine, track: TrackId, slot: Option<usize>, id: &str) {
+    let mut p = serde_json::json!({"track": track, "plugin": id});
+    if let (Some(slot), Some(m)) = (slot, p.as_object_mut()) {
+        m.insert("slot".into(), serde_json::json!(slot));
+    }
+    if let Err(err) = e.execute("mix.insert", &p) {
+        e.message(format!("{id}: {err}"));
+    }
+}
+
+/// Puts each insert's plugin on its imported track(s), slotted ones first, and returns the
+/// plugins with no installed match.
+fn place_plugins(e: &mut Engine, inserts: &[PtxInsert], tracks: &HashMap<String, (TrackId, String)>) -> Vec<MissingPlugin> {
+    let installed = installed_plugins();
+    let mut ordered: Vec<&PtxInsert> = inserts.iter().collect();
+    ordered.sort_by_key(|i| i.slot.is_none());
+    let mut missing: Vec<MissingPlugin> = Vec::new();
+    for ins in ordered {
+        let targets: Vec<(TrackId, Option<usize>)> = tracks.values().filter(|(_, pl)| *pl == ins.playlist).map(|(id, _)| (*id, ins.slot)).collect();
+        if targets.is_empty() {
+            continue;
+        }
+        match installed_match(&ins.plugin, &installed) {
+            Some(id) => {
+                for (track, slot) in targets {
+                    insert_plugin(e, track, slot, &id);
+                }
+            }
+            None => match missing.iter_mut().find(|m| m.name == ins.plugin) {
+                Some(m) => m.targets.extend(targets),
+                None => missing.push(MissingPlugin { name: ins.plugin.clone(), targets }),
+            },
+        }
+    }
+    missing
 }
 
 /// A playlist's family: its name without take suffixes (`.01`, `.dup2`, `-2`), so the takes of
@@ -245,6 +346,7 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     s.folder = Some(folder);
     e.replace_session(s);
     e.path = None;
+    e.missing_plugins = place_plugins(e, &ptx.inserts, &tracks);
     for m in &missing {
         e.message(format!("missing media: {m}"));
     }
@@ -261,6 +363,19 @@ mod tests {
         assert_eq!(file_stem("3.03_458-01"), "3.03_458");
         assert_eq!(file_stem("3.01_456"), "3.01_456");
         assert_eq!(file_stem("juice wrld vx.45"), "juice wrld vx.45");
+    }
+
+    #[test]
+    fn newer_plugin_versions_match_by_name() {
+        let installed = vec![
+            ("vst3:A".to_string(), "SSL G-Channel Stereo".to_string()),
+            ("vst3:B".to_string(), "H-Delay Stereo".to_string()),
+            ("vst3:C".to_string(), "Q4 Stereo".to_string()),
+        ];
+        assert_eq!(installed_match("SSLGChannel", &installed).as_deref(), Some("vst3:A"));
+        assert_eq!(installed_match("H-Delay", &installed).as_deref(), Some("vst3:B"));
+        assert_eq!(installed_match("Q4", &installed).as_deref(), Some("vst3:C"));
+        assert_eq!(installed_match("EQ3 1-Band", &installed), None);
     }
 
     #[test]

@@ -145,6 +145,9 @@ pub struct Engine {
     /// The edit selection (range, tracks) before the last change, for Restore Last Selection.
     /// Kept out of the document so selecting never marks the session modified.
     pub last_selection: Option<(soundcraft_time::Range, Vec<TrackId>)>,
+    /// Plugins an imported Pro Tools session uses that are not installed here, for the UI to
+    /// offer substitutes (see `ptx`).
+    pub missing_plugins: Vec<ptx::MissingPlugin>,
 }
 
 impl Default for Engine {
@@ -175,6 +178,7 @@ impl Engine {
             merge_hold: None,
             messages: Vec::new(),
             last_selection: None,
+            missing_plugins: Vec::new(),
         }
     }
 
