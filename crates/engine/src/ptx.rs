@@ -18,6 +18,8 @@ const PLAIN: usize = 4096;
 const CLIP_DEF: u16 = 0x2628;
 const NAME: u16 = 0x1052;
 const PLACEMENT: u16 = 0x104f;
+/// One per track, in track order: the name of the playlist the track plays.
+const ACTIVE: u16 = 0x210b;
 
 /// A clip as the session defines it: a stretch of one audio file.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +44,8 @@ pub struct PtxPlacement {
 pub struct Ptx {
     pub clips: Vec<PtxClip>,
     pub placements: Vec<PtxPlacement>,
+    /// The playlist each track plays, in track order; the others are alternate takes.
+    pub active: Vec<String>,
 }
 
 /// Undoes the session's XOR. Block 1's padding is mostly zeros, so its most common byte is the step.
@@ -104,7 +108,8 @@ pub fn parse(b: &[u8]) -> Ptx {
             Some(PtxPlacement { playlist, clip, position })
         })
         .collect();
-    Ptx { clips, placements }
+    let active = blocks(b, ACTIVE).into_iter().filter_map(|i| name_at(b, i + 13).map(|(n, _)| n)).collect();
+    Ptx { clips, placements, active }
 }
 
 /// The audio file a clip name comes from: `Beat-04.L` is a piece of `Beat.L`, `Take_12-01` of `Take_12`.
@@ -140,17 +145,24 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     let mut tracks: HashMap<String, TrackId> = HashMap::new();
     let mut missing = Vec::new();
     let mut rate_set = false;
-    let first = ptx.placements.iter().map(|p| p.position).min().unwrap_or(0);
+    // Only the playlists tracks play, in track order (all of them when the session has no list).
+    let order: HashMap<&str, usize> = ptx.active.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let mut placements: Vec<&PtxPlacement> = ptx.placements.iter().filter(|p| order.is_empty() || order.contains_key(p.playlist.as_str())).collect();
+    placements.sort_by_key(|p| order.get(p.playlist.as_str()).copied().unwrap_or(usize::MAX));
+    let first = placements.iter().map(|p| p.position).min().unwrap_or(0);
     let side_of = |p: &PtxPlacement| ptx.clips.get(p.clip).and_then(|c| c.name.rsplit_once('.')).map(|(_, s)| s).filter(|s| *s == "L" || *s == "R");
-    // A stereo track's clips come as .L / .R pairs: those playlists become two mono tracks.
+    // A stereo track's clips all come as .L / .R pairs: those playlists become two mono tracks. A
+    // mono track that holds a few .L or .R pieces stays one track.
     let stereo: std::collections::HashSet<&str> = ptx
         .placements
         .iter()
-        .filter(|p| side_of(p) == Some("L"))
-        .filter(|l| ptx.placements.iter().any(|r| r.playlist == l.playlist && side_of(r) == Some("R")))
         .map(|p| p.playlist.as_str())
+        .filter(|pl| {
+            let sides: Vec<Option<&str>> = ptx.placements.iter().filter(|p| p.playlist == *pl).map(side_of).collect();
+            sides.iter().all(Option::is_some) && sides.contains(&Some("L")) && sides.contains(&Some("R"))
+        })
         .collect();
-    for p in &ptx.placements {
+    for p in placements {
         let Some(clip) = ptx.clips.get(p.clip) else { continue };
         let stem = file_stem(&clip.name);
         let src = match sources.get(&stem) {
