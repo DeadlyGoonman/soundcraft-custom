@@ -10,8 +10,8 @@ use soundcraft_time::{Samples, TimeFormat, format_length};
 
 #[derive(Debug, Clone)]
 pub enum Target {
-    /// Clips moving together; the fields follow the earliest.
-    Clips { clips: Vec<ClipId>, track: Option<TrackId> },
+    /// Clips moving together (`copy`: copies of them, from an Alt-drag); the fields follow the earliest.
+    Clips { clips: Vec<ClipId>, track: Option<TrackId>, copy: bool },
     /// The edge of a clip the Trim tool took.
     Trim { clip: ClipId, start: bool },
     /// An audio file dropped from the Clip List.
@@ -41,7 +41,7 @@ impl Spot {
     pub fn clips(s: &Session, clips: Vec<ClipId>, track: Option<TrackId>, delta: Samples) -> Option<Spot> {
         let c = first_movable(s, &clips)?;
         let stamp = c.source().and_then(|id| s.source(id)).map(|src| recorded_at(s, src.time_reference).saturating_add(c.source_offset()));
-        Some(Spot::new(s, Target::Clips { clips, track }, c.start.saturating_add(delta), c.length, c.sync_point, stamp))
+        Some(Spot::new(s, Target::Clips { clips, track, copy: false }, c.start.saturating_add(delta), c.length, c.sync_point, stamp))
     }
 
     /// A clip's start or end edge, dragged to `to`.
@@ -89,7 +89,7 @@ impl Spot {
     /// The command OK runs; None when nothing would change.
     pub fn command(&self, s: &Session) -> Option<(String, Value)> {
         Some(match &self.target {
-            Target::Clips { clips, track } => {
+            Target::Clips { clips, track, copy } => {
                 let first = first_movable(s, clips)?.start;
                 let by = self.start.saturating_sub(first);
                 if by == 0 && track.is_none() {
@@ -98,6 +98,9 @@ impl Spot {
                 let mut p = json!({"clips": clips.iter().map(|c| c.0).collect::<Vec<_>>(), "by": by});
                 if let Some(t) = track {
                     p["track"] = json!(t.0);
+                }
+                if *copy {
+                    p["copy"] = json!(true);
                 }
                 ("edit.move_clips".into(), p)
             }

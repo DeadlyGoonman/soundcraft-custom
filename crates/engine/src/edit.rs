@@ -206,6 +206,36 @@ pub fn paste(s: &mut Session, track: TrackId, at: Samples, clips: &[Clip], lengt
     Ok(ids)
 }
 
+/// Copies of clips `ids` (new ids), `delta` later and on the tracks `dest` sends them to, placed
+/// the way [`paste`] places them: over what they cover, or making room in Shuffle. Returns the
+/// new ids.
+pub fn copy_clips(s: &mut Session, ids: &[ClipId], delta: Samples, dest: &[(TrackId, TrackId)], shuffle: bool) -> Result<Vec<ClipId>, &'static str> {
+    let groups: Vec<(TrackId, Vec<Clip>)> = s
+        .tracks
+        .iter()
+        .map(|t| (lands(dest, t.id), t.clips().iter().filter(|c| ids.contains(&c.id)).cloned().collect::<Vec<_>>()))
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    let mut out = Vec::new();
+    for (t, mut clips) in groups {
+        let first = clips.iter().map(|c| c.start).min().unwrap_or(0);
+        clips.iter_mut().for_each(|c| c.start -= first);
+        let len = clips.iter().map(Clip::end).max().unwrap_or(0);
+        out.extend(paste(s, t, first.saturating_add(delta).max(0), &clips, len, shuffle)?);
+    }
+    Ok(out)
+}
+
+/// Whether a clip with this content can sit on a track of `kind`.
+pub fn fits(kind: soundcraft_model::TrackKind, c: &Clip) -> bool {
+    use soundcraft_model::TrackKind;
+    match c.content {
+        ClipContent::Audio { .. } => kind == TrackKind::Audio,
+        ClipContent::Midi { .. } => kind.is_midi(),
+        ClipContent::Video { .. } => kind == TrackKind::Video,
+    }
+}
+
 /// Place one clip, overwriting whatever it covers.
 pub fn place_clip(s: &mut Session, track: TrackId, clip: Clip) {
     clear_range(s, track, clip.range(), false);

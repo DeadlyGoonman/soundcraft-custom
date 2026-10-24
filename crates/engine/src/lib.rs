@@ -95,6 +95,9 @@ pub struct Clipboard {
     pub grid_offset: Samples,
     /// Copy Special › Automation: pasting it leaves the clips alone, in Shuffle mode too.
     pub automation_only: bool,
+    /// Copied from Grabber-selected clips: tracks between them hold nothing, and pasting leaves
+    /// those tracks alone (Shuffle makes no room there).
+    pub from_clips: bool,
 }
 
 impl Clipboard {

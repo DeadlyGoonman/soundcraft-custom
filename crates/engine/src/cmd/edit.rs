@@ -12,8 +12,16 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "edit.undo", "Undo", ["Edit"], Some("Cmd+Z"), "{}", can_undo, |e, _| Ok(json!({"undone": e.undo()}))),
         cmd!(noundo "edit.redo", "Redo", ["Edit"], Some("Cmd+Shift+Z"), "{}", can_redo, |e, _| Ok(json!({"redone": e.redo()}))),
         cmd!(noundo "edit.restore_last_selection", "Restore Last Selection", ["Edit"], Some("Cmd+Alt+Z"), "{}", has_last_selection, restore_selection),
-        cmd!("edit.cut", "Cut", ["Edit"], Some("Cmd+X"), "{tracks?, start?, end?}", has_range, |e, p| cut_copy(e, p, true, "edit.cut")),
-        cmd!(noundo "edit.copy", "Copy", ["Edit"], Some("Cmd+C"), "{tracks?, start?, end?}", has_range, |e, p| cut_copy(e, p, false, "edit.copy")),
+        cmd!(
+            "edit.cut",
+            "Cut",
+            ["Edit"],
+            Some("Cmd+X"),
+            "{tracks?, start?, end?} (none given: the selected clips, else the edit selection)",
+            has_range,
+            |e, p| cut_copy(e, p, true, "edit.cut")
+        ),
+        cmd!(noundo "edit.copy", "Copy", ["Edit"], Some("Cmd+C"), "{tracks?, start?, end?} (none given: the selected clips, else the edit selection)", has_range, |e, p| cut_copy(e, p, false, "edit.copy")),
         cmd!("edit.paste", "Paste", ["Edit"], Some("Cmd+V"), "{tracks?, at?}", has_clipboard, paste),
         cmd!("edit.clear", "Clear", ["Edit"], Some("Cmd+B"), "{tracks?, start?, end?}", has_range, clear),
         cmd!("edit.cut_clip_gain", "Clip Gain", ["Edit", "Cut Special"], Some("Cmd+Ctrl+X"), "{}", has_range, |e, p| {
@@ -171,7 +179,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Move Clips",
             [],
             None,
-            "{clips?: [id], by?: samples, to?: position for the first clip that can move (Grid modes snap its sync point), track?: where the first clip's track goes; the others keep their distance}",
+            "{clips?: [id], by?: samples, to?: position for the first clip that can move (Grid modes snap its sync point), track?: where the first clip's track goes; the others keep their distance, copy?: bool (copies go there, the originals stay)}",
             has_selection,
             move_clips
         ),
@@ -254,16 +262,55 @@ fn restore_selection(e: &mut Engine, _: &Value) -> Result<Value> {
     Ok(json!({"selection": range}))
 }
 
+/// With Grabber-selected clips and no tracks or range named: exactly those clips as a clipboard
+/// (starts relative to their span), one entry per track from the topmost holding them to the
+/// bottommost (shown tracks between stay empty, so the clips keep their track offsets), with
+/// those tracks and the span.
+fn clip_selection(e: &Engine, p: &Value) -> Option<(Clipboard, Vec<TrackId>, soundcraft_time::Range)> {
+    if ["track", "tracks", "start", "end", "length"].iter().any(|k| p.get(k).is_some()) {
+        return None;
+    }
+    let s = e.session();
+    let ids = &s.edit.selected_clips;
+    let holds = |t: &soundcraft_model::Track| t.clips().iter().any(|c| ids.contains(&c.id));
+    let top = s.tracks.iter().position(holds)?;
+    let bottom = s.tracks.iter().rposition(holds)?;
+    let range = ids
+        .iter()
+        .filter_map(|id| s.find_clip(*id))
+        .map(|(_, c)| c.range())
+        .reduce(|a, b| soundcraft_time::Range::new(a.start.min(b.start), a.end.max(b.end)))?;
+    let mut cb = Clipboard { from_clips: true, ..Clipboard::of_range(s, range) };
+    let mut tracks = Vec::new();
+    for t in s.tracks[top..=bottom].iter().filter(|t| holds(t) || ops::shown(s, t)) {
+        let clips = t.clips().iter().filter(|c| ids.contains(&c.id)).cloned().map(|mut c| {
+            c.start -= range.start;
+            c
+        });
+        cb.tracks.push(clips.collect());
+        tracks.push(t.id);
+    }
+    Some((cb, tracks, range))
+}
+
 fn cut_copy(e: &mut Engine, p: &Value, cut: bool, id: &str) -> Result<Value> {
-    let tracks = tracks_required(e, id, p)?;
-    let range = range_param(e, id, p)?;
+    let by_clip = clip_selection(e, p);
+    let (tracks, range) = match &by_clip {
+        Some((_, t, r)) => (t.clone(), *r),
+        None => (tracks_required(e, id, p)?, range_param(e, id, p)?),
+    };
     if range.is_empty() {
         return Err(bad(id, "selection is empty"));
     }
-    let mut cb = Clipboard::of_range(e.session(), range);
+    let mut cb = by_clip.as_ref().map_or_else(|| Clipboard::of_range(e.session(), range), |(cb, ..)| cb.clone());
     let follow = e.session().edit.automation_follows_edit;
-    for t in &tracks {
-        cb.tracks.push(ops::copy_range(e.session(), *t, range));
+    for (i, t) in tracks.iter().enumerate() {
+        if by_clip.is_none() {
+            cb.tracks.push(ops::copy_range(e.session(), *t, range));
+        } else if cb.tracks[i].is_empty() {
+            cb.automation.push(Vec::new());
+            continue;
+        }
         let lanes = e
             .session()
             .track(*t)
@@ -301,10 +348,31 @@ fn cut_copy(e: &mut Engine, p: &Value, cut: bool, id: &str) -> Result<Value> {
     if cut {
         let sh = shuffle(e.session());
         let s = e.session_mut();
-        for t in &tracks {
-            cut_track(s, *t, range, sh, follow);
+        for (i, t) in tracks.iter().enumerate() {
+            match &by_clip {
+                // Only the selected clips go, the last first so Shuffle closes each gap in turn.
+                Some((clips, ..)) => {
+                    for c in clips.tracks[i].iter().rev() {
+                        let r = c.range().shifted(range.start);
+                        if sh {
+                            cut_track(s, *t, r, true, follow);
+                            continue;
+                        }
+                        if let Some(pl) = s.track_mut(*t).and_then(|tr| tr.playlist_mut()) {
+                            pl.clips.retain(|x| x.id != c.id);
+                        }
+                        if follow && let Some(tr) = s.track_mut(*t) {
+                            tr.automation.iter_mut().for_each(|l| {
+                                l.clear_range(r.start, r.end);
+                            });
+                        }
+                    }
+                }
+                None => cut_track(s, *t, range, sh, follow),
+            }
         }
         s.edit.selection = soundcraft_time::Range::point(range.start);
+        s.edit.selected_clips.clear();
     }
     let n: usize = cb.tracks.iter().map(Vec::len).sum();
     e.clipboard = cb;
@@ -322,10 +390,15 @@ fn cut_track(s: &mut Session, t: TrackId, r: soundcraft_time::Range, sh: bool, f
 }
 
 fn paste(e: &mut Engine, p: &Value) -> Result<Value> {
-    let tracks = tracks_required(e, "edit.paste", p)?;
+    let mut tracks = tracks_required(e, "edit.paste", p)?;
     let given = position_param(e, "edit.paste", p, "at")?;
     let cb = e.clipboard.clone();
     let s = e.session();
+    let spread = p.get("tracks").is_none() && p.get("track").is_none() && cb.tracks.len() > tracks.len();
+    if spread && let Some(i) = s.track_index(tracks[0]) {
+        // Material from several tracks goes down the shown tracks from the first selected one.
+        tracks = s.tracks[i..].iter().filter(|t| t.id == tracks[0] || ops::shown(s, t)).take(cb.tracks.len()).map(|t| t.id).collect();
+    }
     let at = match given {
         Some(at) => at,
         None if s.edit.edit_mode == EditMode::GridRelative => {
@@ -337,13 +410,19 @@ fn paste(e: &mut Engine, p: &Value) -> Result<Value> {
     let follow = s.edit.automation_follows_edit;
     let replace = Some(s.edit.selection).filter(|r| sh && given.is_none() && !r.is_empty());
     let s = e.session_mut();
-    let mut pasted = 0;
+    let mut pasted = Vec::new();
     for (i, t) in tracks.iter().enumerate() {
         let Some(clips) = cb.tracks.get(i % cb.tracks.len().max(1)) else { continue };
+        // Audio clips only land on audio tracks, MIDI on MIDI and instrument tracks.
+        let kind = s.track(*t).map(|tr| tr.kind);
+        let clips: Vec<_> = clips.iter().filter(|c| kind.is_some_and(|k| ops::fits(k, c))).cloned().collect();
+        if cb.from_clips && clips.is_empty() {
+            continue;
+        }
         if let Some(r) = replace {
             cut_track(s, *t, r, true, follow);
         }
-        pasted += ops::paste(s, *t, at, clips, cb.length, sh).map_err(|why| bad("edit.paste", why))?.len();
+        pasted.extend(ops::paste(s, *t, at, &clips, cb.length, sh).map_err(|why| bad("edit.paste", why))?);
         if follow && let (Some(lanes), Some(tr)) = (cb.automation.get(i % cb.automation.len().max(1)), s.track_mut(*t)) {
             for l in lanes {
                 let dst = tr.lane_mut(&l.param);
@@ -357,7 +436,13 @@ fn paste(e: &mut Engine, p: &Value) -> Result<Value> {
         }
     }
     s.edit.selection = soundcraft_time::Range::new(at, at + cb.length);
-    Ok(json!({"pasted": pasted}))
+    if spread {
+        s.edit.selected_tracks = tracks;
+    }
+    // Pasted clips become the clip selection (Copy and Duplicate then take exactly them); a pasted
+    // range stays a range selection.
+    s.edit.selected_clips = if cb.from_clips { pasted.clone() } else { Vec::new() };
+    Ok(json!({"pasted": pasted.len(), "clips": pasted}))
 }
 
 fn clear(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -564,8 +649,11 @@ fn extend_tracks(e: &mut Engine, dir: i64) -> Result<Value> {
 }
 
 fn duplicate(e: &mut Engine, p: &Value) -> Result<Value> {
-    let tracks = tracks_required(e, "edit.duplicate", p)?;
-    let range = range_param(e, "edit.duplicate", p)?;
+    let by_clip = clip_selection(e, p);
+    let (tracks, range) = match &by_clip {
+        Some((_, t, r)) => (t.clone(), *r),
+        None => (tracks_required(e, "edit.duplicate", p)?, range_param(e, "edit.duplicate", p)?),
+    };
     if range.is_empty() {
         return Err(bad("edit.duplicate", "selection is empty"));
     }
@@ -573,9 +661,17 @@ fn duplicate(e: &mut Engine, p: &Value) -> Result<Value> {
     let follow = e.session().edit.automation_follows_edit;
     let s = e.session_mut();
     let mut n = 0;
-    for t in &tracks {
-        let clips = ops::copy_range(s, *t, range);
-        n += ops::paste(s, *t, range.end, &clips, range.len(), sh).map_err(|why| bad("edit.duplicate", why))?.len();
+    let mut ids = Vec::new();
+    for (i, t) in tracks.iter().enumerate() {
+        // Selected clips repeat right after the last of them; a range repeats right after itself.
+        let clips = match &by_clip {
+            Some((cb, ..)) if cb.tracks[i].is_empty() => continue,
+            Some((cb, ..)) => cb.tracks[i].clone(),
+            None => ops::copy_range(s, *t, range),
+        };
+        let new = ops::paste(s, *t, range.end, &clips, range.len(), sh).map_err(|why| bad("edit.duplicate", why))?;
+        n += new.len();
+        ids.extend(new);
         if follow && let Some(tr) = s.track_mut(*t) {
             for l in &mut tr.automation {
                 let pts: Vec<_> = l.points.iter().filter(|p| range.contains(p.at)).copied().collect();
@@ -586,6 +682,9 @@ fn duplicate(e: &mut Engine, p: &Value) -> Result<Value> {
         }
     }
     s.edit.selection = range.shifted(range.len());
+    if by_clip.is_some() {
+        s.edit.selected_clips = ids;
+    }
     Ok(json!({"clips": n}))
 }
 
@@ -934,6 +1033,14 @@ fn move_clips(e: &mut Engine, p: &Value) -> Result<Value> {
         _ => delta,
     };
     let s = e.session_mut();
+    if bool_or(p, "copy", false) {
+        // Alt-drag: copies land where the clips would have gone, placed like a paste; the
+        // originals stay.
+        let new = ops::copy_clips(s, &ids, delta, &dest, mode == EditMode::Shuffle).map_err(|why| bad("edit.move_clips", why))?;
+        let ids: Vec<u64> = new.iter().map(|c| c.0).collect();
+        select(e, &json!({"clips": ids}))?;
+        return Ok(json!({"copied": ids.len(), "by": delta, "clips": ids}));
+    }
     let n = if mode == EditMode::Shuffle {
         ops::shuffle_clips(s, &ids, delta, &dest).map_err(|why| bad("edit.move_clips", why))?
     } else {

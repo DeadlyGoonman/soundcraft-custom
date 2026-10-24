@@ -57,17 +57,36 @@ fn search_chord(m: Modifiers, mac: bool) -> bool {
 pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
     // Cmd+= and Cmd+0 are Mix/Edit and Quantize to Grid, not egui's built-in interface zoom.
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
+    if std::mem::take(&mut app.claim_clipboard) {
+        ctx.copy_text("SoundCraft clips".into());
+    }
     if ctx.egui_wants_keyboard_input() || app.dialogs.open.is_some() {
         return;
     }
     let events: Vec<(Key, Modifiers)> = ctx.input(|i| {
-        i.events
+        let mut keys: Vec<(Key, Modifiers)> = i
+            .events
             .iter()
             .filter_map(|e| match e {
                 egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => Some((*key, *modifiers)),
                 _ => None,
             })
-            .collect()
+            .collect();
+        // egui-winit hands Cmd/Ctrl+C, X and V (and Ctrl+Insert, Shift+Delete, Shift+Insert) over as
+        // Copy, Cut and Paste instead of key presses; Paste only while the system clipboard holds text.
+        for e in &i.events {
+            let key = match e {
+                egui::Event::Copy => Key::C,
+                egui::Event::Cut => Key::X,
+                egui::Event::Paste(_) => Key::V,
+                _ => continue,
+            };
+            let mods = if i.modifiers.command { i.modifiers } else { Modifiers::COMMAND };
+            if !keys.iter().any(|(k, m)| *k == key && m.command) {
+                keys.push((key, mods));
+            }
+        }
+        keys
     });
     // Cmd and Ctrl are separate keys only on macOS (asked at runtime so the web build in a Mac browser agrees).
     let mac = ctx.os() == egui::os::OperatingSystem::Mac;

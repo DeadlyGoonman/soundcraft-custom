@@ -2248,7 +2248,7 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
             Tool::Selector | Tool::Smart => Some(Gesture::Select { track: track.id, anchor: snap(&s, at_origin), tracks: vec![track.id] }),
             Tool::Grabber => hit.as_ref().map(|c| {
                 let clips = if s.edit.selected_clips.contains(&c.id) { s.edit.selected_clips.clone() } else { vec![c.id] };
-                Gesture::MoveClips { clips, grab_at: at_origin, delta: 0, from_track: track.id, to_track: track.id }
+                Gesture::MoveClips { clips, grab_at: at_origin, delta: 0, from_track: track.id, to_track: track.id, copy: mods.alt }
             }),
             Tool::Trim => hit.as_ref().map(|c| match near_edge(c) {
                 Some(false) => Gesture::TrimEnd { clip: c.id, track: track.id, to: c.end() },
@@ -2417,10 +2417,12 @@ fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
                 *tracks = rows.get(a.min(b)..=a.max(b)).unwrap_or_default().iter().map(|(i, _)| TrackId(*i)).collect();
             }
         }
-        Some(Gesture::MoveClips { clips, grab_at, delta, from_track, to_track: tt }) => {
+        Some(Gesture::MoveClips { clips, grab_at, delta, from_track, to_track: tt, copy }) => {
             if let Some(t2) = to_track {
                 *tt = t2;
             }
+            // Alt (Option) held when the clips are let go drops copies.
+            *copy = ctx.input(|i| i.modifiers.alt);
             let plan = drag_plan(ctx, &s, app.engine.revision, clips, (*from_track, *tt), *grab_at);
             *delta = move_delta(&plan, &s, *from_track, at - *grab_at, ctx.input(|i| i.modifiers.command));
         }
@@ -2517,7 +2519,7 @@ fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
 
 fn finish_drag(app: &mut SoundApp, s: &Session, tl: Rect, p: Option<Pos2>) {
     match app.gesture.take() {
-        Some(Gesture::MoveClips { clips, delta, from_track, to_track, .. }) => drop_clips(app, clips, delta, from_track, to_track),
+        Some(Gesture::MoveClips { clips, delta, from_track, to_track, copy, .. }) => drop_clips(app, clips, delta, (from_track, to_track), copy),
         Some(Gesture::Fade { clip, fade_in, to, .. }) => {
             let to = p.map_or(to, |p| sample_at(s, tl, p.x).max(0));
             if let Some(fade) = s.find_clip(clip).and_then(|(_, c)| fade_drag_preview(c, fade_in, to)) {
@@ -2648,9 +2650,12 @@ fn grabbed_first(s: &Session, clips: &[ClipId], from: TrackId) -> Vec<ClipId> {
     v
 }
 
-fn drop_clips(app: &mut SoundApp, clips: Vec<ClipId>, delta: Samples, from: TrackId, to: TrackId) {
+fn drop_clips(app: &mut SoundApp, clips: Vec<ClipId>, delta: Samples, (from, to): (TrackId, TrackId), copy: bool) {
     let s = app.engine.session();
-    let spot = Spot::clips(s, grabbed_first(s, &clips, from), (to != from).then_some(to), delta);
+    let mut spot = Spot::clips(s, grabbed_first(s, &clips, from), (to != from).then_some(to), delta);
+    if let Some(Spot { target: crate::spot::Target::Clips { copy: c, .. }, .. }) = &mut spot {
+        *c = copy;
+    }
     spot_or_run(app, spot);
 }
 
@@ -2828,7 +2833,7 @@ fn overlay(app: &mut SoundApp, ui: &mut Ui, tl: Rect, area: Rect) {
         scroll_to = follow_to;
     }
     // Ghost of a clip move.
-    if let Some(Gesture::MoveClips { clips, delta, from_track, to_track, grab_at }) = &app.gesture
+    if let Some(Gesture::MoveClips { clips, delta, from_track, to_track, grab_at, .. }) = &app.gesture
         && let plan = drag_plan(ui.ctx(), s, app.engine.revision, clips, (*from_track, *to_track), *grab_at)
         && let Some(dest) = &plan.dest
     {

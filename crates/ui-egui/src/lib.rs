@@ -257,19 +257,75 @@ pub struct MeterDisplay {
 /// An in-progress mouse gesture in the Edit window.
 #[derive(Debug, Clone)]
 pub enum Gesture {
-    Select { track: TrackId, anchor: Samples, tracks: Vec<TrackId> },
-    MoveClips { clips: Vec<soundcraft_model::ClipId>, grab_at: Samples, delta: Samples, from_track: TrackId, to_track: TrackId },
-    TrimStart { clip: soundcraft_model::ClipId, track: TrackId, to: Samples },
-    TrimEnd { clip: soundcraft_model::ClipId, track: TrackId, to: Samples },
-    Fade { clip: soundcraft_model::ClipId, track: TrackId, fade_in: bool, to: Samples },
-    FadeCurve { clip: soundcraft_model::ClipId, fade_in: bool, curvature: f32, anchor: (f32, f32), height: f32 },
-    Scrub { last: Samples },
-    Fader { track: TrackId, start_db: f32 },
-    ClipGain { clip: soundcraft_model::ClipId, track: TrackId, pos: f32, anchor: (f32, f32), fine: bool, fader_bottom: egui::Pos2 },
-    Pencil { track: TrackId, points: Vec<(Samples, f32)> },
-    Breakpoint { track: TrackId, param: soundcraft_model::AutoParam, at: Samples },
-    MidiClip { track: TrackId, from: Samples, to: Samples },
-    ZoomBox { start: f32 },
+    Select {
+        track: TrackId,
+        anchor: Samples,
+        tracks: Vec<TrackId>,
+    },
+    /// `copy` while Alt (Option) is held: copies land there and the originals stay.
+    MoveClips {
+        clips: Vec<soundcraft_model::ClipId>,
+        grab_at: Samples,
+        delta: Samples,
+        from_track: TrackId,
+        to_track: TrackId,
+        copy: bool,
+    },
+    TrimStart {
+        clip: soundcraft_model::ClipId,
+        track: TrackId,
+        to: Samples,
+    },
+    TrimEnd {
+        clip: soundcraft_model::ClipId,
+        track: TrackId,
+        to: Samples,
+    },
+    Fade {
+        clip: soundcraft_model::ClipId,
+        track: TrackId,
+        fade_in: bool,
+        to: Samples,
+    },
+    FadeCurve {
+        clip: soundcraft_model::ClipId,
+        fade_in: bool,
+        curvature: f32,
+        anchor: (f32, f32),
+        height: f32,
+    },
+    Scrub {
+        last: Samples,
+    },
+    Fader {
+        track: TrackId,
+        start_db: f32,
+    },
+    ClipGain {
+        clip: soundcraft_model::ClipId,
+        track: TrackId,
+        pos: f32,
+        anchor: (f32, f32),
+        fine: bool,
+        fader_bottom: egui::Pos2,
+    },
+    Pencil {
+        track: TrackId,
+        points: Vec<(Samples, f32)>,
+    },
+    Breakpoint {
+        track: TrackId,
+        param: soundcraft_model::AutoParam,
+        at: Samples,
+    },
+    MidiClip {
+        track: TrackId,
+        from: Samples,
+        to: Samples,
+    },
+    ZoomBox {
+        start: f32,
+    },
 }
 
 pub struct SoundApp {
@@ -349,6 +405,9 @@ pub struct SoundApp {
     /// When Record last found nothing to record on, and why: the Record buttons show it for a moment.
     record_hint: Option<(f64, &'static str)>,
     pub quit_requested: bool,
+    /// Copy or Cut ran: put a note on the system clipboard, without which egui-winit sends no
+    /// Paste event for Cmd/Ctrl+V.
+    pub claim_clipboard: bool,
     /// Reset floating-window positions next frame (Window › Arrange).
     pub arrange_request: bool,
     /// Tracks whose automation was touched during this pass (Touch/Latch writing).
@@ -435,6 +494,7 @@ impl SoundApp {
             sim: None,
             record_hint: None,
             quit_requested: false,
+            claim_clipboard: false,
             arrange_request: false,
             touched: std::collections::HashSet::new(),
             last_write_at: i64::MIN,
@@ -476,6 +536,9 @@ impl SoundApp {
                 }
                 if id == "app.quit" {
                     self.quit_requested = true;
+                }
+                if matches!(id, "edit.copy" | "edit.cut") {
+                    self.claim_clipboard = true;
                 }
                 if id == "options.scrolling" {
                     // Re-selecting a scrolling mode resumes the playhead follow.
