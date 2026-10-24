@@ -119,6 +119,8 @@ pub struct PtxPlacement {
     pub clip: usize,
     /// Timeline position (samples).
     pub position: u64,
+    /// The clip is muted (Pro Tools greys it out and it doesn't play).
+    pub muted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -194,7 +196,9 @@ pub fn parse(b: &[u8]) -> Ptx {
             let clip = usize::try_from(uint(b, p + 11, 4)?).ok().filter(|&c| c < clips.len())?;
             let position = uint(b, p + 16, 8)?;
             let playlist = names.iter().rev().find(|(q, end, _)| *q < p && p < *end).map(|(_, _, n)| n.clone())?;
-            Some(PtxPlacement { playlist, clip, position })
+            // The flags byte after the position: bit 1 is set on clips that play, clear on muted ones.
+            let muted = b.get(p + 24).is_some_and(|f| f & 0x02 == 0);
+            Some(PtxPlacement { playlist, clip, position, muted })
         })
         .collect();
     let version = pt_version(b);
@@ -277,16 +281,37 @@ fn squash(s: &str) -> String {
     s.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
 }
 
+/// [`squash`] without a leading vendor name that one side has and the other doesn't
+/// (`FabFilter Pro-Q 3` is listed as `Pro-Q 3`).
+fn bare(s: &str) -> String {
+    let q = squash(s);
+    ["fabfilter"].iter().find_map(|v| q.strip_prefix(v).filter(|r| !r.is_empty())).map_or(q.clone(), str::to_string)
+}
+
 /// The installed plugin a Pro Tools plugin name stands for: the same name, or one that starts
 /// with it (`H-Delay` -> `H-Delay Stereo`), ignoring case, spaces and punctuation, so newer
 /// versions of a plugin match.
 pub fn installed_match(name: &str, installed: &[(String, String)], stereo: bool) -> Option<String> {
-    let want = squash(name);
+    let want = bare(name);
     if want.is_empty() {
         return None;
     }
-    let matches: Vec<&(String, String)> = installed.iter().filter(|(_, n)| squash(n) == want).collect();
-    let matches = if matches.is_empty() { installed.iter().filter(|(_, n)| squash(n).starts_with(&want)).collect() } else { matches };
+    let mut matches: Vec<&(String, String)> = installed.iter().filter(|(_, n)| bare(n) == want).collect();
+    if matches.is_empty() {
+        matches = installed.iter().filter(|(_, n)| bare(n).starts_with(&want)).collect();
+    }
+    if matches.is_empty() {
+        // A newer version of the same plugin (Pro-Q 2 -> Pro-Q 4): the name without its version
+        // number, then digits. The newest wins.
+        let base = want.trim_end_matches(|c: char| c.is_ascii_digit());
+        if base.len() >= 3 && base.len() < want.len() {
+            matches = installed
+                .iter()
+                .filter(|(_, n)| bare(n).strip_prefix(base).is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit())))
+                .collect();
+            matches.sort_by_key(|(_, n)| std::cmp::Reverse(bare(n)));
+        }
+    }
     // Waves and others ship Mono and Stereo variants: take the one that fits the track.
     let fits = if stereo { "stereo" } else { "mono" };
     matches.iter().find(|(_, n)| squash(n).ends_with(fits)).or(matches.first()).map(|(id, _)| id.clone())
@@ -526,9 +551,24 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
         let length = if clip.length > 0 { clip.length } else { frames.saturating_sub(clip.offset) };
         let to = |v: u64| Samples::try_from(v).unwrap_or(Samples::MAX);
         let id = s.new_clip_id();
-        crate::edit::place_clip(&mut s, track, Clip::audio(id, clip.name.clone(), src, to(clip.offset), to(p.position.saturating_sub(origin)), to(length)));
+        let mut placed = Clip::audio(id, clip.name.clone(), src, to(clip.offset), to(p.position.saturating_sub(origin)), to(length));
+        placed.muted = p.muted;
+        crate::edit::place_clip(&mut s, track, placed);
     }
     s.folder = Some(folder);
+    // A stereo track came in as two mono tracks: pan them hard left and right, as its sides were.
+    for (name, (id, pl)) in &tracks {
+        let pan = if *name == format!("{pl} L") {
+            -1.0
+        } else if *name == format!("{pl} R") {
+            1.0
+        } else {
+            continue;
+        };
+        if let Some(t) = s.track_mut(*id) {
+            t.mixer.pan = vec![pan];
+        }
+    }
     let missing_plugins = place_plugins(&mut s, &ptx.inserts, &tracks);
     e.replace_session(s);
     e.path = None;
@@ -566,6 +606,10 @@ mod tests {
         let both = vec![("vst3:M".to_string(), "H-Delay Mono".to_string()), ("vst3:S".to_string(), "H-Delay Stereo".to_string())];
         assert_eq!(installed_match("H-Delay", &both, true).as_deref(), Some("vst3:S"));
         assert_eq!(installed_match("H-Delay", &both, false).as_deref(), Some("vst3:M"));
+        let ff = vec![("vst3:Q3".to_string(), "Pro-Q 3".to_string()), ("vst3:Q4".to_string(), "Pro-Q 4".to_string()), ("vst3:L2".to_string(), "Pro-L 2".to_string())];
+        assert_eq!(installed_match("FabFilter Pro-Q 2", &ff, true).as_deref(), Some("vst3:Q4"), "newest version, vendor dropped");
+        assert_eq!(installed_match("FabFilter Pro-L", &ff, true).as_deref(), Some("vst3:L2"));
+        assert_eq!(installed_match("FabFilter Pro-MB", &ff, true), None);
     }
 
     #[test]
