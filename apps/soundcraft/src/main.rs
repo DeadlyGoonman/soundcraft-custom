@@ -57,9 +57,15 @@ impl eframe::App for App {
             open_path(&mut self.0, &p);
         }
         if self.0.quit_requested {
+            // Unloading plugins at exit can take seconds: hide the window first so it closes at once.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if ctx.input(|i| i.viewport().close_requested()) && dialogs::ask_to_save(&mut self.0, "app.quit", &serde_json::json!({})) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        } else if ctx.input(|i| i.viewport().close_requested()) {
+            if dialogs::ask_to_save(&mut self.0, "app.quit", &serde_json::json!({})) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
         }
         soundcraft_ui_egui::fit_window_to_screen(ctx);
         let (inner, maximized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().maximized.unwrap_or(false)));
@@ -93,6 +99,7 @@ impl eframe::App for App {
         self.0.guarded(|app| app.ui(ui));
     }
     fn on_exit(&mut self) {
+        let t = std::time::Instant::now();
         self.0.close_autosave();
         save_prefs(&self.0.ui);
         if let Some(logger) = self.1 {
@@ -100,8 +107,10 @@ impl eframe::App for App {
         }
         // The system Quit (⌘Q) ends the process from inside the event loop, so `run_native` never
         // returns: release the player's plugin instances and shut plugin hosting down here.
+        let before_plugins = t.elapsed();
         self.0.player = None;
         soundcraft_engine::shutdown_plugin_hosts();
+        log::info!("exit: autosave+prefs {before_plugins:?}, plugin teardown {:?}", t.elapsed() - before_plugins);
     }
 }
 
