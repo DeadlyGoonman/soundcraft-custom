@@ -68,6 +68,8 @@ pub struct Ptx {
     pub placements: Vec<PtxPlacement>,
     /// The playlist each track plays, in track order; the others are alternate takes.
     pub active: Vec<String>,
+    /// Each listed track's type, beside `active`: 2 aux, 5 master, else audio.
+    pub kinds: Vec<u8>,
     /// Plugins on tracks' inserts (only when `active` is known, which ties them to tracks).
     pub inserts: Vec<PtxInsert>,
 }
@@ -132,7 +134,10 @@ pub fn parse(b: &[u8]) -> Ptx {
             Some(PtxPlacement { playlist, clip, position })
         })
         .collect();
-    let active: Vec<String> = blocks(b, ACTIVE).into_iter().filter_map(|i| name_at(b, i + 13).map(|(n, _)| n)).collect();
+    // The byte before the name is the track type: 2 aux, 5 master, else audio.
+    let listed: Vec<(String, u8)> = blocks(b, ACTIVE).into_iter().filter_map(|i| Some((name_at(b, i + 13)?.0, *b.get(i + 12)?))).collect();
+    let kinds: Vec<u8> = listed.iter().map(|(_, k)| *k).collect();
+    let active: Vec<String> = listed.into_iter().map(|(n, _)| n).collect();
     let plugins: Vec<String> = blocks(b, PLUGIN).into_iter().filter_map(|i| name_at(b, i + 10).map(|(n, _)| n)).filter(|n| !n.is_empty()).collect();
     let owners: Vec<(usize, usize)> =
         blocks(b, TRACK_INSERTS).into_iter().filter_map(|i| Some((i, i.checked_add(7)?.checked_add(usize::try_from(uint(b, i + 3, 4)?).ok()?)?))).collect();
@@ -145,7 +150,7 @@ pub fn parse(b: &[u8]) -> Ptx {
             Some(PtxInsert { playlist: active.get(track)?.clone(), slot, plugin })
         })
         .collect();
-    Ptx { clips, placements, active, inserts }
+    Ptx { clips, placements, active, kinds, inserts }
 }
 
 /// The audio file a clip name comes from: `Beat-04.L` is a piece of `Beat.L`, `Take_12-01` of `Take_12`.
@@ -226,6 +231,23 @@ fn place_plugins(e: &mut Engine, inserts: &[PtxInsert], tracks: &HashMap<String,
     missing
 }
 
+/// For sessions that don't say which playlist each track plays: per family of takes (`VERSE`,
+/// `VERSE.01`, `VERSE.dup2.03`, `hk-2`...) the playlist with the most clips.
+fn best_per_family(placements: &[PtxPlacement]) -> std::collections::HashSet<&str> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for p in placements {
+        *counts.entry(p.playlist.as_str()).or_default() += 1;
+    }
+    let mut best: HashMap<String, (usize, &str)> = HashMap::new();
+    for (&pl, &n) in &counts {
+        let slot = best.entry(family(pl)).or_insert((0, pl));
+        if (n, pl) > *slot {
+            *slot = (n, pl);
+        }
+    }
+    best.values().map(|&(_, pl)| pl).collect()
+}
+
 /// A playlist's family: its name without take suffixes (`.01`, `.dup2`, `-2`), so the takes of
 /// one part group together.
 fn family(name: &str) -> String {
@@ -249,7 +271,7 @@ fn audio_file(dir: &Path, stem: &str) -> Option<PathBuf> {
 /// not find. A session starting at the usual 1-hour mark is moved to start at zero.
 pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     let ptx = parse(&decode(&read_file(path)?));
-    if ptx.placements.is_empty() {
+    if ptx.placements.is_empty() && ptx.active.is_empty() {
         return Err(EngineError::Io(format!("{path}: no audio clips found (only Pro Tools 10-style sessions are read)")));
     }
     let folder = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
@@ -261,9 +283,11 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     let mut tracks: HashMap<String, (TrackId, String)> = HashMap::new();
     let mut missing = Vec::new();
     let mut rate_set = false;
-    // Only the playlists tracks play, in track order (all of them when the session has no list).
+    // Which playlists load: the ones tracks play, in track order, when the session lists them;
+    // else one per family of takes. Unused takes are not loaded.
     let order: HashMap<&str, usize> = ptx.active.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
-    let mut placements: Vec<&PtxPlacement> = ptx.placements.iter().filter(|p| order.is_empty() || order.contains_key(p.playlist.as_str())).collect();
+    let chosen: std::collections::HashSet<&str> = if order.is_empty() { best_per_family(&ptx.placements) } else { order.keys().copied().collect() };
+    let mut placements: Vec<&PtxPlacement> = ptx.placements.iter().filter(|p| chosen.contains(p.playlist.as_str())).collect();
     placements.sort_by_key(|p| order.get(p.playlist.as_str()).copied().unwrap_or(usize::MAX));
     let first = placements.iter().map(|p| p.position).min().unwrap_or(0);
     let side_of = |p: &PtxPlacement| ptx.clips.get(p.clip).and_then(|c| c.name.rsplit_once('.')).map(|(_, s)| s).filter(|s| *s == "L" || *s == "R");
@@ -278,6 +302,22 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
             sides.iter().all(Option::is_some) && sides.contains(&Some("L")) && sides.contains(&Some("R"))
         })
         .collect();
+    // Every track the session lists, in order, clips or not (aux and effects returns too); the
+    // master is the session's own.
+    for (name, kind) in ptx.active.iter().zip(&ptx.kinds) {
+        let (kind, channels) = match kind {
+            5 => continue,
+            2 => (TrackKind::Aux, 2),
+            _ => (TrackKind::Audio, 1),
+        };
+        let names = if stereo.contains(name.as_str()) { vec![format!("{name} L"), format!("{name} R")] } else { vec![name.clone()] };
+        for track_name in names {
+            if let std::collections::hash_map::Entry::Vacant(slot) = tracks.entry(track_name) {
+                let id = s.add_track(kind, ChannelFormat::for_channels(channels), Some(slot.key()));
+                slot.insert((id, name.clone()));
+            }
+        }
+    }
     for p in placements {
         let Some(clip) = ptx.clips.get(p.clip) else { continue };
         let stem = file_stem(&clip.name);
@@ -318,30 +358,6 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
         let to = |v: u64| Samples::try_from(v).unwrap_or(Samples::MAX);
         let id = s.new_clip_id();
         crate::edit::place_clip(&mut s, track, Clip::audio(id, clip.name.clone(), src, to(clip.offset), to(p.position.saturating_sub(origin)), to(length)));
-    }
-    // Without the list of what each track plays, every playlist came in: per family of takes
-    // (`VERSE`, `VERSE.01`, `VERSE.dup2.03`, `hk-2`...) the one with the most clips keeps playing
-    // and the others are muted, so takes don't stack. They stay in the session to unmute.
-    if ptx.active.is_empty() {
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        for p in &ptx.placements {
-            *counts.entry(p.playlist.as_str()).or_default() += 1;
-        }
-        let mut best: HashMap<String, (usize, &str)> = HashMap::new();
-        for (&pl, &n) in &counts {
-            let slot = best.entry(family(pl)).or_insert((0, pl));
-            if (n, pl) > *slot {
-                *slot = (n, pl);
-            }
-        }
-        let playing: std::collections::HashSet<&str> = best.values().map(|&(_, pl)| pl).collect();
-        for (id, pl) in tracks.values() {
-            if !playing.contains(pl.as_str())
-                && let Some(t) = s.track_mut(*id)
-            {
-                t.mixer.mute = true;
-            }
-        }
     }
     s.folder = Some(folder);
     e.replace_session(s);
