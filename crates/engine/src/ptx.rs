@@ -20,6 +20,10 @@ const NAME: u16 = 0x1052;
 const PLACEMENT: u16 = 0x104f;
 /// One per track, in track order: the name of the playlist the track plays.
 const ACTIVE: u16 = 0x210b;
+/// The track list (rulers first), in track order.
+const TRACKS: u16 = 0x2619;
+/// Track-list entries that are rulers, not tracks.
+const RULERS: [&str; 5] = ["Tempo", "Meter", "Key Signature", "Chord Symbols", "Markers"];
 /// The plugins the session uses (named ones, in index order).
 const PLUGIN: u16 = 0x1017;
 /// One per track, in track order: its inserts.
@@ -47,6 +51,55 @@ pub struct PtxInsert {
 pub struct MissingPlugin {
     pub name: String,
     pub targets: Vec<(TrackId, Option<usize>)>,
+}
+
+/// How a session says which playlist each track plays, by the Pro Tools version that saved it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Era {
+    /// Pro Tools 2018 and later (or no version written but the list is there): a list of the
+    /// playlist each track plays, with the track type.
+    Modern,
+    /// Pro Tools 10 to 12: no such list, but tracks are named after the playlist they play.
+    Classic,
+    /// Neither: one take per family is loaded.
+    #[default]
+    Unknown,
+}
+
+impl Era {
+    pub fn label(self) -> &'static str {
+        match self {
+            Era::Modern => "modern",
+            Era::Classic => "classic",
+            Era::Unknown => "unknown",
+        }
+    }
+}
+
+/// The version Pro Tools wrote in the plain header (`10.3.9`, `12.5.2`, `2019.6.0`), if any.
+pub fn pt_version(b: &[u8]) -> Option<String> {
+    let head = b.get(..b.len().min(PLAIN))?;
+    let at = head.windows(9).position(|w| w == b"Pro Tools")?;
+    let tail = head.get(at..head.len().min(at + 96))?;
+    let text: String = tail.iter().map(|&c| if c.is_ascii_graphic() { char::from(c) } else { ' ' }).collect();
+    text.split_whitespace()
+        .find(|w| {
+            let parts: Vec<&str> = w.split('.').collect();
+            parts.len() >= 2 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+        })
+        .map(str::to_string)
+}
+
+/// The era for a version, falling back to what the session holds when the version is missing.
+pub fn era_of(version: Option<&str>, has_list: bool, has_tracks: bool) -> Era {
+    let major = version.and_then(|v| v.split('.').next()?.parse::<u32>().ok());
+    match major {
+        Some(m) if m >= 2018 && has_list => Era::Modern,
+        Some(10..=12) if has_tracks => Era::Classic,
+        _ if has_list => Era::Modern,
+        _ if has_tracks => Era::Classic,
+        _ => Era::Unknown,
+    }
 }
 
 /// A clip as the session defines it: a stretch of one audio file.
@@ -78,6 +131,10 @@ pub struct Ptx {
     pub kinds: Vec<u8>,
     /// Plugins on tracks' inserts (only when `active` is known, which ties them to tracks).
     pub inserts: Vec<PtxInsert>,
+    /// The Pro Tools version in the header, when written.
+    pub version: Option<String>,
+    /// How this session was read.
+    pub era: Era,
 }
 
 /// Undoes the session's XOR. Block 1's padding is mostly zeros, so its most common byte is the step.
@@ -140,8 +197,25 @@ pub fn parse(b: &[u8]) -> Ptx {
             Some(PtxPlacement { playlist, clip, position })
         })
         .collect();
-    // The byte before the name is the track type: 2 aux, 5 master, else audio.
-    let listed: Vec<(String, u8)> = blocks(b, ACTIVE).into_iter().filter_map(|i| Some((name_at(b, i + 13)?.0, *b.get(i + 12)?))).collect();
+    let version = pt_version(b);
+    let list_blocks = blocks(b, ACTIVE);
+    let era = era_of(version.as_deref(), !list_blocks.is_empty(), !blocks(b, TRACKS).is_empty());
+    // Modern: the byte before the name is the track type: 2 aux, 5 master, else audio.
+    let mut listed: Vec<(String, u8)> =
+        if era == Era::Modern { list_blocks.into_iter().filter_map(|i| Some((name_at(b, i + 13)?.0, *b.get(i + 12)?))).collect() } else { Vec::new() };
+    if listed.is_empty() && era != Era::Unknown {
+        // Older sessions have no such list, but their track list carries the names, and a Pro
+        // Tools track is named after the playlist it plays. The rulers come first; one insert
+        // container follows per track.
+        let count = blocks(b, TRACK_INSERTS).len();
+        listed = blocks(b, TRACKS)
+            .into_iter()
+            .filter_map(|i| name_at(b, i + 9).map(|(n, _)| n))
+            .filter(|n| !RULERS.contains(&n.as_str()))
+            .take(count)
+            .map(|n| (n, 0))
+            .collect();
+    }
     let kinds: Vec<u8> = listed.iter().map(|(_, k)| *k).collect();
     let active: Vec<String> = listed.into_iter().map(|(n, _)| n).collect();
     let plugins: Vec<String> = blocks(b, PLUGIN).into_iter().filter_map(|i| name_at(b, i + 10).map(|(n, _)| n)).filter(|n| !n.is_empty()).collect();
@@ -165,7 +239,7 @@ pub fn parse(b: &[u8]) -> Ptx {
             Some(PtxInsert { playlist: active.get(track)?.clone(), slot, plugin, state })
         })
         .collect();
-    Ptx { clips, placements, active, kinds, inserts }
+    Ptx { clips, placements, active, kinds, inserts, version, era }
 }
 
 /// The audio file a clip name comes from: `Beat-04.L` is a piece of `Beat.L`, `Take_12-01` of `Take_12`.
@@ -225,17 +299,17 @@ fn waves_state(template: &[u8], xml: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The settings to give `id` for a Pro Tools chunk: Waves XML rewrapped for VST3 (from a fresh
-/// instance's state, made once per plugin), else the chunk as it is.
-fn plugin_state(id: &str, chunk: &[u8], templates: &mut HashMap<String, Option<Vec<u8>>>) -> Vec<u8> {
-    if chunk.starts_with(b"<PresetChunkXMLTree") {
-        let template = templates
-            .entry(id.to_string())
-            .or_insert_with(|| soundcraft_mix::create_instance(id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state()));
-        if let Some(state) = template.as_deref().and_then(|t| waves_state(t, chunk)) {
-            return state;
-        }
+/// instance's state, made once per plugin). Other vendors get none and start from their
+/// defaults: handing a plugin data in a format it doesn't expect can crash it (Auto-Tune Pro
+/// does), so only verified conversions are passed on.
+fn plugin_state(id: &str, chunk: &[u8], templates: &mut HashMap<String, Option<Vec<u8>>>) -> Option<Vec<u8>> {
+    if !chunk.starts_with(b"<PresetChunkXMLTree") {
+        return None;
     }
-    chunk.to_vec()
+    let template = templates
+        .entry(id.to_string())
+        .or_insert_with(|| soundcraft_mix::create_instance(id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state()));
+    template.as_deref().and_then(|t| waves_state(t, chunk))
 }
 
 /// Installed VST3 and CLAP plugins as (id, name), from the hosts' saved scans.
@@ -273,7 +347,7 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
         let stereo = targets.first().and_then(|(t, _)| s.track(*t)).is_some_and(|t| t.format.channels() >= 2);
         match installed_match(&ins.plugin, &installed, stereo) {
             Some(id) => {
-                let state = ins.state.as_deref().map(|c| plugin_state(&id, c, &mut templates));
+                let state = ins.state.as_deref().and_then(|c| plugin_state(&id, c, &mut templates));
                 for (track, slot) in targets {
                     let Some(t) = s.track_mut(track) else { continue };
                     let slots = &mut t.mixer.inserts;
@@ -349,7 +423,10 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     // Which playlists load: the ones tracks play, in track order, when the session lists them;
     // else one per family of takes. Unused takes are not loaded.
     let order: HashMap<&str, usize> = ptx.active.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
-    let chosen: std::collections::HashSet<&str> = if order.is_empty() { best_per_family(&ptx.placements) } else { order.keys().copied().collect() };
+    // When no track is named after a playlist with clips (a renamed session), fall back to the
+    // best take per family.
+    let named_play = ptx.placements.iter().any(|p| order.contains_key(p.playlist.as_str()));
+    let chosen: std::collections::HashSet<&str> = if named_play { order.keys().copied().collect() } else { best_per_family(&ptx.placements) };
     let mut placements: Vec<&PtxPlacement> = ptx.placements.iter().filter(|p| chosen.contains(p.playlist.as_str())).collect();
     placements.sort_by_key(|p| order.get(p.playlist.as_str()).copied().unwrap_or(usize::MAX));
     let first = placements.iter().map(|p| p.position).min().unwrap_or(0);
@@ -427,6 +504,7 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     e.replace_session(s);
     e.path = None;
     e.missing_plugins = missing_plugins;
+    e.message(format!("Pro Tools {} session, read with the {} layout", ptx.version.as_deref().unwrap_or("(version not written)"), ptx.era.label()));
     for m in &missing {
         e.message(format!("missing media: {m}"));
     }
@@ -459,6 +537,20 @@ mod tests {
         let both = vec![("vst3:M".to_string(), "H-Delay Mono".to_string()), ("vst3:S".to_string(), "H-Delay Stereo".to_string())];
         assert_eq!(installed_match("H-Delay", &both, true).as_deref(), Some("vst3:S"));
         assert_eq!(installed_match("H-Delay", &both, false).as_deref(), Some("vst3:M"));
+    }
+
+    #[test]
+    fn the_version_picks_how_a_session_is_read() {
+        let mut head = vec![0u8; 64];
+        head.extend_from_slice(b"Pro Tools HD\0\0\x0310.3.9\0Release");
+        assert_eq!(pt_version(&head).as_deref(), Some("10.3.9"));
+        assert_eq!(pt_version(b"no version here"), None);
+        assert_eq!(era_of(Some("10.3.9"), false, true), Era::Classic);
+        assert_eq!(era_of(Some("12.5.2"), false, true), Era::Classic);
+        assert_eq!(era_of(Some("2019.6.0"), true, true), Era::Modern);
+        assert_eq!(era_of(None, true, true), Era::Modern);
+        assert_eq!(era_of(None, false, true), Era::Classic);
+        assert_eq!(era_of(None, false, false), Era::Unknown);
     }
 
     #[test]
