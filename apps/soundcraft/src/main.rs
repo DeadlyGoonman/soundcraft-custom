@@ -322,6 +322,10 @@ fn main() -> eframe::Result {
             app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
             app.extra.ui_scale = prefs.ui_scale;
             app.extra.plugin_scanner = plugin_scanner();
+            // Runs without preferences (tests, agents) make no network calls.
+            if prefs_enabled() {
+                app.extra.update = soundcraft_ui_egui::extra_windows::update::UpdateChecker::start();
+            }
             app.ui = prefs;
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());

@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use soundcraft_model::{Speaker, TrackKind};
 
 pub mod plugin_scanner;
+pub mod update;
 
 /// How often an auto-updating configuration is refreshed (seconds).
 const AUTO_UPDATE_SECS: f64 = 2.0;
@@ -27,6 +28,8 @@ pub struct ExtraState {
     applied: Option<(f32, bool)>,
     /// Setup › Plugin Scanner (the saved plugin scan and background scans).
     pub plugin_scanner: plugin_scanner::PluginScanner,
+    /// The update check at launch and the update dialog (see `update`).
+    pub update: update::UpdateChecker,
 }
 
 impl Default for ExtraState {
@@ -43,6 +46,7 @@ impl Default for ExtraState {
             last_auto_update: 0.0,
             applied: None,
             plugin_scanner: plugin_scanner::PluginScanner::default(),
+            update: update::UpdateChecker::default(),
         }
     }
 }
@@ -69,6 +73,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     apply_customization(app, ctx);
     crate::preferences::show(app, ctx);
     plugin_scanner::window(app, ctx);
+    update::window(app, ctx);
 }
 
 fn apply_customization(app: &mut SoundApp, ctx: &egui::Context) {

@@ -34,6 +34,8 @@ thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 log = "0.4"
+# The update check and installer download (blocking, rustls).
+ureq = "2"
 rayon = "1"
 proptest = "1"
 
