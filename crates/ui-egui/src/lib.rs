@@ -417,6 +417,8 @@ pub struct SoundApp {
     /// When Record last found nothing to record on, and why: the Record buttons show it for a moment.
     record_hint: Option<(f64, &'static str)>,
     pub quit_requested: bool,
+    /// Set when a different session takes over: the next frame clears the old one's view state.
+    reset_view: bool,
     /// Copy or Cut ran: put a note on the system clipboard, without which egui-winit sends no
     /// Paste event for Cmd/Ctrl+V.
     pub claim_clipboard: bool,
@@ -507,6 +509,7 @@ impl SoundApp {
             sim: None,
             record_hint: None,
             quit_requested: false,
+            reset_view: false,
             claim_clipboard: false,
             arrange_request: false,
             touched: std::collections::HashSet::new(),
@@ -1335,7 +1338,11 @@ impl SoundApp {
                     self.gesture = None;
                     self.touched.clear();
                     self.last_write_at = i64::MIN;
-                    self.edit_layout.follow_hold = false;
+                    // A clean view: scroll, zoom-back and layout of the old session don't carry
+                    // over, nor do its open plugin windows.
+                    self.edit_layout = edit_window::EditLayout::default();
+                    self.ui.plugin_windows.clear();
+                    self.reset_view = true;
                     self.meters.clear();
                     self.main_meter = MeterDisplay::default();
                 }
@@ -1580,6 +1587,10 @@ impl SoundApp {
         video_window::show(self, &ctx);
         ops_windows::show(self, &ctx);
         extra_windows::show(self, &ctx);
+        if std::mem::take(&mut self.reset_view) {
+            // A different session: scroll offsets and per-view state of the old one go too.
+            ctx.memory_mut(|m| m.data.clear());
+        }
         recovery::show(self, &ctx);
         score_editor::show(self, &ctx);
         palette::show(self, &ctx);

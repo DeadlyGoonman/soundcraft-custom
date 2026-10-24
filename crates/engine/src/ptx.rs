@@ -218,24 +218,41 @@ pub fn parse(b: &[u8]) -> Ptx {
     }
     let kinds: Vec<u8> = listed.iter().map(|(_, k)| *k).collect();
     let active: Vec<String> = listed.into_iter().map(|(n, _)| n).collect();
-    let plugins: Vec<String> = blocks(b, PLUGIN).into_iter().filter_map(|i| name_at(b, i + 10).map(|(n, _)| n)).filter(|n| !n.is_empty()).collect();
+    // Each named plugin with its ids (manufacturer, product, plugin: 4 bytes each after the name).
+    let plugins: Vec<(String, Vec<u8>)> = blocks(b, PLUGIN)
+        .into_iter()
+        .filter_map(|i| {
+            let (n, end) = name_at(b, i + 10)?;
+            Some((n, b.get(end..end + 12)?.to_vec()))
+        })
+        .filter(|(n, _)| !n.is_empty())
+        .collect();
     let owners: Vec<(usize, usize)> =
         blocks(b, TRACK_INSERTS).into_iter().filter_map(|i| Some((i, i.checked_add(7)?.checked_add(usize::try_from(uint(b, i + 3, 4)?).ok()?)?))).collect();
     let chunks = blocks(b, CHUNK);
     let inserts = blocks(b, INSERT)
         .into_iter()
         .filter_map(|s| {
-            let plugin = plugins.get(usize::try_from(uint(b, s + 18, 2)?).ok()?)?.clone();
             let slot = uint(b, s + 29, 2).and_then(|v| usize::try_from(v).ok()).filter(|&v| v < 10);
             let track = owners.iter().position(|&(start, end)| start < s && s < end)?;
             let end = s.checked_add(7)?.checked_add(usize::try_from(uint(b, s + 3, 4)?).ok()?)?;
-            let state = chunks.iter().find(|&&k| s < k && k < end).and_then(|&k| {
+            let chunk = chunks.iter().find(|&&k| s < k && k < end).and_then(|&k| {
                 let n = usize::try_from(uint(b, k + 13, 4)?).ok()?;
-                // Past Pro Tools' 56-byte chunk header (size, version, four ids, a 32-byte name)
-                // is the plugin's own data, which is what its VST3 / CLAP version reads.
-                let chunk = b.get(k + 17..k.checked_add(17)?.checked_add(n)?)?;
-                Some(chunk.get(AAX_HEADER..).unwrap_or(chunk).to_vec()).filter(|c| !c.is_empty())
+                b.get(k + 17..k.checked_add(17)?.checked_add(n)?)
             });
+            // The chunk names its plugin by the same ids as the plugin list, each 4 bytes reversed:
+            // exact, where the insert's plugin index isn't in older sessions.
+            let by_ids = chunk.and_then(|c| c.get(8..20)).and_then(|ids| {
+                let key: Vec<u8> = ids.chunks(4).flat_map(|w| w.iter().rev().copied()).collect();
+                plugins.iter().find(|(_, p)| *p == key).map(|(n, _)| n.clone())
+            });
+            let plugin = match by_ids {
+                Some(n) => n,
+                None => plugins.get(usize::try_from(uint(b, s + 18, 2)?).ok()?)?.0.clone(),
+            };
+            // Past Pro Tools' 56-byte chunk header (size, version, four ids, a 32-byte name) is the
+            // plugin's own data, which is what its VST3 / CLAP version reads.
+            let state = chunk.map(|c| c.get(AAX_HEADER..).unwrap_or(c).to_vec()).filter(|c| !c.is_empty());
             Some(PtxInsert { playlist: active.get(track)?.clone(), slot, plugin, state })
         })
         .collect();
@@ -275,26 +292,33 @@ pub fn installed_match(name: &str, installed: &[(String, String)], stereo: bool)
     matches.iter().find(|(_, n)| squash(n).ends_with(fits)).or(matches.first()).map(|(id, _)| id.clone())
 }
 
-/// Waves keeps the same preset XML in its AAX and VST3 versions; the VST3 state wraps it in a
-/// 36-byte header (three fields of which count the XML: little-endian at 4, big-endian at 8 and
-/// 28) and a trailer. `template` is a fresh instance's state, giving both.
+/// Waves keeps the same preset XML in its AAX and VST3 versions. `template` is a fresh
+/// instance's state in SoundCraft's VST3 container ("SCV3", u32 LE length + component state,
+/// u32 LE length + controller state). Its component state is Waves' 28-byte header (big-endian
+/// lengths at 0 and 20 count what follows), the preset XML, then a trailer: the session's XML
+/// goes in its place. The controller part is left empty, so the editor takes its settings from
+/// the component (`setComponentState`) rather than from a fresh instance's controller.
 fn waves_state(template: &[u8], xml: &[u8]) -> Option<Vec<u8>> {
     const END: &[u8] = b"</PresetChunkXMLTree>";
+    const HEADER: usize = 28;
     let end_of = |b: &[u8]| b.windows(END.len()).position(|w| w == END).map(|p| p + END.len());
-    if !template.starts_with(b"SCV3") || template.len() < 36 {
-        return None;
+    let rest = template.strip_prefix(b"SCV3")?;
+    let n = usize::try_from(u32::from_le_bytes(rest.get(..4)?.try_into().ok()?)).ok()?;
+    let comp = rest.get(4..4usize.checked_add(n)?)?;
+    let (fresh_end, xml_end) = (end_of(comp)?, end_of(xml)?);
+    let delta = i64::try_from(xml_end).ok()? - i64::try_from(fresh_end.checked_sub(HEADER)?).ok()?;
+    let mut c = comp.get(..HEADER)?.to_vec();
+    for at in [0, 20] {
+        let field: [u8; 4] = c.get(at..at + 4)?.try_into().ok()?;
+        let v = u32::try_from(i64::from(u32::from_be_bytes(field)) + delta).ok()?;
+        c.get_mut(at..at + 4)?.copy_from_slice(&v.to_be_bytes());
     }
-    let (fresh_end, xml_end) = (end_of(template)?, end_of(xml)?);
-    let delta = i64::try_from(xml_end).ok()? - i64::try_from(fresh_end.checked_sub(36)?).ok()?;
-    let mut out = template.get(..36)?.to_vec();
-    for (at, big) in [(4, false), (8, true), (28, true)] {
-        let field: [u8; 4] = out.get(at..at + 4)?.try_into().ok()?;
-        let v = if big { u32::from_be_bytes(field) } else { u32::from_le_bytes(field) };
-        let v = u32::try_from(i64::from(v) + delta).ok()?;
-        out.get_mut(at..at + 4)?.copy_from_slice(&if big { v.to_be_bytes() } else { v.to_le_bytes() });
-    }
-    out.extend_from_slice(xml.get(..xml_end)?);
-    out.extend_from_slice(template.get(fresh_end..)?);
+    c.extend_from_slice(xml.get(..xml_end)?);
+    c.extend_from_slice(comp.get(fresh_end..)?);
+    let mut out = b"SCV3".to_vec();
+    out.extend_from_slice(&u32::try_from(c.len()).ok()?.to_le_bytes());
+    out.extend_from_slice(&c);
+    out.extend_from_slice(&0u32.to_le_bytes());
     Some(out)
 }
 

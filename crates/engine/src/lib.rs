@@ -213,6 +213,8 @@ impl Engine {
         self.undo.clear();
         self.redo.clear();
         self.last_selection = None;
+        // An import's missing plugins belong to its session (the import sets them after this).
+        self.missing_plugins.clear();
         self.revision = self.revision.wrapping_add(1);
         self.dirty = false;
     }
