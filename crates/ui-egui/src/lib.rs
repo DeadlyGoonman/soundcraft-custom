@@ -722,7 +722,7 @@ impl SoundApp {
             .iter()
             .map(|(track, inputs, path)| soundcraft_engine::io::Take { track: *track, path: path.clone(), channels: inputs.len() })
             .collect();
-        r.arm(plan)?;
+        r.arm(plan, self.ui.audio.record_depth)?;
         Ok(takes)
     }
 

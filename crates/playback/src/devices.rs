@@ -35,6 +35,29 @@ pub struct AudioConfig {
     /// Render every track on one thread instead of sharing them out to the worker pool. Off by
     /// default (the pool is faster on big sessions); on avoids cross-thread waits at tiny buffers.
     pub serial_mixing: bool,
+    /// The sample format new recordings are written in (WAV).
+    pub record_depth: RecordDepth,
+}
+
+/// The sample format of a recording (always a WAV file).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RecordDepth {
+    Int16,
+    Int24,
+    /// 32-bit float: no clipping or rounding while recording, and the default.
+    #[default]
+    Float32,
+}
+
+impl RecordDepth {
+    /// The bits per sample of the recording (32 for float).
+    pub fn bits(self) -> u16 {
+        match self {
+            RecordDepth::Int16 => 16,
+            RecordDepth::Int24 => 24,
+            RecordDepth::Float32 => 32,
+        }
+    }
 }
 
 /// One device as the settings window lists it.
@@ -234,6 +257,7 @@ mod tests {
             sample_rate: Some(48_000),
             buffer_size: Some(256),
             serial_mixing: true,
+            record_depth: RecordDepth::Int24,
         };
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<AudioConfig>(&s).unwrap(), c);

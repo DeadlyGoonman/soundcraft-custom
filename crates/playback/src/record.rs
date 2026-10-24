@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::devices::RecordDepth;
 use soundcraft_model::TrackId;
 
 /// What [`Recorder::finish`] returns: the takes that hold audio and the first problem met.
@@ -82,6 +83,17 @@ impl CaptureRing {
 /// An input sample, or silence for NaN and infinities, which would poison the take and the mix.
 fn finite(x: f32) -> f32 {
     if x.is_finite() { x } else { 0.0 }
+}
+
+/// Appends one sample in the recording's format (little-endian): float as it is, integers rounded
+/// and clipped to full scale.
+fn push_sample(out: &mut Vec<u8>, x: f32, depth: RecordDepth) {
+    let x = finite(x);
+    match depth {
+        RecordDepth::Float32 => out.extend_from_slice(&x.to_le_bytes()),
+        RecordDepth::Int16 => out.extend_from_slice(&((x.clamp(-1.0, 1.0) * 32_767.0).round() as i16).to_le_bytes()),
+        RecordDepth::Int24 => out.extend_from_slice(&((x.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32).to_le_bytes()[..3]),
+    }
 }
 
 struct Shared {
@@ -338,12 +350,14 @@ impl Recorder {
 
     /// Create each take's file and start recording into them: a track's take records the given
     /// input channels into a new file.
-    pub fn arm(&mut self, takes: Vec<(TrackId, Vec<usize>, PathBuf)>) -> Result<(), String> {
+    pub fn arm(&mut self, takes: Vec<(TrackId, Vec<usize>, PathBuf)>, depth: RecordDepth) -> Result<(), String> {
         if self.writer.is_some() {
             return Err("already recording".into());
         }
-        let takes =
-            takes.into_iter().map(|(id, inputs, path)| TakeWriter::create(id, inputs, path, self.sample_rate)).collect::<Result<Vec<_>, _>>()?;
+        let takes = takes
+            .into_iter()
+            .map(|(id, inputs, path)| TakeWriter::create(id, inputs, path, self.sample_rate, depth))
+            .collect::<Result<Vec<_>, _>>()?;
         let live = takes.iter().map(|t| (t.id, Arc::clone(&t.live))).collect();
         let ring = &self.shared.ring;
         ring.tail.store(ring.head.load(Ordering::Acquire), Ordering::Release);
@@ -457,17 +471,18 @@ struct TakeWriter {
     path: PathBuf,
     file: File,
     rate: u32,
+    depth: RecordDepth,
     frames: u64,
     error: Option<String>,
     live: Arc<Mutex<LiveTake>>,
 }
 
 impl TakeWriter {
-    fn create(id: TrackId, inputs: Vec<usize>, path: PathBuf, rate: u32) -> Result<TakeWriter, String> {
+    fn create(id: TrackId, inputs: Vec<usize>, path: PathBuf, rate: u32, depth: RecordDepth) -> Result<TakeWriter, String> {
         let file = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| File::create_new(&path));
         let file = file.map_err(|e| format!("{}: {e}", path.display()))?;
         let live = Arc::new(Mutex::new(vec![Vec::new(); inputs.len()]));
-        let mut take = TakeWriter { id, inputs, path, file, rate, frames: 0, error: None, live };
+        let mut take = TakeWriter { id, inputs, path, file, rate, depth, frames: 0, error: None, live };
         take.write_header();
         take.error.take().map_or(Ok(take), Err)
     }
@@ -478,10 +493,12 @@ impl TakeWriter {
         if self.error.is_some() {
             return;
         }
-        let bytes: Vec<u8> = block
-            .chunks_exact(channels)
-            .flat_map(|f| self.inputs.iter().flat_map(move |&i| f.get(i).copied().unwrap_or(0.0).to_le_bytes()))
-            .collect();
+        let mut bytes = Vec::with_capacity(block.len() / channels * self.inputs.len() * 4);
+        for f in block.chunks_exact(channels) {
+            for &i in &self.inputs {
+                push_sample(&mut bytes, f.get(i).copied().unwrap_or(0.0), self.depth);
+            }
+        }
         match self.file.write_all(&bytes) {
             Ok(()) => {
                 self.summarize(block, channels);
@@ -508,7 +525,12 @@ impl TakeWriter {
     }
 
     fn write_header(&mut self) {
-        let header = match soundcraft_audio_io::wav_float_header(self.inputs.len(), self.rate, self.frames) {
+        let channels = self.inputs.len();
+        let header = match self.depth {
+            RecordDepth::Float32 => soundcraft_audio_io::wav_float_header(channels, self.rate, self.frames),
+            depth => soundcraft_audio_io::wav_pcm_header(channels, self.rate, depth.bits(), self.frames),
+        };
+        let header = match header {
             Ok(h) => h,
             Err(e) => return self.fail(e),
         };
@@ -595,7 +617,7 @@ mod tests {
     fn a_failed_write_is_trouble_while_still_recording() {
         let dir = std::env::temp_dir().join(format!("soundcraft-failed-take-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut take = TakeWriter::create(TrackId(1), vec![0], dir.join("Vox_01.wav"), 48_000).unwrap();
+        let mut take = TakeWriter::create(TrackId(1), vec![0], dir.join("Vox_01.wav"), 48_000, RecordDepth::Float32).unwrap();
         take.file = File::open(&take.path).unwrap();
         let shared = Arc::new(Shared::new(CaptureRing::new(1 << 12)));
         shared.armed.store(true, Ordering::Release);
@@ -618,9 +640,9 @@ mod tests {
     fn takes_stream_into_their_files() {
         let dir = std::env::temp_dir().join(format!("soundcraft-takes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let gtr = TakeWriter::create(TrackId(1), vec![1, 2], dir.join("Gtr_01.wav"), 48_000).unwrap();
-        let mut vox = TakeWriter::create(TrackId(2), vec![0], dir.join("Vox_01.wav"), 48_000).unwrap();
-        assert!(TakeWriter::create(TrackId(3), vec![0], dir.join("Vox_01.wav"), 48_000).is_err(), "never overwrites a file");
+        let gtr = TakeWriter::create(TrackId(1), vec![1, 2], dir.join("Gtr_01.wav"), 48_000, RecordDepth::Float32).unwrap();
+        let mut vox = TakeWriter::create(TrackId(2), vec![0], dir.join("Vox_01.wav"), 48_000, RecordDepth::Float32).unwrap();
+        assert!(TakeWriter::create(TrackId(3), vec![0], dir.join("Vox_01.wav"), 48_000, RecordDepth::Float32).is_err(), "never overwrites a file");
         vox.write(&[0.5; 300], 3);
         vox.write_header();
         vox.write(&[0.25; 150], 3);
@@ -682,7 +704,7 @@ mod tests {
     fn a_take_sums_itself_up_for_drawing_while_it_records() {
         let dir = std::env::temp_dir().join(format!("soundcraft-live-take-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut take = TakeWriter::create(TrackId(4), vec![2, 0], dir.join("Gtr_01.wav"), 48_000).unwrap();
+        let mut take = TakeWriter::create(TrackId(4), vec![2, 0], dir.join("Gtr_01.wav"), 48_000, RecordDepth::Float32).unwrap();
         let input: Vec<f32> = (0..300).flat_map(|f| [f as f32, -1.0, -(f as f32)]).collect();
         take.write(&input[..3 * 100], 3);
         take.write(&input[3 * 100..], 3);
@@ -862,5 +884,31 @@ mod ring_tests {
         let mut out = vec![vec![1.0f32; 4]];
         ring.pop_into(&mut out, 4, 48_000);
         assert_eq!(out[0], [0.5, 0.0, 0.0, -0.5]);
+    }
+}
+
+#[cfg(test)]
+mod pcm_tests {
+    use super::*;
+
+    #[test]
+    fn a_16_or_24_bit_take_is_a_readable_wav_with_clipped_samples() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-pcm-take-{}", std::process::id()));
+        for depth in [RecordDepth::Int16, RecordDepth::Int24] {
+            let path = dir.join(format!("take-{}.wav", depth.bits()));
+            let mut take = TakeWriter::create(TrackId(1), vec![0], path.clone(), 48_000, depth).unwrap();
+            take.write(&[0.5, -2.0, f32::NAN], 1);
+            take.write_header();
+            assert!(take.error.is_none(), "{:?}", take.error);
+            let bytes = std::fs::read(&path).unwrap();
+            let (info, buf) = soundcraft_audio_io::decode(&bytes, None).unwrap();
+            assert_eq!(info.frames, 3, "{depth:?}");
+            let got = &buf.channels[0];
+            let tol = if depth == RecordDepth::Int16 { 1e-3 } else { 1e-5 };
+            for (g, w) in got.iter().zip([0.5f32, -1.0, 0.0]) {
+                assert!((g - w).abs() < tol, "{depth:?}: {got:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

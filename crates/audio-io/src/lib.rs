@@ -402,3 +402,15 @@ pub fn wav_float_header(channels: usize, sample_rate: u32, frames: u64) -> Resul
     }
     wav::header(channels, sample_rate, (32, true), None, None, frames, false, None)
 }
+
+/// The header of a PCM WAV of 16 or 24 bits holding `frames` frames, as [`wav_float_header`] is
+/// (the same length whatever `frames`, so a recorder can rewrite it as the file grows).
+pub fn wav_pcm_header(channels: usize, sample_rate: u32, bits: u16, frames: u64) -> Result<Vec<u8>> {
+    if channels == 0 || sample_rate == 0 {
+        return Err(AudioError::Encode("a WAV needs channels and a sample rate".into()));
+    }
+    if bits != 16 && bits != 24 {
+        return Err(AudioError::Unsupported(format!("PCM WAV recording supports 16 or 24 bits, not {bits}")));
+    }
+    wav::header(channels, sample_rate, (bits, false), None, None, frames, false, None)
+}

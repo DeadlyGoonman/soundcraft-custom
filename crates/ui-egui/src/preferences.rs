@@ -8,6 +8,7 @@ use crate::{Services, SoundApp};
 use egui::vec2;
 use serde_json::json;
 use soundcraft_engine::plugin_scan::Format;
+use soundcraft_playback::devices::RecordDepth;
 use std::path::Path;
 
 /// The preferences kept in `ui.json` under `preferences` (serde defaults, so older files load).
@@ -196,6 +197,15 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     app.ui.preferences.show = open;
 }
 
+/// The recording format as the preferences list it.
+fn record_label(depth: RecordDepth) -> &'static str {
+    match depth {
+        RecordDepth::Int16 => "WAV 16-bit",
+        RecordDepth::Int24 => "WAV 24-bit",
+        RecordDepth::Float32 => "WAV 32-bit float",
+    }
+}
+
 fn note(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).small().color(crate::theme::Tokens::current().text_dim));
 }
@@ -231,6 +241,16 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
                 app.ui.audio.serial_mixing = !cores;
                 soundcraft_mix::set_serial_strips(!cores);
             }
+            ui.horizontal(|ui| {
+                ui.label("Recording format");
+                let depth = &mut app.ui.audio.record_depth;
+                egui::ComboBox::from_id_salt("prefs_record_depth").selected_text(record_label(*depth)).show_ui(ui, |ui| {
+                    for d in [RecordDepth::Int16, RecordDepth::Int24, RecordDepth::Float32] {
+                        ui.selectable_value(depth, d, record_label(d));
+                    }
+                });
+            });
+            note(ui, "Recordings are WAV files. 32-bit float keeps every level above full scale; 16 and 24-bit are smaller but clip above full scale.");
             open_button(app, ui, "Open Playback Engine…", "window.playback_engine");
             open_button(app, ui, "Open I/O Setup…", "window.io_setup");
         }
