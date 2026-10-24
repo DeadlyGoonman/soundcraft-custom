@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
-use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorScale};
+use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorScale, EditorScaleMode};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
@@ -30,11 +30,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyMenu, DestroyWindow, GA_ROOTOWNER, GW_HWNDNEXT,
     GWL_EXSTYLE, GWLP_USERDATA, GetAncestor, GetClassNameW, GetClientRect, GetForegroundWindow, GetParent, GetSystemMenu, GetWindow,
     GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, MF_BYCOMMAND,
-    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MINMAXINFO, MoveWindow, RegisterClassW, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT, WM_SIZE, WM_SIZING, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
+    MF_CHECKED, MF_STRING, MINMAXINFO, MoveWindow, RegisterClassW, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE,
+    WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT, WM_SIZE, WM_SIZING, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -547,7 +547,7 @@ fn frame_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT
             let body = client_size(hwnd.0)?;
             let factor = header::snap_factor((body.0 / native.0) as f32);
             let mut s = f.state.get();
-            let new = EditorScale { factor, mode: s.scale.mode };
+            let new = EditorScale { factor, mode: EditorScaleMode::Auto };
             resize(hwnd.0, (native.0 * f64::from(factor)).round(), (native.1 * f64::from(factor)).round());
             if new != s.scale {
                 s.scale = new;
@@ -690,7 +690,7 @@ fn click_header(hwnd: HWND, x: i32, y: i32) {
             let Some(c) = scale_menu(hwnd, &s, POINT { x: l.scale.left, y: l.scale.bottom }) else { return };
             // The menu ran a modal loop: start from the state as it is now.
             s = f.state.get();
-            let new = header::apply_choice(s.scale, c);
+            let new = header::apply_choice(c);
             if new == s.scale {
                 return;
             }
@@ -723,16 +723,7 @@ fn scale_menu(hwnd: HWND, s: &EditorHeaderState, at: POINT) -> Option<header::Me
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         for item in header::menu_items(s) {
-            if item.separator {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            }
-            let mut flags = MF_STRING;
-            if item.checked {
-                flags |= MF_CHECKED;
-            }
-            if !item.enabled {
-                flags |= MF_GRAYED;
-            }
+            let flags = if item.checked { MF_STRING | MF_CHECKED } else { MF_STRING };
             let label = HSTRING::from(item.label.as_str());
             let _ = AppendMenuW(menu, flags, item.id as usize, &label);
         }

@@ -1,7 +1,7 @@
 //! The header strip on top of every plugin editor window: platform-free layout, hit testing, the
 //! scale menu and frame-drag helpers. The Win32 window that draws it lives in `frame`.
 
-use soundcraft_dsp::{EditorHeaderState, EditorScale, EditorScaleMode, UpscaleFilter};
+use soundcraft_dsp::{EditorHeaderState, EditorScale, EditorScaleMode};
 
 /// Header height at 96 dpi, in pixels.
 pub const HEADER_DIP: i32 = 28;
@@ -86,48 +86,26 @@ pub fn scale_label(scale: EditorScale) -> String {
     format!("{}% \u{25BE}", (scale.clamped_factor() * 100.0).round() as u32)
 }
 
-/// One choice of the scale menu.
+/// One choice of the scale menu: a size. There is no mode to pick: an editor scales natively
+/// when the plugin can, otherwise the FSR 1 upscaler stretches it ([`crate::plan`] with `Auto`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MenuChoice {
     Percent(u32),
-    Mode(EditorScaleMode),
 }
 
-/// The modes offered (NIS is not: it falls back to FSR 1).
-pub const MODES: [(EditorScaleMode, &str); 4] = [
-    (EditorScaleMode::Auto, "Auto (native, else FSR 1)"),
-    (EditorScaleMode::Native, "Native (plugin draws)"),
-    (EditorScaleMode::Upscale(UpscaleFilter::Fsr1), "Upscale: FSR 1"),
-    (EditorScaleMode::Upscale(UpscaleFilter::Bilinear), "Upscale: Bilinear"),
-];
-
-const MODE_BASE: u32 = 1;
 const PERCENT_BASE: u32 = 1000;
 
 /// The Win32 menu command id of a choice (never 0).
 pub fn menu_id(c: MenuChoice) -> u32 {
     match c {
         MenuChoice::Percent(p) => PERCENT_BASE + p,
-        MenuChoice::Mode(m) => MODE_BASE + MODES.iter().position(|(x, _)| *x == shown_mode(m)).unwrap_or(0) as u32,
     }
 }
 
 /// The choice behind a menu command id.
 pub fn menu_choice(id: u32) -> Option<MenuChoice> {
-    if id > PERCENT_BASE {
-        let p = id - PERCENT_BASE;
-        return PRESETS.contains(&p).then_some(MenuChoice::Percent(p));
-    }
-    let i = id.checked_sub(MODE_BASE)? as usize;
-    MODES.get(i).map(|(m, _)| MenuChoice::Mode(*m))
-}
-
-/// NIS shows as FSR 1 (what it falls back to).
-fn shown_mode(m: EditorScaleMode) -> EditorScaleMode {
-    match m {
-        EditorScaleMode::Upscale(UpscaleFilter::Nis) => EditorScaleMode::Upscale(UpscaleFilter::Fsr1),
-        m => m,
-    }
+    let p = id.checked_sub(PERCENT_BASE)?;
+    PRESETS.contains(&p).then_some(MenuChoice::Percent(p))
 }
 
 /// One entry of the scale menu.
@@ -136,36 +114,18 @@ pub struct MenuItem {
     pub id: u32,
     pub label: String,
     pub checked: bool,
-    pub enabled: bool,
-    /// Draw a separator above this entry.
-    pub separator: bool,
 }
 
-/// The scale menu for the header state: the presets (current one checked), then the modes.
+/// The scale menu for the header state: the size presets, the current one checked.
 pub fn menu_items(s: &EditorHeaderState) -> Vec<MenuItem> {
     let cur = (s.scale.clamped_factor() * 100.0).round() as u32;
-    let mut out: Vec<MenuItem> = PRESETS
-        .iter()
-        .map(|&p| MenuItem { id: menu_id(MenuChoice::Percent(p)), label: format!("{p}%"), checked: p == cur, enabled: true, separator: false })
-        .collect();
-    let mode = shown_mode(s.scale.mode);
-    for (i, (m, label)) in MODES.iter().enumerate() {
-        out.push(MenuItem {
-            id: menu_id(MenuChoice::Mode(*m)),
-            label: (*label).to_string(),
-            checked: *m == mode,
-            enabled: *m != EditorScaleMode::Native || s.native_scaling,
-            separator: i == 0,
-        });
-    }
-    out
+    PRESETS.iter().map(|&p| MenuItem { id: menu_id(MenuChoice::Percent(p)), label: format!("{p}%"), checked: p == cur }).collect()
 }
 
-/// The scale after picking `c` with `cur` in effect.
-pub fn apply_choice(cur: EditorScale, c: MenuChoice) -> EditorScale {
+/// The scale after picking `c`: always `Auto` (native first, else FSR 1).
+pub fn apply_choice(c: MenuChoice) -> EditorScale {
     match c {
-        MenuChoice::Percent(p) => EditorScale { factor: p as f32 / 100.0, mode: cur.mode },
-        MenuChoice::Mode(mode) => EditorScale { factor: cur.clamped_factor(), mode },
+        MenuChoice::Percent(p) => EditorScale { factor: p as f32 / 100.0, mode: EditorScaleMode::Auto },
     }
 }
 
@@ -220,6 +180,7 @@ pub fn locked_body(native: (f64, f64), want: (f64, f64), edge: Edge, min: f64, m
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soundcraft_dsp::UpscaleFilter;
 
     #[test]
     fn layout_scales_with_dpi_and_stays_inside() {
@@ -257,32 +218,26 @@ mod tests {
         for p in PRESETS {
             assert_eq!(menu_choice(menu_id(MenuChoice::Percent(p))), Some(MenuChoice::Percent(p)));
         }
-        for (m, _) in MODES {
-            assert_eq!(menu_choice(menu_id(MenuChoice::Mode(m))), Some(MenuChoice::Mode(m)));
-        }
         assert_eq!(menu_choice(0), None);
         assert_eq!(menu_choice(PERCENT_BASE + 333), None);
         let ids: std::collections::HashSet<u32> = menu_items(&EditorHeaderState::default()).iter().map(|i| i.id).collect();
-        assert_eq!(ids.len(), PRESETS.len() + MODES.len());
+        assert_eq!(ids.len(), PRESETS.len());
     }
 
     #[test]
-    fn menu_checks_the_current_scale_and_hides_nis() {
+    fn the_menu_offers_sizes_only() {
         let s = EditorHeaderState { scale: EditorScale { factor: 1.5, mode: EditorScaleMode::Upscale(UpscaleFilter::Nis) }, ..Default::default() };
         let items = menu_items(&s);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["50%", "75%", "100%", "125%", "150%", "175%", "200%", "250%", "300%", "400%"]);
         let checked: Vec<&str> = items.iter().filter(|i| i.checked).map(|i| i.label.as_str()).collect();
-        assert_eq!(checked, ["150%", "Upscale: FSR 1"]);
-        assert!(!items.iter().any(|i| i.label.contains("NIS")));
-        let native = items.iter().find(|i| i.label.starts_with("Native")).map(|i| i.enabled);
-        assert_eq!(native, Some(false), "no native scaling: Native is greyed");
+        assert_eq!(checked, ["150%"]);
         assert_eq!(scale_label(s.scale), "150% \u{25BE}");
     }
 
     #[test]
-    fn choices_change_factor_or_mode() {
-        let cur = EditorScale { factor: 1.25, mode: EditorScaleMode::Native };
-        assert_eq!(apply_choice(cur, MenuChoice::Percent(200)), EditorScale { factor: 2.0, mode: EditorScaleMode::Native });
-        assert_eq!(apply_choice(cur, MenuChoice::Mode(EditorScaleMode::Auto)), EditorScale { factor: 1.25, mode: EditorScaleMode::Auto });
+    fn a_picked_size_is_always_auto() {
+        assert_eq!(apply_choice(MenuChoice::Percent(200)), EditorScale { factor: 2.0, mode: EditorScaleMode::Auto });
     }
 
     #[test]

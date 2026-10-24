@@ -21,16 +21,17 @@ use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, ID3DBlob};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS, D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE_ADDRESS_CLAMP,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Buffer, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext,
-    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Buffer, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext, ID3D11SamplerState, ID3D11ShaderResourceView,
+    ID3D11Texture2D, ID3D11UnorderedAccessView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-    IDXGIFactory2, IDXGISwapChain1, IDXGISwapChain3,
+    IDXGIFactory2, IDXGISwapChain1,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLACK_BRUSH, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
@@ -42,11 +43,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, LWA_ALPHA, PostMessageW,
     RealChildWindowFromPoint, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetLayeredWindowAttributes,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::{Interface, PCSTR, PCWSTR, w};
+use windows::core::{PCSTR, PCWSTR, w};
 
 /// Largest accepted dimension (native or scaled), in pixels.
 const MAX_DIM: u32 = 16_384;
@@ -92,6 +93,17 @@ struct State {
     /// Last captured native frame, one `0xAARRGGBB` per pixel, row-major.
     frame: Vec<u32>,
     last_pump: Option<Instant>,
+    /// GPU paths built so far (tests: a steady window never rebuilds per frame).
+    gpu_builds: u32,
+    /// Tests: read back each presented frame.
+    probe: bool,
+    /// A non-blank frame has been captured (blank captures are dropped after that).
+    have_frame: bool,
+    /// The capture being checked before it replaces `frame`.
+    shot: Vec<u32>,
+    /// Black pixels in `frame`, and captures held back in a row by [`flash_guard`].
+    black: usize,
+    held: u32,
     /// Child that receives keyboard messages: the last one the mouse went down on.
     focus: HWND,
     /// Child that owns the button press in progress (mouse capture).
@@ -130,6 +142,12 @@ impl ScaledWindow {
             capture: None,
             frame: Vec::new(),
             last_pump: None,
+            gpu_builds: 0,
+            probe: false,
+            have_frame: false,
+            shot: Vec::new(),
+            black: 0,
+            held: 0,
             focus: source,
             drag: None,
         });
@@ -209,7 +227,27 @@ impl ScaledWindow {
         let Some(capture) = st.capture.as_ref() else {
             return;
         };
-        capture.grab(st.source, &mut st.frame);
+        // A failed capture, or one that suddenly turns much of the editor black (a GPU-drawn plugin
+        // caught mid-repaint), keeps the last good frame on screen: nothing is presented, so the
+        // swapchain still shows it. An unchanged frame is not presented again either.
+        if !capture.grab(st.source, &mut st.shot) {
+            if st.have_frame {
+                return;
+            }
+        } else {
+            let black = black_pixels(&st.shot);
+            if !flash_guard(st.have_frame.then_some(st.black), black, st.shot.len(), st.held) {
+                st.held += 1;
+                return;
+            }
+            st.held = 0;
+            st.black = black;
+            if st.have_frame && st.shot == st.frame {
+                return;
+            }
+            std::mem::swap(&mut st.frame, &mut st.shot);
+            st.have_frame = true;
+        }
 
         let mut gpu_error = None;
         let mut presented = false;
@@ -252,6 +290,28 @@ impl ScaledWindow {
     #[doc(hidden)]
     pub fn uses_gpu(&self) -> bool {
         self.st().gpu.is_some()
+    }
+
+    /// Tests: read back every presented frame ([`ScaledWindow::last_presented_center`]).
+    #[doc(hidden)]
+    pub fn set_probe(&mut self, on: bool) {
+        let st = self.st_mut();
+        st.probe = on;
+        if let Some(g) = st.gpu.as_mut() {
+            g.probe = on;
+        }
+    }
+
+    /// Tests: the centre pixel of the last frame copied into the swapchain, `0xAARRGGBB`.
+    #[doc(hidden)]
+    pub fn last_presented_center(&self) -> Option<u32> {
+        self.st().gpu.as_ref().and_then(|g| g.last_back)
+    }
+
+    /// Tests: how many times the GPU path (swapchain included) was built.
+    #[doc(hidden)]
+    pub fn gpu_builds(&self) -> u32 {
+        self.st().gpu_builds
     }
 
     /// Test readback: the last captured native frame's pixel as `0xAARRGGBB`.
@@ -311,10 +371,18 @@ impl State {
         self.capture = Some(Capture::new(nw, nh)?);
         self.frame.clear();
         self.frame.resize((nw as usize) * (nh as usize), 0);
+        self.shot.clear();
+        self.shot.resize((nw as usize) * (nh as usize), 0);
+        self.have_frame = false;
+        self.held = 0;
         self.gpu = None;
         if !self.gpu_disabled {
             match Gpu::new(self.canvas, self.native, (sw, sh), self.filter) {
-                Ok(gpu) => self.gpu = Some(gpu),
+                Ok(mut gpu) => {
+                    gpu.probe = self.probe;
+                    self.gpu_builds += 1;
+                    self.gpu = Some(gpu);
+                }
                 Err(e) => self.disable_gpu(&e),
             }
         }
@@ -518,7 +586,6 @@ impl Drop for Capture {
 struct Gpu {
     ctx: ID3D11DeviceContext,
     swap: IDXGISwapChain1,
-    swap3: IDXGISwapChain3,
     capture_tex: ID3D11Texture2D,
     capture_srv: ID3D11ShaderResourceView,
     /// Intermediate EASU output (FSR 1 only).
@@ -534,6 +601,9 @@ struct Gpu {
     native: (u32, u32),
     scaled: (u32, u32),
     filter: UpscaleFilter,
+    /// Tests: read the back buffer's centre after each copy into `last_back`.
+    probe: bool,
+    last_back: Option<u32>,
 }
 
 impl Gpu {
@@ -634,12 +704,10 @@ impl Gpu {
         };
         // SAFETY: `device` is a live device; `canvas` is our live window; `desc` is valid.
         let swap = unsafe { factory.CreateSwapChainForHwnd(&device, canvas, &desc, None, None) }.map_err(|e| format!("swapchain: {e}"))?;
-        let swap3: IDXGISwapChain3 = swap.cast().map_err(|e| format!("swapchain3: {e}"))?;
 
         Ok(Gpu {
             ctx,
             swap,
-            swap3,
             capture_tex,
             capture_srv,
             mid_srv,
@@ -654,6 +722,8 @@ impl Gpu {
             native,
             scaled,
             filter,
+            probe: false,
+            last_back: None,
         })
     }
 
@@ -683,15 +753,49 @@ impl Gpu {
                 self.dispatch(&rcas, &mid_srv, &self.out_uav, sw.div_ceil(16), sh.div_ceil(16));
             }
         }
-        // SAFETY: `swap3` is our live swapchain; the back buffer index is current; the copy source
-        // and destination have identical format and size.
+        // In D3D11 a flip-model swapchain's writable back buffer is always buffer 0 (the runtime
+        // rotates it). Other indices are read-only views of buffers in flight: writing "the current
+        // index" lands every other frame nowhere and DWM shows a stale/black buffer (violent flicker).
+        // SAFETY: `swap` is our live swapchain; the copy source and destination have identical
+        // format and size.
         unsafe {
-            let index = self.swap3.GetCurrentBackBufferIndex();
-            let back: ID3D11Texture2D = self.swap.GetBuffer(index).map_err(|e| format!("GetBuffer: {e}"))?;
+            let back: ID3D11Texture2D = self.swap.GetBuffer(0).map_err(|e| format!("GetBuffer: {e}"))?;
             self.ctx.CopyResource(&back, &self.out_tex);
-            self.swap.Present(0, DXGI_PRESENT(0)).ok().map_err(|e| format!("Present: {e}"))?;
+            if self.probe {
+                self.last_back = self.read_center(&back);
+            }
+            // Sync interval 1: presented on vblank, in step with DWM.
+            self.swap.Present(1, DXGI_PRESENT(0)).ok().map_err(|e| format!("Present: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Test readback: the centre pixel of `tex` (R8G8B8A8) as `0xAARRGGBB`.
+    fn read_center(&self, tex: &ID3D11Texture2D) -> Option<u32> {
+        let (sw, sh) = self.scaled;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: plain queries and a staging copy of our own texture, mapped and unmapped here; the
+        // mapped pointer is read within the row pitch reported for it.
+        unsafe {
+            tex.GetDesc(&mut desc);
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            desc.MiscFlags = 0;
+            let device = self.ctx.GetDevice().ok()?;
+            let mut staging = None;
+            device.CreateTexture2D(&desc, None, Some(&mut staging)).ok()?;
+            let staging = staging?;
+            self.ctx.CopyResource(&staging, tex);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).ok()?;
+            let (x, y) = ((sw / 2) as usize, (sh / 2) as usize);
+            let p = mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize + x * 4).cast::<u32>().read_unaligned();
+            self.ctx.Unmap(&staging, 0);
+            // RGBA in memory -> 0xAARRGGBB.
+            let [r, g, b, a] = p.to_le_bytes();
+            Some(u32::from_be_bytes([a, r, g, b]))
+        }
     }
 
     /// Binds one compute pass (input SRV at t0, output UAV at u0, params at b0) and runs it.
@@ -834,6 +938,25 @@ fn view_uav(device: &ID3D11Device, tex: &ID3D11Texture2D) -> Result<ID3D11Unorde
     view.ok_or_else(|| "UAV missing".to_string())
 }
 
+/// Pure-black pixels (colour 0, any alpha) in a captured frame.
+fn black_pixels(px: &[u32]) -> usize {
+    px.iter().filter(|&&p| p & 0x00FF_FFFF == 0).count()
+}
+
+/// Captures in a row a sudden blackout may be held back (about 130 ms at 60 fps): content that
+/// really turned dark gets through after that.
+const HOLD_FRAMES: u32 = 8;
+
+/// Whether a capture with `black` of `total` pixels black may replace the shown frame (`prev`
+/// black pixels, `None` before the first frame), given `held` captures already held back. A jump
+/// of more than a quarter of the editor to black is a capture glitch, not a picture.
+fn flash_guard(prev: Option<usize>, black: usize, total: usize, held: u32) -> bool {
+    match prev {
+        None => black < total || held >= HOLD_FRAMES,
+        Some(prev) => black <= prev.saturating_add(total / 4) || held >= HOLD_FRAMES,
+    }
+}
+
 /// Clamps the factor to the supported 0.5..=4.0 range; non-finite values mean 1.0.
 fn clamp_factor(factor: f32) -> f32 {
     if factor.is_finite() { factor.clamp(0.5, 4.0) } else { 1.0 }
@@ -902,7 +1025,6 @@ fn register_classes() -> Result<(), String> {
             lpfnWndProc: Some(view_proc),
             hInstance: instance,
             lpszClassName: class_view(),
-            hbrBackground: black,
             ..Default::default()
         };
         // SAFETY: the class structures and their name strings are static or live for the call.
@@ -955,6 +1077,8 @@ fn view_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT>
             st.follow_visible();
             true
         }
+        // The swapchain owns every pixel of the canvas: erasing it would flash black over it.
+        WM_ERASEBKGND => true,
         WM_FRAME_HIDING => {
             st.hide();
             true
@@ -1131,6 +1255,45 @@ mod tests {
         eprintln!("editor-scale test: D3D11 filter active = {}", sw.uses_gpu());
         assert_eq!(found.map(|p| p & 0x00FF_FFFF), Some(0x00FF_0000));
         assert_eq!(sw.last_frame_pixel(64, 0), None, "out of range pixels are None");
+    }
+
+    #[test]
+    fn upscaled_frames_are_steady() {
+        // Regression: frames were copied into the swapchain buffer at the "current index", which in
+        // D3D11 is read-only every other frame, so the window flashed black.
+        let mut sw = ScaledWindow::new("editor-scale steady test", 64, 48, 2.0, UpscaleFilter::Fsr1).expect("create");
+        sw.set_probe(true);
+        let _child = red_child(HWND(sw.parent()), 64, 48);
+        sw.raise();
+        let builds = sw.gpu_builds();
+        let mut seen = Vec::new();
+        for _ in 0..30 {
+            sw.pump();
+            if let Some(p) = sw.last_presented_center() {
+                seen.push(p & 0x00FF_FFFF);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if builds == 0 {
+            eprintln!("editor-scale steady test: no D3D11 device, GPU checks skipped");
+            return;
+        }
+        assert!(sw.uses_gpu(), "the D3D11 path keeps working (no fallback to GDI)");
+        assert_eq!(sw.gpu_builds(), builds, "the swapchain is not rebuilt while the window is steady");
+        let first_red = seen.iter().position(|&p| p == 0x00FF_0000).expect("red reaches the swapchain");
+        assert!(seen[first_red..].iter().all(|&p| p == 0x00FF_0000), "never black once shown: {seen:x?}");
+    }
+
+    #[test]
+    fn blackouts_are_held_back_briefly() {
+        assert_eq!(black_pixels(&[0xFF00_0000, 0, 0x00FF_0000]), 2);
+        assert!(flash_guard(None, 10, 100, 0), "a first frame with a picture");
+        assert!(!flash_guard(None, 100, 100, 0), "a first frame that is all black waits");
+        assert!(flash_guard(Some(10), 30, 100, 0), "small changes pass");
+        assert!(!flash_guard(Some(10), 90, 100, 0), "a sudden blackout is held");
+        assert!(!flash_guard(Some(10), 90, 100, HOLD_FRAMES - 1));
+        assert!(flash_guard(Some(10), 90, 100, HOLD_FRAMES), "real dark content gets through");
+        assert!(flash_guard(Some(90), 5, 100, 0), "brighter is always fine");
     }
 
     #[test]

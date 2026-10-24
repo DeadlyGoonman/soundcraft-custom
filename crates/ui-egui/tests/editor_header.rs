@@ -83,7 +83,7 @@ fn header_actions_from_the_editor_change_the_insert() {
 #[test]
 fn a_scale_chosen_in_the_header_is_applied_and_remembered() {
     let (mut h, id, shared) = setup();
-    let scale = EditorScale { factor: 1.5, mode: EditorScaleMode::Native };
+    let scale = EditorScale { factor: 1.5, mode: EditorScaleMode::Auto };
     shared.lock().unwrap().queued = vec![EditorHeaderAction::SetScale(scale)];
     h.run_steps(2);
     assert_eq!(shared.lock().unwrap().scales, vec![scale]);

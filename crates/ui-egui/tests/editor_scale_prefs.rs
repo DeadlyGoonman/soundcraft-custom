@@ -41,14 +41,12 @@ fn a_scale_is_stored_as_plain_json() {
 #[test]
 fn percent_choices_cover_one_hundred_percent_as_auto_default() {
     assert!(EDITOR_SCALE_PERCENTS.contains(&100));
-    let at_100 = scale_at_percent(EditorScale::default(), 100);
-    assert_eq!(at_100, EditorScale::default());
+    assert_eq!(scale_at_percent(100), EditorScale::default());
 }
 
 #[test]
-fn picking_a_percent_keeps_the_mode() {
-    let native = EditorScale { factor: 1.0, mode: EditorScaleMode::Native };
-    let picked = scale_at_percent(native, 200);
-    assert_eq!(picked.mode, EditorScaleMode::Native);
+fn picking_a_percent_is_always_auto() {
+    let picked = scale_at_percent(200);
+    assert_eq!(picked.mode, EditorScaleMode::Auto);
     assert!((picked.factor - 2.0).abs() < 1e-6);
 }

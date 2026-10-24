@@ -46,11 +46,11 @@ was written by **Claude** (Anthropic's Claude Code). **This fork's changes are 1
   SoundCraft's parameter wrapper, and waits for third-party editors that take a moment to appear.
 - **VST3 analyzer/sync fix** — hosts `IMessage`/`IAttributeList` so plugins like FabFilter Pro-Q can push live analyzer
   data to their own editor, and keeps the editor in sync with presets, automation and undo.
-- **Plugin editor scaling** — native resizing where a plugin supports it, otherwise upscaled (FSR 1 or bilinear), so
+- **Plugin editor scaling** — native resizing where a plugin supports it, otherwise upscaled with FSR 1, so
   small plugin GUIs aren't stuck tiny on a high-DPI display. Every plugin window can be dragged larger or smaller
   (aspect-locked, snapping to 100/125/150/200%), and the size is remembered per plugin.
-- **Plugin window header** — a strip on top of every VST3/CLAP editor window: a `Scale ▾` menu (50–400%, Auto /
-  Native / FSR 1 / Bilinear), **Bypass**, and **Δ Delta** (hear only what the plugin changes: wet minus the
+- **Plugin window header** — a strip on top of every VST3/CLAP editor window: a `Scale ▾` menu (50–400%; the plugin
+  scales itself when it can, otherwise FSR 1 upscales it), **Bypass**, and **Δ Delta** (hear only what the plugin changes: wet minus the
   latency-aligned dry signal; a listening aid that is never saved). Closing a plugin window no longer pulls the main
   window to the front.
 - **Custom themes** — an OLED Black theme (pure-black surfaces) and a Custom theme shaded from any colour you pick,

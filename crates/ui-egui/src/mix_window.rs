@@ -833,37 +833,24 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     }
 }
 
-/// Editor scale choices (percent of the plugin's own size) in the Editor Scale submenu.
-pub const EDITOR_SCALE_PERCENTS: [u32; 7] = [50, 75, 100, 125, 150, 200, 300];
+/// Editor scale choices (percent of the plugin's own size) in the Editor Scale submenu, the same
+/// sizes as the editor window's own Scale menu.
+pub const EDITOR_SCALE_PERCENTS: [u32; 10] = [50, 75, 100, 125, 150, 175, 200, 250, 300, 400];
 
-/// `scale` with its factor set to `percent` (the mode is kept).
-pub fn scale_at_percent(scale: soundcraft_dsp::EditorScale, percent: u32) -> soundcraft_dsp::EditorScale {
-    soundcraft_dsp::EditorScale { factor: percent as f32 / 100.0, ..scale }
+/// The scale for `percent`. There is no mode to choose: the plugin scales itself when it can,
+/// otherwise the FSR 1 upscaler stretches it (`Auto`).
+pub fn scale_at_percent(percent: u32) -> soundcraft_dsp::EditorScale {
+    soundcraft_dsp::EditorScale { factor: percent as f32 / 100.0, mode: soundcraft_dsp::EditorScaleMode::Auto }
 }
 
-/// The Editor Scale submenu of a hosted plugin's slot: zoom percentages, then the scaling mode.
-/// Native is disabled when the plugin cannot draw itself at another size.
+/// The Editor Scale submenu of a hosted plugin's slot: zoom percentages.
 fn editor_scale_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, plugin: &str) {
-    use soundcraft_dsp::{EditorScale, EditorScaleMode, UpscaleFilter};
     let current = app.ui.editor_scales.get(plugin).copied().unwrap_or_default();
-    let native_ok = app.player.as_ref().is_some_and(|p| p.editor_native_scaling(id, slot));
     ui.menu_button("Editor Scale", |ui| {
         for pct in EDITOR_SCALE_PERCENTS {
             let selected = (current.clamped_factor() * 100.0).round() as u32 == pct;
             if ui.radio(selected, format!("{pct} %")).clicked() {
-                set_slot_scale(app, ui, id, slot, scale_at_percent(current, pct));
-            }
-        }
-        ui.separator();
-        let modes = [
-            ("Auto", EditorScaleMode::Auto, true),
-            ("Native", EditorScaleMode::Native, native_ok),
-            ("Upscale FSR 1", EditorScaleMode::Upscale(UpscaleFilter::Fsr1), true),
-            ("Upscale Bilinear", EditorScaleMode::Upscale(UpscaleFilter::Bilinear), true),
-        ];
-        for (label, mode, enabled) in modes {
-            if ui.add_enabled(enabled, egui::RadioButton::new(current.mode == mode, label)).clicked() {
-                set_slot_scale(app, ui, id, slot, EditorScale { mode, ..current });
+                set_slot_scale(app, ui, id, slot, scale_at_percent(pct));
             }
         }
     });
