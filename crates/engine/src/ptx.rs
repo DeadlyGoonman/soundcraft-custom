@@ -189,16 +189,53 @@ fn squash(s: &str) -> String {
 /// The installed plugin a Pro Tools plugin name stands for: the same name, or one that starts
 /// with it (`H-Delay` -> `H-Delay Stereo`), ignoring case, spaces and punctuation, so newer
 /// versions of a plugin match.
-pub fn installed_match(name: &str, installed: &[(String, String)]) -> Option<String> {
+pub fn installed_match(name: &str, installed: &[(String, String)], stereo: bool) -> Option<String> {
     let want = squash(name);
     if want.is_empty() {
         return None;
     }
-    installed
-        .iter()
-        .find(|(_, n)| squash(n) == want)
-        .or_else(|| installed.iter().find(|(_, n)| squash(n).starts_with(&want)))
-        .map(|(id, _)| id.clone())
+    let matches: Vec<&(String, String)> = installed.iter().filter(|(_, n)| squash(n) == want).collect();
+    let matches = if matches.is_empty() { installed.iter().filter(|(_, n)| squash(n).starts_with(&want)).collect() } else { matches };
+    // Waves and others ship Mono and Stereo variants: take the one that fits the track.
+    let fits = if stereo { "stereo" } else { "mono" };
+    matches.iter().find(|(_, n)| squash(n).ends_with(fits)).or(matches.first()).map(|(id, _)| id.clone())
+}
+
+/// Waves keeps the same preset XML in its AAX and VST3 versions; the VST3 state wraps it in a
+/// 36-byte header (three fields of which count the XML: little-endian at 4, big-endian at 8 and
+/// 28) and a trailer. `template` is a fresh instance's state, giving both.
+fn waves_state(template: &[u8], xml: &[u8]) -> Option<Vec<u8>> {
+    const END: &[u8] = b"</PresetChunkXMLTree>";
+    let end_of = |b: &[u8]| b.windows(END.len()).position(|w| w == END).map(|p| p + END.len());
+    if !template.starts_with(b"SCV3") || template.len() < 36 {
+        return None;
+    }
+    let (fresh_end, xml_end) = (end_of(template)?, end_of(xml)?);
+    let delta = i64::try_from(xml_end).ok()? - i64::try_from(fresh_end.checked_sub(36)?).ok()?;
+    let mut out = template.get(..36)?.to_vec();
+    for (at, big) in [(4, false), (8, true), (28, true)] {
+        let field: [u8; 4] = out.get(at..at + 4)?.try_into().ok()?;
+        let v = if big { u32::from_be_bytes(field) } else { u32::from_le_bytes(field) };
+        let v = u32::try_from(i64::from(v) + delta).ok()?;
+        out.get_mut(at..at + 4)?.copy_from_slice(&if big { v.to_be_bytes() } else { v.to_le_bytes() });
+    }
+    out.extend_from_slice(xml.get(..xml_end)?);
+    out.extend_from_slice(template.get(fresh_end..)?);
+    Some(out)
+}
+
+/// The settings to give `id` for a Pro Tools chunk: Waves XML rewrapped for VST3 (from a fresh
+/// instance's state, made once per plugin), else the chunk as it is.
+fn plugin_state(id: &str, chunk: &[u8], templates: &mut HashMap<String, Option<Vec<u8>>>) -> Vec<u8> {
+    if chunk.starts_with(b"<PresetChunkXMLTree") {
+        let template = templates
+            .entry(id.to_string())
+            .or_insert_with(|| soundcraft_mix::create_instance(id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state()));
+        if let Some(state) = template.as_deref().and_then(|t| waves_state(t, chunk)) {
+            return state;
+        }
+    }
+    chunk.to_vec()
 }
 
 /// Installed VST3 and CLAP plugins as (id, name), from the hosts' saved scans.
@@ -224,6 +261,7 @@ pub fn insert_plugin(e: &mut Engine, track: TrackId, slot: Option<usize>, id: &s
 /// plugins with no installed match.
 fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String, (TrackId, String)>) -> Vec<MissingPlugin> {
     let installed = installed_plugins();
+    let mut templates: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     let mut ordered: Vec<&PtxInsert> = inserts.iter().collect();
     ordered.sort_by_key(|i| i.slot.is_none());
     let mut missing: Vec<MissingPlugin> = Vec::new();
@@ -232,15 +270,17 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
         if targets.is_empty() {
             continue;
         }
-        match installed_match(&ins.plugin, &installed) {
+        let stereo = targets.first().and_then(|(t, _)| s.track(*t)).is_some_and(|t| t.format.channels() >= 2);
+        match installed_match(&ins.plugin, &installed, stereo) {
             Some(id) => {
+                let state = ins.state.as_deref().map(|c| plugin_state(&id, c, &mut templates));
                 for (track, slot) in targets {
                     let Some(t) = s.track_mut(track) else { continue };
                     let slots = &mut t.mixer.inserts;
                     let free = slot.filter(|&i| slots.get(i).is_some_and(Option::is_none)).or_else(|| slots.iter().position(Option::is_none));
                     if let Some(cell) = free.and_then(|i| slots.get_mut(i)) {
                         let mut insert = soundcraft_model::Insert::new(id.clone());
-                        insert.state = ins.state.as_deref().map(soundcraft_model::b64::encode);
+                        insert.state = state.as_deref().map(soundcraft_model::b64::encode);
                         *cell = Some(insert);
                     }
                 }
@@ -412,10 +452,13 @@ mod tests {
             ("vst3:B".to_string(), "H-Delay Stereo".to_string()),
             ("vst3:C".to_string(), "Q4 Stereo".to_string()),
         ];
-        assert_eq!(installed_match("SSLGChannel", &installed).as_deref(), Some("vst3:A"));
-        assert_eq!(installed_match("H-Delay", &installed).as_deref(), Some("vst3:B"));
-        assert_eq!(installed_match("Q4", &installed).as_deref(), Some("vst3:C"));
-        assert_eq!(installed_match("EQ3 1-Band", &installed), None);
+        assert_eq!(installed_match("SSLGChannel", &installed, true).as_deref(), Some("vst3:A"));
+        assert_eq!(installed_match("H-Delay", &installed, true).as_deref(), Some("vst3:B"));
+        assert_eq!(installed_match("Q4", &installed, false).as_deref(), Some("vst3:C"));
+        assert_eq!(installed_match("EQ3 1-Band", &installed, true), None);
+        let both = vec![("vst3:M".to_string(), "H-Delay Mono".to_string()), ("vst3:S".to_string(), "H-Delay Stereo".to_string())];
+        assert_eq!(installed_match("H-Delay", &both, true).as_deref(), Some("vst3:S"));
+        assert_eq!(installed_match("H-Delay", &both, false).as_deref(), Some("vst3:M"));
     }
 
     #[test]
