@@ -15,7 +15,7 @@
 #![allow(clippy::unnecessary_cast)]
 
 use crate::{Vst3Error, scan};
-use soundcraft_dsp::{EditorScale, Transport};
+use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorScale, Transport};
 use soundcraft_editor_scale::{Choice, ScaledWindow, plan};
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_int, c_void};
@@ -1950,6 +1950,34 @@ impl EditorWindow {
             EditorWindow::Scaled(s) => s.close(),
         }
     }
+
+    fn set_header(&self, state: EditorHeaderState) {
+        match self {
+            EditorWindow::Plain(w) => w.set_header(state),
+            EditorWindow::Scaled(s) => s.set_header(state),
+        }
+    }
+
+    fn take_actions(&self) -> Vec<EditorHeaderAction> {
+        match self {
+            EditorWindow::Plain(w) => w.take_actions(),
+            EditorWindow::Scaled(s) => s.take_actions(),
+        }
+    }
+
+    fn position(&self) -> Option<(i32, i32)> {
+        match self {
+            EditorWindow::Plain(w) => w.position(),
+            EditorWindow::Scaled(s) => s.position(),
+        }
+    }
+
+    fn move_to(&self, pos: (i32, i32)) {
+        match self {
+            EditorWindow::Plain(w) => w.move_to(pos),
+            EditorWindow::Scaled(s) => s.move_to(pos),
+        }
+    }
 }
 
 /// The `IPlugFrame` handed to a plugin view: `resizeView` resizes our host window.
@@ -2031,6 +2059,10 @@ struct EditorInner {
     resizable: bool,
     /// Whether the plugin can draw itself at another size; cached once probed.
     native: Option<bool>,
+    /// What the window's header shows (the app's part; scale and native come from here).
+    header: EditorHeaderState,
+    /// Where the last window was, so a reopened editor (new scale, closed and opened) stays put.
+    pos: Option<(i32, i32)>,
 }
 
 /// The link between an instance and its editor and state handles. The instance may process on
@@ -2135,8 +2167,17 @@ impl EditorLink {
         }
         let mut win = match upscale {
             Some(filter) => EditorWindow::Scaled(ScaledWindow::new(title, base.0 as u32, base.1 as u32, factor, filter)?),
-            None => EditorWindow::Plain(window::HostWindow::new(title, size.0, size.1, resizable)?),
+            None => {
+                let w = window::open_window(title, size.0, size.1, resizable)?;
+                // Frame drags keep the plugin's own aspect ratio.
+                w.set_native(base.0, base.1);
+                EditorWindow::Plain(w)
+            }
         };
+        if let Some(pos) = g.pos {
+            win.move_to(pos);
+        }
+        win.set_header(EditorHeaderState { scale: g.scale, native_scaling: native, can_resize: resizable, ..g.header });
         let frame = ComWrapper::new(PlugFrame::new(win.frame_window(), size.0, size.1));
         if let Some(f) = frame.as_com_ref::<sb::IPlugFrame>() {
             // SAFETY: valid view; the frame outlives the view's attachment (kept in `g.frame`
@@ -2312,8 +2353,30 @@ impl EditorLink {
         }
         g.frame = None;
         if let Some(w) = g.window.take() {
+            g.pos = w.position().or(g.pos);
             w.close();
         }
+    }
+
+    /// Shows the app's state in the window's header (main thread).
+    pub fn set_header(&self, state: EditorHeaderState) {
+        if !window::on_main_thread() {
+            return;
+        }
+        let mut g = self.lock();
+        let shown = EditorHeaderState { scale: g.scale, native_scaling: g.native.unwrap_or(false), can_resize: g.resizable, ..state };
+        g.header = state;
+        if let Some(w) = &g.window {
+            w.set_header(shown);
+        }
+    }
+
+    /// Header clicks and frame drags since the last call (main thread).
+    pub fn take_header_actions(&self) -> Vec<EditorHeaderAction> {
+        if !window::on_main_thread() {
+            return Vec::new();
+        }
+        self.lock().window.as_ref().map(EditorWindow::take_actions).unwrap_or_default()
     }
 
     /// Hands a host-set value to the controller before a state save (`setParamNormalized`,
@@ -2579,6 +2642,24 @@ mod window {
         None
     }
 
+    /// A host window (`resizable` follows the view's `canResize`).
+    pub fn open_window(title: &str, w: f64, h: f64, resizable: bool) -> Result<HostWindow, String> {
+        HostWindow::new(title, w, h, resizable)
+    }
+
+    /// The editor header is Windows only: these are no-ops here.
+    impl HostWindow {
+        pub fn set_header(&self, _state: soundcraft_dsp::EditorHeaderState) {}
+        pub fn take_actions(&self) -> Vec<soundcraft_dsp::EditorHeaderAction> {
+            Vec::new()
+        }
+        pub fn set_native(&self, _w: f64, _h: f64) {}
+        pub fn position(&self) -> Option<(i32, i32)> {
+            None
+        }
+        pub fn move_to(&self, _pos: (i32, i32)) {}
+    }
+
     pub fn resize(window: *mut c_void, w: f64, h: f64) {
         if MainThreadMarker::new().is_none() {
             return;
@@ -2590,23 +2671,15 @@ mod window {
     }
 }
 
-/// The Windows host window: a top-level window owned by the app's active window (so it stays
-/// above it and has no taskbar button) whose client area is the plugin view's `HWND` parent.
-/// Closing it only hides it; the editor link notices in `idle`, detaches the view, then destroys
-/// the window. Messages are dispatched by the app's own event loop on the main thread.
+/// The Windows host window: SoundCraft's editor frame (`soundcraft_editor_scale::HostWindow`) with
+/// the header strip on top; its body is the plugin view's `HWND` parent. Closing it only hides it;
+/// the editor link notices in `idle`, detaches the view, then destroys the window. Messages are
+/// dispatched by the app's own event loop on the main thread.
 #[cfg(windows)]
 mod window {
-    use std::ffi::{c_char, c_void};
-    use std::sync::OnceLock;
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AdjustWindowRectEx, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWL_STYLE,
-        GetClientRect, GetWindowLongPtrW, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WM_CLOSE, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_MAXIMIZEBOX,
-        WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME,
-    };
+    use std::ffi::c_char;
+
+    pub use soundcraft_editor_scale::{HostWindow, client_size, resize};
 
     pub const PLATFORM_TYPE: Option<*const c_char> = Some(vst3::Steinberg::kPlatformTypeHWND);
 
@@ -2615,167 +2688,12 @@ mod window {
         std::thread::current().name() == Some("main")
     }
 
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().filter(|&c| c != 0).chain(Some(0)).collect()
-    }
-
-    const STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
-
-    unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        if msg == WM_CLOSE {
-            // SAFETY: `hwnd` is the window this procedure was called for.
-            unsafe { ShowWindow(hwnd, SW_HIDE) };
-            return 0;
+    /// An editor frame; every one is drag-resizable (aspect-locked), so `resizable` is not needed.
+    pub fn open_window(title: &str, w: f64, h: f64, _resizable: bool) -> Result<HostWindow, String> {
+        if !on_main_thread() {
+            return Err("not on the main thread".into());
         }
-        // SAFETY: default handling of a message for the window it was sent to.
-        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-    }
-
-    /// Registers the window class once; the name lives for the whole process.
-    fn class_name() -> Option<&'static [u16]> {
-        static CLASS: OnceLock<Option<Vec<u16>>> = OnceLock::new();
-        CLASS
-            .get_or_init(|| {
-                let name = wide("SoundCraftVst3Editor");
-                // SAFETY: null asks for this process's module handle.
-                let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
-                let wc = WNDCLASSEXW {
-                    cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                    style: CS_HREDRAW | CS_VREDRAW,
-                    lpfnWndProc: Some(wndproc),
-                    cbClsExtra: 0,
-                    cbWndExtra: 0,
-                    hInstance: instance,
-                    hIcon: std::ptr::null_mut(),
-                    // SAFETY: a system cursor (null instance + predefined id).
-                    hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
-                    hbrBackground: std::ptr::null_mut(),
-                    lpszMenuName: std::ptr::null(),
-                    lpszClassName: name.as_ptr(),
-                    hIconSm: std::ptr::null_mut(),
-                };
-                // SAFETY: a fully initialised class description whose strings outlive the call
-                // (the name is kept for the process lifetime in this `OnceLock`).
-                (unsafe { RegisterClassExW(&wc) } != 0).then_some(name)
-            })
-            .as_deref()
-    }
-
-    /// Outer window size for a client area of `w`×`h`.
-    fn outer_size(style: u32, ex_style: u32, w: f64, h: f64) -> (i32, i32) {
-        let mut r = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
-        // SAFETY: `r` is a valid, writable rect.
-        unsafe { AdjustWindowRectEx(&mut r, style, 0, ex_style) };
-        (r.right.saturating_sub(r.left), r.bottom.saturating_sub(r.top))
-    }
-
-    /// Owns the window handle; destroyed in `close` (main thread only).
-    pub struct HostWindow {
-        hwnd: HWND,
-    }
-
-    // SAFETY: the handle is only used on the main thread (every method checks); the struct
-    // merely carries it between threads' locks.
-    unsafe impl Send for HostWindow {}
-
-    impl HostWindow {
-        fn live(&self) -> Option<HWND> {
-            // SAFETY: `IsWindow` accepts any value and only reports whether it names a window.
-            (on_main_thread() && unsafe { IsWindow(self.hwnd) } != 0).then_some(self.hwnd)
-        }
-
-        pub fn new(title: &str, w: f64, h: f64, resizable: bool) -> Result<HostWindow, String> {
-            if !on_main_thread() {
-                return Err("not on the main thread".into());
-            }
-            let class = class_name().ok_or_else(|| "cannot register the editor window class".to_string())?;
-            let title = wide(title);
-            let style = if resizable { STYLE | WS_THICKFRAME | WS_MAXIMIZEBOX } else { STYLE };
-            let (ow, oh) = outer_size(style, 0, w, h);
-            // SAFETY: main thread; the active window (or null) of this thread's queue.
-            let owner = unsafe { GetActiveWindow() };
-            // SAFETY: registered class and NUL-terminated strings that outlive the call; the
-            // owner is null or a window of this thread.
-            let hwnd = unsafe {
-                CreateWindowExW(
-                    0,
-                    class.as_ptr(),
-                    title.as_ptr(),
-                    style,
-                    CW_USEDEFAULT,
-                    CW_USEDEFAULT,
-                    ow,
-                    oh,
-                    owner,
-                    std::ptr::null_mut(),
-                    GetModuleHandleW(std::ptr::null()),
-                    std::ptr::null(),
-                )
-            };
-            if hwnd.is_null() {
-                return Err("cannot create the editor window".into());
-            }
-            Ok(HostWindow { hwnd })
-        }
-
-        /// The window handle (for the plug frame's resizes).
-        pub fn raw(&self) -> *mut c_void {
-            self.hwnd
-        }
-
-        /// The `HWND` the plugin view creates its child window in.
-        pub fn parent(&self) -> *mut c_void {
-            self.live().unwrap_or(std::ptr::null_mut())
-        }
-
-        pub fn raise(&self) {
-            if let Some(h) = self.live() {
-                // SAFETY: a live window of this thread.
-                unsafe {
-                    ShowWindow(h, SW_SHOW);
-                    SetForegroundWindow(h);
-                }
-            }
-        }
-
-        pub fn is_visible(&self) -> bool {
-            // SAFETY: a live window of this thread.
-            self.live().is_some_and(|h| unsafe { IsWindowVisible(h) } != 0)
-        }
-
-        pub fn close(self) {
-            if let Some(h) = self.live() {
-                // SAFETY: our own live window; the view was detached before (see `teardown`).
-                unsafe { DestroyWindow(h) };
-            }
-        }
-    }
-
-    /// The client area's size of a host window (`window` from [`HostWindow::raw`]); main thread only.
-    pub fn client_size(window: *mut c_void) -> Option<(f64, f64)> {
-        // SAFETY: `IsWindow` accepts any value.
-        if !on_main_thread() || window.is_null() || unsafe { IsWindow(window) } == 0 {
-            return None;
-        }
-        let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        // SAFETY: a live window of this thread; `r` is a valid, writable rect.
-        if unsafe { GetClientRect(window, &mut r) } == 0 {
-            return None;
-        }
-        Some((f64::from(r.right - r.left), f64::from(r.bottom - r.top)))
-    }
-
-    /// Resizes a host window's client area (`window` from [`HostWindow::raw`]); main thread only.
-    pub fn resize(window: *mut c_void, w: f64, h: f64) {
-        // SAFETY: `IsWindow` accepts any value.
-        if !on_main_thread() || window.is_null() || unsafe { IsWindow(window) } == 0 {
-            return;
-        }
-        // SAFETY: a live window of this thread; style values are read, not changed.
-        let (style, ex) = unsafe { (GetWindowLongPtrW(window, GWL_STYLE) as u32, GetWindowLongPtrW(window, GWL_EXSTYLE) as u32) };
-        let (ow, oh) = outer_size(style, ex, w, h);
-        // SAFETY: as above; only the size changes.
-        unsafe { SetWindowPos(window, std::ptr::null_mut(), 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) };
+        HostWindow::new(title, w, h)
     }
 }
 
@@ -2807,6 +2725,19 @@ mod window {
             false
         }
         pub fn close(self) {}
+        pub fn set_header(&self, _state: soundcraft_dsp::EditorHeaderState) {}
+        pub fn take_actions(&self) -> Vec<soundcraft_dsp::EditorHeaderAction> {
+            Vec::new()
+        }
+        pub fn set_native(&self, _w: f64, _h: f64) {}
+        pub fn position(&self) -> Option<(i32, i32)> {
+            None
+        }
+        pub fn move_to(&self, _pos: (i32, i32)) {}
+    }
+
+    pub fn open_window(title: &str, w: f64, h: f64, resizable: bool) -> Result<HostWindow, String> {
+        HostWindow::new(title, w, h, resizable)
     }
 
     pub fn resize(_window: *mut c_void, _w: f64, _h: f64) {}

@@ -359,6 +359,14 @@ impl PluginEditor for ClapEditor {
         self.link.open(self.info.name).inspect_err(|_| self.link.set_editor_scale(prev))
     }
 
+    fn set_header(&mut self, state: soundcraft_dsp::EditorHeaderState) {
+        self.link.set_header(state);
+    }
+
+    fn take_header_actions(&mut self) -> Vec<soundcraft_dsp::EditorHeaderAction> {
+        self.link.take_header_actions()
+    }
+
     fn idle(&mut self) -> Vec<(String, f32)> {
         let raw = self.link.idle();
         let _ = self.link.host().dirty.swap(false, Ordering::Relaxed);
@@ -406,7 +414,8 @@ mod tests {
         assert!(!e.native_scaling());
         assert!(e.set_scale(EditorScale { factor: 2.0, mode: EditorScaleMode::Auto }).is_ok());
         assert_eq!(e.link.editor_scale().factor, 2.0);
-        assert!(e.set_scale(EditorScale { factor: 2.0, mode: EditorScaleMode::Native }).is_err());
+        // Native on a plugin that can't is upscaled too (a scale never fails).
+        assert!(e.set_scale(EditorScale { factor: 2.0, mode: EditorScaleMode::Native }).is_ok());
     }
 
     #[test]

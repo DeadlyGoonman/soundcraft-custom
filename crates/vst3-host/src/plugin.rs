@@ -557,6 +557,14 @@ impl PluginEditor for Vst3Editor {
         self.link.set_scale(scale)
     }
 
+    fn set_header(&mut self, state: soundcraft_dsp::EditorHeaderState) {
+        self.link.set_header(state);
+    }
+
+    fn take_header_actions(&mut self) -> Vec<soundcraft_dsp::EditorHeaderAction> {
+        self.link.take_header_actions()
+    }
+
     fn idle(&mut self) -> Vec<(String, f32)> {
         self.link.idle();
         let edits = self.host.take_edits();
