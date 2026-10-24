@@ -125,6 +125,20 @@ fn file_stem(clip: &str) -> String {
     side.map_or_else(|| base.to_string(), |s| format!("{base}.{s}"))
 }
 
+/// A playlist's family: its name without take suffixes (`.01`, `.dup2`, `-2`), so the takes of
+/// one part group together.
+fn family(name: &str) -> String {
+    let mut s = name;
+    while let Some((head, tail)) = s.rsplit_once(['.', '-']) {
+        let digits = tail.strip_prefix("dup").unwrap_or(tail);
+        if head.is_empty() || digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        s = head;
+    }
+    s.to_string()
+}
+
 fn audio_file(dir: &Path, stem: &str) -> Option<PathBuf> {
     ["wav", "WAV", "aif", "aiff"].iter().map(|ext| dir.join(format!("{stem}.{ext}"))).find(|p| file_found(p))
 }
@@ -142,7 +156,8 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     let name = Path::new(path).file_stem().map_or_else(|| "Pro Tools Session".into(), |n| n.to_string_lossy().into_owned());
     let mut s = Session { name, ..Session::default() };
     let mut sources: HashMap<String, Option<SourceId>> = HashMap::new();
-    let mut tracks: HashMap<String, TrackId> = HashMap::new();
+    // Track name -> the track and the playlist it holds.
+    let mut tracks: HashMap<String, (TrackId, String)> = HashMap::new();
     let mut missing = Vec::new();
     let mut rate_set = false;
     // Only the playlists tracks play, in track order (all of them when the session has no list).
@@ -191,7 +206,10 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
         let Some(src) = src else { continue };
         let side = side_of(p).filter(|_| stereo.contains(p.playlist.as_str()));
         let track_name = side.map_or_else(|| p.playlist.clone(), |side| format!("{} {side}", p.playlist));
-        let track = *tracks.entry(track_name.clone()).or_insert_with(|| s.add_track(TrackKind::Audio, ChannelFormat::for_channels(1), Some(&track_name)));
+        let track = tracks
+            .entry(track_name.clone())
+            .or_insert_with(|| (s.add_track(TrackKind::Audio, ChannelFormat::for_channels(1), Some(&track_name)), p.playlist.clone()))
+            .0;
         let hour = u64::from(s.sample_rate.hz()) * 3600;
         let origin = first.checked_div(hour).map_or(0, |h| h * hour);
         let frames = s.source(src).map_or(0, |x| x.frames);
@@ -199,6 +217,30 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
         let to = |v: u64| Samples::try_from(v).unwrap_or(Samples::MAX);
         let id = s.new_clip_id();
         crate::edit::place_clip(&mut s, track, Clip::audio(id, clip.name.clone(), src, to(clip.offset), to(p.position.saturating_sub(origin)), to(length)));
+    }
+    // Without the list of what each track plays, every playlist came in: per family of takes
+    // (`VERSE`, `VERSE.01`, `VERSE.dup2.03`, `hk-2`...) the one with the most clips keeps playing
+    // and the others are muted, so takes don't stack. They stay in the session to unmute.
+    if ptx.active.is_empty() {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for p in &ptx.placements {
+            *counts.entry(p.playlist.as_str()).or_default() += 1;
+        }
+        let mut best: HashMap<String, (usize, &str)> = HashMap::new();
+        for (&pl, &n) in &counts {
+            let slot = best.entry(family(pl)).or_insert((0, pl));
+            if (n, pl) > *slot {
+                *slot = (n, pl);
+            }
+        }
+        let playing: std::collections::HashSet<&str> = best.values().map(|&(_, pl)| pl).collect();
+        for (id, pl) in tracks.values() {
+            if !playing.contains(pl.as_str())
+                && let Some(t) = s.track_mut(*id)
+            {
+                t.mixer.mute = true;
+            }
+        }
     }
     s.folder = Some(folder);
     e.replace_session(s);
@@ -219,6 +261,15 @@ mod tests {
         assert_eq!(file_stem("3.03_458-01"), "3.03_458");
         assert_eq!(file_stem("3.01_456"), "3.01_456");
         assert_eq!(file_stem("juice wrld vx.45"), "juice wrld vx.45");
+    }
+
+    #[test]
+    fn takes_group_by_their_base_name() {
+        assert_eq!(family("VERSE.dup4.01"), "VERSE");
+        assert_eq!(family("hk-2"), "hk");
+        assert_eq!(family("ju hook 1.02"), "ju hook 1");
+        assert_eq!(family("Lead 1.dup1.17"), "Lead 1");
+        assert_eq!(family("Instrumental"), "Instrumental");
     }
 
     #[test]
