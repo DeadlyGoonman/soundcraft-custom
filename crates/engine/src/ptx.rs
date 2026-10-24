@@ -26,6 +26,10 @@ const PLUGIN: u16 = 0x1017;
 const TRACK_INSERTS: u16 = 0x2627;
 /// An insert: plugin index (0x2626 child) and slot (0x2613 child).
 const INSERT: u16 = 0x2615;
+/// A plugin's settings chunk inside an insert: u32 version, u32 length, then the bytes.
+const CHUNK: u16 = 0x1038;
+/// The length of the header Pro Tools puts before a plugin's own settings data.
+const AAX_HEADER: usize = 56;
 
 /// A plugin on a track's insert.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +38,8 @@ pub struct PtxInsert {
     /// Insert slot 0-9 (`None` when the session doesn't give one).
     pub slot: Option<usize>,
     pub plugin: String,
+    /// The plugin's saved settings as Pro Tools stored them (its chunk), when there is one.
+    pub state: Option<Vec<u8>>,
 }
 
 /// A plugin the imported session uses that isn't installed here, and the slots it was on.
@@ -141,13 +147,22 @@ pub fn parse(b: &[u8]) -> Ptx {
     let plugins: Vec<String> = blocks(b, PLUGIN).into_iter().filter_map(|i| name_at(b, i + 10).map(|(n, _)| n)).filter(|n| !n.is_empty()).collect();
     let owners: Vec<(usize, usize)> =
         blocks(b, TRACK_INSERTS).into_iter().filter_map(|i| Some((i, i.checked_add(7)?.checked_add(usize::try_from(uint(b, i + 3, 4)?).ok()?)?))).collect();
+    let chunks = blocks(b, CHUNK);
     let inserts = blocks(b, INSERT)
         .into_iter()
         .filter_map(|s| {
             let plugin = plugins.get(usize::try_from(uint(b, s + 18, 2)?).ok()?)?.clone();
             let slot = uint(b, s + 29, 2).and_then(|v| usize::try_from(v).ok()).filter(|&v| v < 10);
             let track = owners.iter().position(|&(start, end)| start < s && s < end)?;
-            Some(PtxInsert { playlist: active.get(track)?.clone(), slot, plugin })
+            let end = s.checked_add(7)?.checked_add(usize::try_from(uint(b, s + 3, 4)?).ok()?)?;
+            let state = chunks.iter().find(|&&k| s < k && k < end).and_then(|&k| {
+                let n = usize::try_from(uint(b, k + 13, 4)?).ok()?;
+                // Past Pro Tools' 56-byte chunk header (size, version, four ids, a 32-byte name)
+                // is the plugin's own data, which is what its VST3 / CLAP version reads.
+                let chunk = b.get(k + 17..k.checked_add(17)?.checked_add(n)?)?;
+                Some(chunk.get(AAX_HEADER..).unwrap_or(chunk).to_vec()).filter(|c| !c.is_empty())
+            });
+            Some(PtxInsert { playlist: active.get(track)?.clone(), slot, plugin, state })
         })
         .collect();
     Ptx { clips, placements, active, kinds, inserts }
@@ -204,9 +219,10 @@ pub fn insert_plugin(e: &mut Engine, track: TrackId, slot: Option<usize>, id: &s
     }
 }
 
-/// Puts each insert's plugin on its imported track(s), slotted ones first, and returns the
+/// Puts each insert's plugin on its imported track(s), slotted ones first, with the settings
+/// Pro Tools saved (a plugin that can't read them starts from its defaults), and returns the
 /// plugins with no installed match.
-fn place_plugins(e: &mut Engine, inserts: &[PtxInsert], tracks: &HashMap<String, (TrackId, String)>) -> Vec<MissingPlugin> {
+fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String, (TrackId, String)>) -> Vec<MissingPlugin> {
     let installed = installed_plugins();
     let mut ordered: Vec<&PtxInsert> = inserts.iter().collect();
     ordered.sort_by_key(|i| i.slot.is_none());
@@ -219,7 +235,14 @@ fn place_plugins(e: &mut Engine, inserts: &[PtxInsert], tracks: &HashMap<String,
         match installed_match(&ins.plugin, &installed) {
             Some(id) => {
                 for (track, slot) in targets {
-                    insert_plugin(e, track, slot, &id);
+                    let Some(t) = s.track_mut(track) else { continue };
+                    let slots = &mut t.mixer.inserts;
+                    let free = slot.filter(|&i| slots.get(i).is_some_and(Option::is_none)).or_else(|| slots.iter().position(Option::is_none));
+                    if let Some(cell) = free.and_then(|i| slots.get_mut(i)) {
+                        let mut insert = soundcraft_model::Insert::new(id.clone());
+                        insert.state = ins.state.as_deref().map(soundcraft_model::b64::encode);
+                        *cell = Some(insert);
+                    }
                 }
             }
             None => match missing.iter_mut().find(|m| m.name == ins.plugin) {
@@ -360,9 +383,10 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
         crate::edit::place_clip(&mut s, track, Clip::audio(id, clip.name.clone(), src, to(clip.offset), to(p.position.saturating_sub(origin)), to(length)));
     }
     s.folder = Some(folder);
+    let missing_plugins = place_plugins(&mut s, &ptx.inserts, &tracks);
     e.replace_session(s);
     e.path = None;
-    e.missing_plugins = place_plugins(e, &ptx.inserts, &tracks);
+    e.missing_plugins = missing_plugins;
     for m in &missing {
         e.message(format!("missing media: {m}"));
     }
