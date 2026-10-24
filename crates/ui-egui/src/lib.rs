@@ -742,6 +742,19 @@ impl SoundApp {
         }
     }
 
+    /// Reloads a third-party plugin: keeps its current settings, drops the live instance,
+    /// creates a fresh one from them and opens its editor. Fixes a stuck or blank window without
+    /// restarting (the plugin's library itself stays loaded: other instances may use it).
+    pub fn reload_plugin(&mut self, track: TrackId, slot: usize) {
+        self.capture_plugin_states();
+        let Some(p) = &self.player else { return };
+        p.forget_instance(track, slot);
+        p.update_session(self.engine.session_arc());
+        if let Err(e) = self.open_slot_editor(track, slot) {
+            self.ui.status = format!("Reload: {e}");
+        }
+    }
+
     /// The plugin id in a slot: the track's instrument for the instrument slot, else its insert.
     pub fn slot_plugin_id(&self, track: TrackId, slot: usize) -> Option<String> {
         let t = self.engine.session().track(track)?;

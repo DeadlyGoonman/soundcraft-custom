@@ -777,6 +777,12 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
             open_parameters(app, id, slot);
             ui.close();
         }
+        if third_party
+            && ui.button("Reload Plugin").on_hover_text("Recreate this plugin with its current settings (fixes a stuck or blank window)").clicked()
+        {
+            app.reload_plugin(id, slot);
+            ui.close();
+        }
         if let Some(plugin) = plugin.as_deref().filter(|p| soundcraft_mix::is_third_party(p)) {
             editor_scale_menu(app, ui, id, slot, plugin);
         }
