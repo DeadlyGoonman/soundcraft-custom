@@ -113,6 +113,65 @@ fn a_dragged_upscaled_size_only_rescales_the_editor() {
 }
 
 #[test]
+fn keys_toggle_is_remembered_and_shown() {
+    let (mut h, _id, shared) = setup();
+    assert!(!h.state().ui.editor_keys, "off by default");
+    shared.lock().unwrap().queued = vec![EditorHeaderAction::SetKeys(true)];
+    h.run_steps(3);
+    assert!(h.state().ui.editor_keys);
+    assert!(shared.lock().unwrap().state.keys, "the header shows it lit");
+}
+
+#[test]
+fn a_forwarded_space_plays_and_stops() {
+    let (mut h, _id, shared) = setup();
+    let playing = |h: &Harness<'static, SoundApp>| h.state().engine.transport.playing;
+    let before = playing(&h);
+    let space = soundcraft_dsp::EditorKey { name: "Space", ctrl: false, shift: false, alt: false };
+    shared.lock().unwrap().queued = vec![EditorHeaderAction::Key(space)];
+    // Frames as the app runs them: forwarded keys enter through the raw-input hook.
+    for _ in 0..4 {
+        let mut raw = std::mem::take(h.input_mut());
+        h.state_mut().raw_input_hook(&mut raw);
+        *h.input_mut() = raw;
+        h.step();
+    }
+    assert_ne!(playing(&h), before, "Space from the plugin window toggled the transport");
+}
+
+#[test]
+fn forwarded_key_names_are_known_to_egui() {
+    for name in [
+        "Space",
+        "Enter",
+        "Home",
+        "End",
+        "0",
+        "9",
+        "Plus",
+        "Minus",
+        "Period",
+        "F1",
+        "F12",
+        "A",
+        "Z",
+        "ArrowLeft",
+        "ArrowDown",
+        "Delete",
+        "Backspace",
+        "Equals",
+        "Comma",
+        "OpenBracket",
+        "CloseBracket",
+    ] {
+        let k = soundcraft_dsp::EditorKey { name, ctrl: true, shift: false, alt: false };
+        let evs = soundcraft_ui_egui::editor_key_events(k);
+        assert_eq!(evs.len(), 2, "{name}: press and release");
+        assert!(matches!(evs[0], egui::Event::Key { pressed: true, modifiers, .. } if modifiers.command && modifiers.ctrl));
+    }
+}
+
+#[test]
 fn the_mixers_bypass_reaches_the_editor_next_frame() {
     let (mut h, _id, shared) = setup();
     assert!(!shared.lock().unwrap().state.bypass);

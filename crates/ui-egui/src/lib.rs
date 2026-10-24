@@ -135,6 +135,10 @@ pub struct UiState {
     /// without an entry opens at 100 % Auto.
     #[serde(default)]
     pub editor_scales: HashMap<String, soundcraft_dsp::EditorScale>,
+    /// Plugin editor windows send SoundCraft's shortcut keys (Space = play/stop, ...) to the app
+    /// (the header's Keys toggle). Off by default: plugins with text fields need the keyboard.
+    #[serde(default)]
+    pub editor_keys: bool,
 }
 
 impl Default for UiState {
@@ -198,6 +202,7 @@ impl Default for UiState {
             ui_scale: 1.0,
             wave_view_zoom: 1.0,
             editor_scales: HashMap::new(),
+            editor_keys: false,
         }
     }
 }
@@ -381,6 +386,9 @@ pub struct SoundApp {
     /// Bring the separate Mix window to the front on the next frame.
     pub(crate) focus_mix: bool,
     pub synthetic: Vec<egui::Event>,
+    /// Shortcut keys pressed in plugin editor windows (header Keys on), fed into the next frame's
+    /// input as if pressed in the main window.
+    pub editor_key_events: Vec<egui::Event>,
     /// Where a dropped audio file loads into a track's sampler (last frame's rects).
     pub sample_drop_targets: Vec<(egui::Rect, TrackId)>,
     pub audio_drop_lanes: Vec<(egui::Rect, egui::Rect, TrackId)>,
@@ -477,6 +485,7 @@ impl SoundApp {
             palette: palette::PaletteState::default(),
             focus_mix: false,
             synthetic: Vec::new(),
+            editor_key_events: Vec::new(),
             sample_drop_targets: Vec::new(),
             audio_drop_lanes: Vec::new(),
             drop_preview: file_drop::DropPreview::default(),
@@ -829,6 +838,14 @@ impl SoundApp {
                     self.engine.execute("mix.insert_delta", &json!({"track": t.0, "slot": slot, "value": v})).map(drop).map_err(|e| e.to_string())
                 }
                 A::SetScale(s) => self.set_slot_editor_scale(t, slot, s),
+                A::SetKeys(on) => {
+                    self.ui.editor_keys = on;
+                    Ok(())
+                }
+                A::Key(k) => {
+                    self.editor_key_events.extend(editor_key_events(k));
+                    Ok(())
+                }
             };
             if let Err(e) = result {
                 self.ui.status = e;
@@ -864,6 +881,7 @@ impl SoundApp {
                         scale,
                         native_scaling: p.editor_native_scaling(t.id, slot),
                         can_resize: false,
+                        keys: self.ui.editor_keys,
                     },
                 );
             }
@@ -1503,6 +1521,8 @@ impl SoundApp {
                 !matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::PointerGone | egui::Event::MouseMoved(_))
             });
         }
+        // Shortcut keys from plugin editor windows: press and release, all at once.
+        raw.events.append(&mut self.editor_key_events);
         let Some(first) = self.synthetic.first().cloned() else { return };
         let take = match first {
             egui::Event::Key { pressed: true, .. } => {
@@ -1935,4 +1955,12 @@ mod tests {
         assert!(!app.is_playing());
         assert!((speed(&app) - 1.0).abs() < 1e-3, "a half-speed pass that ends on its own restores full speed");
     }
+}
+
+/// The egui key press and release for a key forwarded from a plugin editor window (empty for a
+/// name egui doesn't know). Ctrl is the command key (SoundCraft's shortcuts use Cmd = Ctrl off Mac).
+pub fn editor_key_events(k: soundcraft_dsp::EditorKey) -> Vec<egui::Event> {
+    let Some(key) = egui::Key::from_name(k.name) else { return Vec::new() };
+    let modifiers = egui::Modifiers { alt: k.alt, ctrl: k.ctrl, shift: k.shift, mac_cmd: false, command: k.ctrl };
+    [true, false].into_iter().map(|pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers }).collect()
 }

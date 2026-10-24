@@ -314,6 +314,9 @@ pub struct EditorHeaderState {
     pub native_scaling: bool,
     /// The plugin's view can be given another size (without a scale factor).
     pub can_resize: bool,
+    /// The editor window sends SoundCraft's shortcut keys (Space = play/stop, ...) to the app
+    /// instead of the plugin.
+    pub keys: bool,
 }
 
 /// A click in an editor window's header, for the UI to apply as a command.
@@ -321,8 +324,23 @@ pub struct EditorHeaderState {
 pub enum EditorHeaderAction {
     SetBypass(bool),
     SetDelta(bool),
-    /// A scale chosen from the header menu or by dragging the window frame.
+    /// A scale chosen by dragging the window frame.
     SetScale(EditorScale),
+    /// The header's Keys toggle: send shortcut keys to SoundCraft while the editor has focus.
+    SetKeys(bool),
+    /// A shortcut key pressed in the editor while Keys is on, for the app to handle as if pressed
+    /// in its own window.
+    Key(EditorKey),
+}
+
+/// A key press forwarded from a plugin editor window: an egui key name (`egui::Key::from_name`)
+/// and the modifiers held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorKey {
+    pub name: &'static str,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
 }
 
 /// The filter that stretches a plugin editor drawn at its own size (host-side upscaling).

@@ -28,16 +28,19 @@ impl Rect {
 /// A clickable part of the header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
+    /// "Keys": send SoundCraft's shortcut keys to the app while the editor has focus.
+    Keys,
     Bypass,
     /// "Δ Delta": wet minus dry.
     Delta,
 }
 
-/// Where the header's buttons are for a width and dpi: `… [Bypass] [Δ Delta]`, right-aligned
-/// (next to the close button above them).
+/// Where the header's buttons are for a width and dpi: `… [Keys] [Bypass] [Δ Delta]`,
+/// right-aligned (next to the close button above them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
     pub height: i32,
+    pub keys: Rect,
     pub bypass: Rect,
     pub delta: Rect,
 }
@@ -60,15 +63,71 @@ pub fn layout(width: i32, dpi: u32) -> Layout {
     let (top, bottom) = (pad, h - pad);
     let delta_w = px(68, dpi);
     let bypass_w = px(64, dpi);
-    let right = width.max(pad + bypass_w + pad + delta_w + pad) - pad;
+    let keys_w = px(52, dpi);
+    let right = width.max(pad + keys_w + pad + bypass_w + pad + delta_w + pad) - pad;
     let delta = Rect { left: right - delta_w, top, right, bottom };
     let bypass = Rect { left: delta.left - pad - bypass_w, top, right: delta.left - pad, bottom };
-    Layout { height: h, bypass, delta }
+    let keys = Rect { left: bypass.left - pad - keys_w, top, right: bypass.left - pad, bottom };
+    Layout { height: h, keys, bypass, delta }
 }
 
 /// The button under a header point.
 pub fn hit(l: &Layout, x: i32, y: i32) -> Option<Button> {
-    [(l.bypass, Button::Bypass), (l.delta, Button::Delta)].into_iter().find(|(r, _)| r.contains(x, y)).map(|(_, b)| b)
+    [(l.keys, Button::Keys), (l.bypass, Button::Bypass), (l.delta, Button::Delta)].into_iter().find(|(r, _)| r.contains(x, y)).map(|(_, b)| b)
+}
+
+/// The Keys button's tooltip.
+pub const KEYS_TIP: &str = "Send keys to SoundCraft (Space = play/stop)";
+
+/// Which key presses an editor window sends to SoundCraft while Keys is on, as the egui key name
+/// the app's shortcut handling knows (`None`: the plugin gets the key). `vk` is a Windows
+/// virtual-key code.
+///
+/// Plain keys: only the transport and navigation keys a plugin rarely needs (Space, Enter, Home,
+/// End, F1-F12, the numeric keypad), so typing into a plugin's text fields still works. With Ctrl
+/// or Alt held: also letters, the number row, arrows and the rest (SoundCraft's menu shortcuts
+/// such as Ctrl+S, Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y). Escape and Tab always stay with the plugin.
+pub fn forward_key(vk: u32, ctrl: bool, alt: bool) -> Option<&'static str> {
+    const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    const LETTERS: [&str; 26] =
+        ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"];
+    const FKEYS: [&str; 12] = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"];
+    let i = |base: u32| (vk - base) as usize;
+    let always = match vk {
+        0x20 => Some("Space"),
+        0x0D => Some("Enter"),
+        0x24 => Some("Home"),
+        0x23 => Some("End"),
+        0x60..=0x69 => DIGITS.get(i(0x60)).copied(), // numeric keypad 0-9
+        0x6B => Some("Plus"),                        // keypad +
+        0x6D => Some("Minus"),                       // keypad -
+        0x6E => Some("Period"),                      // keypad .
+        0x70..=0x7B => FKEYS.get(i(0x70)).copied(),
+        _ => None,
+    };
+    if always.is_some() {
+        return always;
+    }
+    if !(ctrl || alt) {
+        return None;
+    }
+    match vk {
+        0x30..=0x39 => DIGITS.get(i(0x30)).copied(),
+        0x41..=0x5A => LETTERS.get(i(0x41)).copied(),
+        0x25 => Some("ArrowLeft"),
+        0x26 => Some("ArrowUp"),
+        0x27 => Some("ArrowRight"),
+        0x28 => Some("ArrowDown"),
+        0x2E => Some("Delete"),
+        0x08 => Some("Backspace"),
+        0xBB => Some("Equals"),
+        0xBD => Some("Minus"),
+        0xBC => Some("Comma"),
+        0xBE => Some("Period"),
+        0xDB => Some("OpenBracket"),
+        0xDD => Some("CloseBracket"),
+        _ => None,
+    }
 }
 
 /// Delta needs a dry signal: unavailable on instruments and while bypassed.
@@ -152,11 +211,50 @@ mod tests {
     }
 
     #[test]
+    fn keys_sits_left_of_bypass() {
+        for dpi in [96, 144, 192] {
+            let l = layout(800, dpi);
+            assert!(l.keys.left >= 0 && l.keys.right < l.bypass.left);
+            assert_eq!(l.keys.top, l.bypass.top);
+        }
+        let l = layout(10, 96);
+        assert!(l.keys.left >= 0 && l.keys.right < l.bypass.left, "too narrow: still in order");
+    }
+
+    #[test]
+    fn which_keys_go_to_soundcraft() {
+        // Transport and navigation keys, plain or with modifiers.
+        assert_eq!(forward_key(0x20, false, false), Some("Space"));
+        assert_eq!(forward_key(0x0D, false, false), Some("Enter"));
+        assert_eq!(forward_key(0x24, false, false), Some("Home"));
+        assert_eq!(forward_key(0x23, false, false), Some("End"));
+        assert_eq!(forward_key(0x61, false, false), Some("1"), "keypad digits");
+        assert_eq!(forward_key(0x6B, false, false), Some("Plus"));
+        assert_eq!(forward_key(0x71, false, false), Some("F2"));
+        // Typing stays with the plugin.
+        assert_eq!(forward_key(0x41, false, false), None, "a plain letter");
+        assert_eq!(forward_key(0x31, false, false), None, "a plain number-row digit");
+        assert_eq!(forward_key(0x25, false, false), None, "a plain arrow");
+        assert_eq!(forward_key(0x08, false, false), None, "plain backspace");
+        // SoundCraft's menu shortcuts.
+        assert_eq!(forward_key(0x53, true, false), Some("S"), "Ctrl+S");
+        assert_eq!(forward_key(0x5A, true, false), Some("Z"), "Ctrl+Z (and Ctrl+Shift+Z)");
+        assert_eq!(forward_key(0x59, true, false), Some("Y"));
+        assert_eq!(forward_key(0x31, true, false), Some("1"));
+        assert_eq!(forward_key(0xBB, true, false), Some("Equals"));
+        // Never: Escape, Tab, modifiers on their own.
+        for vk in [0x1B, 0x09, 0x10, 0x11, 0x12] {
+            assert_eq!(forward_key(vk, true, false), None, "{vk:#x}");
+            assert_eq!(forward_key(vk, false, false), None, "{vk:#x}");
+        }
+    }
+
+    #[test]
     fn hits_find_each_button() {
         for dpi in [96, 144, 192] {
             let l = layout(640, dpi);
             let mid = |r: Rect| ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
-            for (r, b) in [(l.bypass, Button::Bypass), (l.delta, Button::Delta)] {
+            for (r, b) in [(l.keys, Button::Keys), (l.bypass, Button::Bypass), (l.delta, Button::Delta)] {
                 let (x, y) = mid(r);
                 assert_eq!(hit(&l, x, y), Some(b), "{dpi}");
             }

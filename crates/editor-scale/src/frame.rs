@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
-use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorScale};
+use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorKey, EditorScale};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
@@ -23,8 +23,13 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Controls::{
+    ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW, TTS_ALWAYSTIP,
+    TTS_NOPREFIX, TTTOOLINFOW,
+};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyWindow, GA_ROOTOWNER, GW_HWNDNEXT, GWL_EXSTYLE, GWLP_USERDATA, GetAncestor,
     GetClassNameW, GetClientRect, GetForegroundWindow, GetParent, GetSystemMenu, GetWindow, GetWindowLongPtrW, GetWindowRect,
@@ -34,8 +39,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT, WM_SIZE, WM_SIZING, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
+use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, GA_ROOT, HC_ACTION, SetWindowsHookExW, WH_KEYBOARD, WS_EX_TOPMOST, WS_POPUP};
 use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, SWP_FRAMECHANGED};
-use windows::core::{HSTRING, PCWSTR, w};
+use windows::core::{HSTRING, PCWSTR, PWSTR, w};
 
 use crate::header::{self, Button, Edge};
 
@@ -79,6 +85,12 @@ struct Frame {
     dragged: Cell<bool>,
     /// A host resize is in progress: no drag limits apply to it.
     programmatic: Cell<bool>,
+    /// Keys whose press went to SoundCraft: their release goes there too (the plugin never sees
+    /// half a key press).
+    swallowed: RefCell<Vec<u32>>,
+    /// The Keys button's tooltip window (null when unavailable) and its text.
+    tooltip: Cell<HWND>,
+    tip_text: RefCell<Vec<u16>>,
 }
 
 /// A plugin editor's window: frame, header and body. Main thread only; dropping it destroys the
@@ -177,6 +189,138 @@ fn nonclient(top: HWND, dpi: u32) -> (i32, i32) {
         let _ = AdjustWindowRectExForDpi(&mut r, style, false, EX_STYLE, dpi);
     }
     (r.right - r.left, r.bottom - r.top)
+}
+
+/// A tooltip on the header's Keys button.
+fn create_tooltip(top: HWND, header: HWND, f: &Frame) -> HWND {
+    // SAFETY: common-controls init and a tooltip window owned by our frame; the tool's text buffer
+    // lives in `f` as long as the windows.
+    unsafe {
+        let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_BAR_CLASSES };
+        let _ = InitCommonControlsEx(&icc);
+        let Ok(tip) = CreateWindowExW(
+            WS_EX_TOPMOST,
+            TOOLTIPS_CLASSW,
+            None,
+            WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            Some(top),
+            None,
+            module_instance(),
+            None,
+        ) else {
+            return HWND::default();
+        };
+        let info = TTTOOLINFOW {
+            cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_SUBCLASS,
+            hwnd: header,
+            uId: 1,
+            lpszText: PWSTR(f.tip_text.borrow_mut().as_mut_ptr()),
+            ..Default::default()
+        };
+        SendMessageW(tip, TTM_ADDTOOLW, None, Some(LPARAM(&info as *const TTTOOLINFOW as isize)));
+        tip
+    }
+}
+
+/// Puts the tooltip's area on the Keys button after a header resize.
+fn place_tooltip(header: HWND, f: &Frame, keys: header::Rect) {
+    let tip = f.tooltip.get();
+    if tip.0.is_null() {
+        return;
+    }
+    let info = TTTOOLINFOW {
+        cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+        hwnd: header,
+        uId: 1,
+        rect: RECT { left: keys.left, top: keys.top, right: keys.right, bottom: keys.bottom },
+        ..Default::default()
+    };
+    // SAFETY: our live tooltip; `info` lives for the call.
+    unsafe { SendMessageW(tip, TTM_NEWTOOLRECTW, None, Some(LPARAM(&info as *const TTTOOLINFOW as isize))) };
+}
+
+thread_local! {
+    /// This thread's keyboard hook (installed once, with the first editor window).
+    static KEY_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Installs a keyboard hook for this (the UI) thread. It sees each key before the focused window
+/// does, so keys meant for SoundCraft never reach the plugin while its frame has Keys on.
+fn install_key_hook() {
+    if KEY_HOOK.with(Cell::get) {
+        return;
+    }
+    // SAFETY: a thread-scoped hook on our own thread with a procedure that lives for the process.
+    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD, Some(key_hook), None, GetCurrentThreadId()) };
+    KEY_HOOK.with(|h| h.set(hook.is_ok()));
+}
+
+/// The frame whose window (or a child of it) has the keyboard focus.
+fn focused_frame<'a>() -> Option<&'a Frame> {
+    // SAFETY: plain queries on this thread's focus window.
+    let root = unsafe {
+        let focus = GetFocus();
+        if focus.0.is_null() {
+            return None;
+        }
+        GetAncestor(focus, GA_ROOT)
+    };
+    if class_of(root) == "SoundCraftEditorScaleSource" {
+        // A plugin child of the upscaler's hidden source window: its frame is noted on the source.
+        // SAFETY: the source's user data is 0 or its frame's handle (set by the upscaler).
+        let top = HWND(unsafe { GetWindowLongPtrW(root, GWLP_USERDATA) } as *mut c_void);
+        return frame_of(top);
+    }
+    frame_of(root)
+}
+
+unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let swallow = code >= 0 && catch_unwind(AssertUnwindSafe(|| route_key(code as u32, wp.0 as u32, lp.0 as u32))).unwrap_or(false);
+    if swallow {
+        return LRESULT(1);
+    }
+    // SAFETY: passes the event on unchanged.
+    unsafe { CallNextHookEx(None, code, wp, lp) }
+}
+
+/// Decides whether a key event goes to SoundCraft (true: the plugin doesn't get it) and queues
+/// the press for the app. `lp` bit 31 is set on release, bit 30 on auto-repeat.
+fn route_key(code: u32, vk: u32, lp: u32) -> bool {
+    let Some(f) = focused_frame() else { return false };
+    let up = lp & (1 << 31) != 0;
+    if up {
+        let mut sw = f.swallowed.borrow_mut();
+        let Some(i) = sw.iter().position(|&k| k == vk) else { return false };
+        if code == HC_ACTION {
+            sw.remove(i);
+        }
+        return true;
+    }
+    if !f.state.get().keys {
+        return false;
+    }
+    // SAFETY: plain key-state queries for this thread.
+    let (ctrl, shift, alt) = unsafe {
+        let down = |k: VIRTUAL_KEY| GetKeyState(i32::from(k.0)) < 0;
+        (down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU))
+    };
+    let Some(name) = header::forward_key(vk, ctrl, alt) else { return false };
+    if code == HC_ACTION {
+        let repeat = lp & (1 << 30) != 0;
+        if !repeat {
+            f.actions.borrow_mut().push(EditorHeaderAction::Key(EditorKey { name, ctrl, shift, alt }));
+        }
+        let mut sw = f.swallowed.borrow_mut();
+        if !sw.contains(&vk) {
+            sw.push(vk);
+        }
+    }
+    true
 }
 
 /// Adds or removes the sizing border, keeping the body's size.
@@ -292,6 +436,9 @@ impl HostWindow {
             native: Cell::new((0.0, 0.0)),
             dragged: Cell::new(false),
             programmatic: Cell::new(false),
+            swallowed: RefCell::new(Vec::new()),
+            tooltip: Cell::new(HWND::default()),
+            tip_text: RefCell::new(header::KEYS_TIP.encode_utf16().chain(Some(0)).collect()),
         }));
         // SAFETY: `top` is our live window; the pointer stays valid until `Drop` clears it.
         unsafe { SetWindowLongPtrW(top, GWLP_USERDATA, frame as isize) };
@@ -321,7 +468,9 @@ impl HostWindow {
         if let Some(f) = this.fr() {
             f.header.set(header);
             f.body.set(body_hwnd);
+            f.tooltip.set(create_tooltip(top, header, f));
         }
+        install_key_hook();
         // No Minimize/Maximize/Restore in the system menu either (the frame has no such boxes).
         // SAFETY: our live frame's own system menu; missing items are ignored.
         unsafe {
@@ -496,6 +645,7 @@ fn layout_children(top: HWND, f: &Frame) {
     // SAFETY: our live child windows.
     unsafe {
         let _ = MoveWindow(f.header.get(), 0, 0, cw, hh, true);
+        place_tooltip(f.header.get(), f, header::layout(cw, dpi_of(top)).keys);
         let _ = MoveWindow(f.body.get(), 0, hh, cw, (ch - hh).max(1), true);
     }
 }
@@ -659,6 +809,7 @@ fn draw_header(hwnd: HWND, hdc: HDC, s: &EditorHeaderState) {
     let idle = rgb(0x3C, 0x3C, 0x3C);
     let delta_on = s.delta && header::delta_enabled(s);
     let buttons = [
+        (l.keys, "Keys".to_string(), if s.keys { rgb(0x3C, 0xB4, 0x5A) } else { idle }, if s.keys { rgb(0x10, 0x10, 0x10) } else { text }),
         (l.bypass, "Bypass".to_string(), if s.bypass { rgb(0xE6, 0xA0, 0x1E) } else { idle }, if s.bypass { rgb(0x10, 0x10, 0x10) } else { text }),
         (
             l.delta,
@@ -717,6 +868,10 @@ fn click_header(hwnd: HWND, x: i32, y: i32) {
     let l = header::layout(r.right - r.left, dpi_of(hwnd));
     let mut s = f.state.get();
     let action = match header::hit(&l, x, y) {
+        Some(Button::Keys) => {
+            s.keys = !s.keys;
+            EditorHeaderAction::SetKeys(s.keys)
+        }
         Some(Button::Bypass) => {
             s.bypass = !s.bypass;
             EditorHeaderAction::SetBypass(s.bypass)
@@ -801,6 +956,9 @@ mod tests {
         win.set_header(EditorHeaderState { is_instrument: true, ..Default::default() });
         click_header(header, (l.delta.left + l.delta.right) / 2, l.height / 2);
         assert!(win.take_actions().is_empty(), "no delta on an instrument");
+        // Keys toggles.
+        click_header(header, (l.keys.left + l.keys.right) / 2, l.height / 2);
+        assert_eq!(win.take_actions(), vec![EditorHeaderAction::SetKeys(true)]);
         // The left side of the header is empty: a click there does nothing.
         click_header(header, 10, l.height / 2);
         assert!(win.take_actions().is_empty());

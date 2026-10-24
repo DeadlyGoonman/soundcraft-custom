@@ -153,6 +153,11 @@ impl ScaledWindow {
             }
         };
         let canvas = frame.body();
+        // Lets the frame's keyboard routing find it from a plugin child of the source.
+        // SAFETY: our live source window; its user data is otherwise unused.
+        unsafe {
+            SetWindowLongPtrW(source, GWLP_USERDATA, frame.raw() as isize);
+        }
         let state = Box::new(State {
             source,
             window: frame,
@@ -1490,6 +1495,13 @@ mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::{WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE};
 
+    /// Tests that show windows take turns: a window raised by one would take the focus another
+    /// test checks.
+    fn ui_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Dispatches this thread's pending messages (paints, timers), as the app's event loop does.
     fn pump_messages() {
         use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage};
@@ -1550,6 +1562,7 @@ mod tests {
 
     #[test]
     fn child_colour_comes_through() {
+        let _ui = ui_lock();
         let mut sw = ScaledWindow::new("editor-scale test", 64, 48, 2.0, UpscaleFilter::Fsr1).expect("create");
         let _child = red_child(HWND(sw.parent()), 64, 48);
         sw.raise();
@@ -1570,6 +1583,7 @@ mod tests {
 
     #[test]
     fn upscaled_frames_are_steady() {
+        let _ui = ui_lock();
         // Regression: frames were copied into the swapchain buffer at the "current index", which in
         // D3D11 is read-only every other frame, so the window flashed black.
         let mut sw = ScaledWindow::new("editor-scale steady test", 64, 48, 2.0, UpscaleFilter::Fsr1).expect("create");
@@ -1632,6 +1646,7 @@ mod tests {
 
     #[test]
     fn a_second_child_window_is_captured() {
+        let _ui = ui_lock();
         // Plugins draw parts of their editor in their own child windows: those must be in the
         // captured frame too, not just the first child.
         let mut sw = ScaledWindow::new("editor-scale children test", 64, 48, 2.0, UpscaleFilter::Fsr1).expect("create");
@@ -1726,6 +1741,7 @@ mod tests {
 
     #[test]
     fn the_source_sits_exactly_under_the_canvas() {
+        let _ui = ui_lock();
         let mut sw = ScaledWindow::new("editor-scale origin test", 320, 240, 2.0, UpscaleFilter::Fsr1).expect("create");
         sw.raise();
         let (canvas, source) = sw.origins();
@@ -1766,6 +1782,7 @@ mod tests {
 
     #[test]
     fn an_animated_editor_is_upscaled_at_a_steady_frame_rate() {
+        let _ui = ui_lock();
         use windows::Win32::Graphics::Gdi::{InvalidateRect, UpdateWindow};
         use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage};
         let sw = ScaledWindow::new("editor-scale fps test", 400, 300, 1.5, UpscaleFilter::Fsr1).expect("create");
@@ -1821,6 +1838,7 @@ mod tests {
 
     #[test]
     fn rescaling_an_upscaled_window_keeps_the_focus_where_it_is() {
+        let _ui = ui_lock();
         use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
         let mut sw = ScaledWindow::new("editor-scale focus test", 320, 240, 1.0, UpscaleFilter::Fsr1).expect("create");
         let _child = red_child(HWND(sw.parent()), 320, 240);
