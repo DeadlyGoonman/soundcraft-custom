@@ -970,6 +970,24 @@ impl Player {
         self.side().forget((track, slot));
     }
 
+    /// Releases every third-party plugin instance before a different session takes over, so
+    /// the next session's plugins are created only once the old ones are gone: some plugin
+    /// shells (Waves') crash when instances of two sessions are alive together. Waits briefly
+    /// for the audio thread to hand them back. Call on the UI thread.
+    pub fn release_all(&self) {
+        let mut side = self.side();
+        let keys: Vec<(TrackId, usize)> = side.shadow.keys().copied().collect();
+        for k in keys {
+            side.forget(k);
+        }
+        let _ = self.tx.send(Cmd::Session(Arc::new(Session::default()), Vec::new()));
+        // The audio thread retires the old instances on its next callback and sends them back.
+        if let Ok(g) = side.garbage.recv_timeout(std::time::Duration::from_millis(500)) {
+            drop(g);
+        }
+        side.collect_garbage();
+    }
+
     /// Sends a new session snapshot to the audio thread, with freshly created (state-restored,
     /// prepared) instances of any third-party plugin it newly needs. Call on the UI thread.
     pub fn update_session(&self, s: Arc<Session>) {

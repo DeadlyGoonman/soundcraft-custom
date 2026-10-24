@@ -423,10 +423,15 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     // Which playlists load: the ones tracks play, in track order, when the session lists them;
     // else one per family of takes. Unused takes are not loaded.
     let order: HashMap<&str, usize> = ptx.active.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
-    // When no track is named after a playlist with clips (a renamed session), fall back to the
-    // best take per family.
-    let named_play = ptx.placements.iter().any(|p| order.contains_key(p.playlist.as_str()));
-    let chosen: std::collections::HashSet<&str> = if named_play { order.keys().copied().collect() } else { best_per_family(&ptx.placements) };
+    // Playlists the session lists (modern) or names tracks after (classic) play. Classic sessions
+    // can't be sure: families of takes with no such playlist (tracks renamed since) add their
+    // best take, so their audio isn't lost. Modern sessions list exactly what plays.
+    let mut chosen: std::collections::HashSet<&str> = order.keys().copied().collect();
+    if ptx.era != Era::Modern {
+        let covered: std::collections::HashSet<String> =
+            ptx.placements.iter().filter(|p| order.contains_key(p.playlist.as_str())).map(|p| family(&p.playlist)).collect();
+        chosen.extend(best_per_family(&ptx.placements).into_iter().filter(|pl| !covered.contains(&family(pl))));
+    }
     let mut placements: Vec<&PtxPlacement> = ptx.placements.iter().filter(|p| chosen.contains(p.playlist.as_str())).collect();
     placements.sort_by_key(|p| order.get(p.playlist.as_str()).copied().unwrap_or(usize::MAX));
     let first = placements.iter().map(|p| p.position).min().unwrap_or(0);

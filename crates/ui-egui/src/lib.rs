@@ -1324,6 +1324,8 @@ impl SoundApp {
                         p.set_recording(false);
                         p.set_speed(1.0);
                         p.locate(self.engine.transport.position);
+                        // A different session: its plugins load only after the old ones are gone.
+                        p.release_all();
                     }
                     self.sim = None;
                     // The old capture belongs to the replaced document, never to the new one.
