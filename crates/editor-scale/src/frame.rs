@@ -34,11 +34,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, GetKeyState, VIRTUAL
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyWindow, GA_ROOTOWNER, GW_HWNDNEXT, GWL_EXSTYLE, GWLP_USERDATA, GetAncestor,
     GetClassNameW, GetClientRect, GetForegroundWindow, GetParent, GetSystemMenu, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, MF_BYCOMMAND, MINMAXINFO, MoveWindow, RegisterClassW,
-    SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE,
-    WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT, WM_SIZE, WM_SIZING, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
+    GetWindowThreadProcessId, IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, MF_BYCOMMAND, MINMAXINFO, MoveWindow,
+    RegisterClassW, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT, WM_SIZE, WM_SIZING, WM_TIMER, WNDCLASSW, WS_CAPTION,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, GA_ROOT, HC_ACTION, SetWindowsHookExW, WH_KEYBOARD, WS_EX_TOPMOST, WS_POPUP};
 use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, SWP_FRAMECHANGED};
@@ -50,6 +50,10 @@ use crate::header::{self, Button, Edge};
 pub(crate) const WM_FRAME_MOVED: u32 = WM_APP + 0x51;
 /// Sent to the body just before the frame hides (close button).
 pub(crate) const WM_FRAME_HIDING: u32 = WM_APP + 0x52;
+/// The frame's repaint shortly after it is shown: a plugin still starting its drawing then
+/// (the first Waves editor of a run) gets painted once it is ready.
+const REPAINT_TIMER: usize = 0x5c01;
+const REPAINT_MS: u32 = 400;
 
 /// Close button only: no minimize or maximize box.
 /// Close button only: no minimize or maximize box. A plugin that can scale itself also gets a
@@ -513,6 +517,7 @@ impl HostWindow {
                 let _ = ShowWindow(self.top, SW_SHOW);
                 let _ = SetForegroundWindow(self.top);
                 let _ = RedrawWindow(Some(self.top), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                let _ = SetTimer(Some(self.top), REPAINT_TIMER, REPAINT_MS, None);
             }
         }
     }
@@ -692,6 +697,14 @@ fn frame_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT
             None
         }
         WM_ERASEBKGND => Some(LRESULT(1)),
+        WM_TIMER if wp.0 == REPAINT_TIMER => {
+            // SAFETY: our live window; the timer is one-shot.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), REPAINT_TIMER);
+                let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+            }
+            Some(LRESULT(0))
+        }
         WM_CLOSE => {
             // SAFETY: our live body window.
             unsafe { SendMessageW(f.body.get(), WM_FRAME_HIDING, None, None) };

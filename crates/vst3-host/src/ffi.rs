@@ -2206,6 +2206,11 @@ impl EditorLink {
             win.set_native_size(fitted);
             frame.set_size(fitted);
             size = fitted;
+        } else if let Some(cur) = EditorLink::view_size(&view) {
+            // Tell the attached view its size: some editors (Waves) start or refresh drawing on it.
+            let mut r = sb::ViewRect { left: 0, top: 0, right: cur.0 as i32, bottom: cur.1 as i32 };
+            // SAFETY: valid view; `r` is a live rect for the duration of the call.
+            unsafe { view.onSize(&mut r) };
         }
         win.raise();
         if let Some(old) = g.retired.take() {
