@@ -466,8 +466,9 @@ mod tests {
         for path in files {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             // `io` and this module are the checked gateway; `autosave` writes the app's own
-            // recovery folder; `tests*.rs` are test-only modules.
-            if path.parent() == Some(src.as_path()) && matches!(name, "io.rs" | "file_access.rs" | "autosave.rs") || name.starts_with("tests") {
+            // recovery folder; `plugin_scan` keeps its cache and settings in the app's settings
+            // folder; `tests*.rs` are test-only modules.
+            if path.parent() == Some(src.as_path()) && matches!(name, "io.rs" | "file_access.rs" | "autosave.rs" | "plugin_scan.rs") || name.starts_with("tests") {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();

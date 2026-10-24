@@ -68,6 +68,8 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("ui.audio_device", "Audio Device", "", None),
     ("window.io_setup", "I/O Setup", "", None),
     ("window.shortcuts", "Keyboard Shortcuts", "", None),
+    ("window.preferences", "Preferences", "", None),
+    ("window.plugin_scanner", "Plugin Scanner", "", None),
     ("view.mix_section", "Mix Window View", "", None),
     ("ui.new_tracks_dialog", "New Tracks…", "", None),
     ("ui.bounce_dialog", "Bounce Mix…", "", None),
@@ -476,6 +478,8 @@ const MENU_WINDOWS: &[(&str, &str)] = &[
     ("Setup > Playback Engine...", "window.playback_engine"),
     ("Setup > I/O...", "window.io_setup"),
     ("Setup > Keyboard Shortcuts...", "window.shortcuts"),
+    ("Setup > Preferences...", "window.preferences"),
+    ("Setup > Plugin Scanner...", "window.plugin_scanner"),
     ("Setup > Session", "setup.session"),
     ("Event > Beat Detective", "window.beat_detective"),
     ("Event > Tempo Operations > Tempo Operations Window", "window.tempo_ops"),
@@ -544,7 +548,7 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
     if matches!(id, "ui.dock" | "ui.dock.reset") {
         return Some(crate::docking::command(app, id == "ui.dock.reset", p));
     }
-    if let Some(v) = crate::extra_windows::run(app, id, p) {
+    if let Some(v) = crate::extra_windows::run(app, id, p).or_else(|| crate::preferences::run(app, id, p)) {
         return Some(Ok(v));
     }
     if id == "ui.audio_device" {

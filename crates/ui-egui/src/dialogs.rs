@@ -70,6 +70,9 @@ pub struct Dialogs {
     after_save: Option<(String, Value)>,
     /// A session the browser read while the open one had changes, waiting for `SaveChanges`.
     pending_session: Option<(String, Vec<u8>)>,
+    /// Where Save Session As starts (Setup › Preferences…), and the open project save prompt's fields.
+    pub project_defaults: crate::preferences::ProjectDefaults,
+    pub project: Option<crate::preferences::ProjectSave>,
 }
 
 impl Dialogs {
@@ -128,6 +131,7 @@ impl Dialogs {
     /// Open the dialog for a command; false when the command has no dialog.
     pub fn open_for_command(&mut self, e: &Engine, id: &str) -> bool {
         self.after_save = None;
+        self.project = None;
         let home = default_dir();
         let name = e.session().name.clone();
         self.open = Some(match id {
@@ -147,7 +151,7 @@ impl Dialogs {
                     .filter(|d| !d.as_os_str().is_empty())
                     .map_or(home.clone(), |d| d.display().to_string());
                 Dialog::Bounce {
-                    path: format!("{dir}/Bounced Files/{name} Bounce.wav"),
+                    path: format!("{dir}/{}/{name} Bounce.wav", self.project_defaults.bounce_folder),
                     format: "wav".into(),
                     bit_depth: "24".into(),
                     bitrate: 320,
@@ -169,7 +173,12 @@ impl Dialogs {
                 path: if home.is_empty() {
                     format!("{name}.{}", soundcraft_engine::io::BUNDLE_EXTENSION)
                 } else {
-                    format!("{home}/{name}/{name}.scraft")
+                    // A project: <projects folder>/<name>/<name>.scraft (Setup › Preferences…).
+                    let d = &self.project_defaults;
+                    let p = crate::preferences::ProjectSave { folder: d.dir.clone(), name: name.clone(), subfolder: d.subfolder };
+                    let path = p.path();
+                    self.project = Some(p);
+                    path
                 },
                 key: "path".into(),
             },
@@ -612,40 +621,44 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     }
                 }
                 Dialog::PathPrompt { cmd, path, key, .. } => {
-                    let folder = key == "dir";
-                    let opening = !folder && (cmd.contains("import") || cmd.contains("open") || cmd == "session.new_from_template");
-                    let (mut dir, mut name, ext) = split_save_path(path);
-                    let (old_dir, old_name) = (dir.clone(), name.clone());
-                    let mut picked = None;
-                    egui::Grid::new("path_prompt").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
-                        if folder || opening {
-                            ui.label(if folder { "Folder" } else { "File" });
-                            ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
-                        } else {
-                            ui.label("Folder");
-                            ui.add(egui::TextEdit::singleline(&mut dir).desired_width(420.0));
-                        }
-                        ui.end_row();
-                        ui.label("");
-                        let browse = if folder {
-                            app.services.pick_folder.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(path)).flatten())
-                        } else if opening {
-                            app.services.pick_open.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(cmd, &[])).flatten())
-                        } else {
-                            app.services.pick_save.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(cmd, path)).flatten())
-                        };
-                        picked = browse.flatten();
-                        ui.end_row();
-                        if !folder && !opening {
-                            ui.label("Name");
-                            ui.add(egui::TextEdit::singleline(&mut name).desired_width(420.0));
+                    if let Some(project) = app.dialogs.project.as_mut().filter(|_| cmd.starts_with("session.save")) {
+                        crate::preferences::project_fields(ui, &app.services, cmd, project, path);
+                    } else {
+                        let folder = key == "dir";
+                        let opening = !folder && (cmd.contains("import") || cmd.contains("open") || cmd == "session.new_from_template");
+                        let (mut dir, mut name, ext) = split_save_path(path);
+                        let (old_dir, old_name) = (dir.clone(), name.clone());
+                        let mut picked = None;
+                        egui::Grid::new("path_prompt").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
+                            if folder || opening {
+                                ui.label(if folder { "Folder" } else { "File" });
+                                ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
+                            } else {
+                                ui.label("Folder");
+                                ui.add(egui::TextEdit::singleline(&mut dir).desired_width(420.0));
+                            }
                             ui.end_row();
+                            ui.label("");
+                            let browse = if folder {
+                                app.services.pick_folder.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(path)).flatten())
+                            } else if opening {
+                                app.services.pick_open.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(cmd, &[])).flatten())
+                            } else {
+                                app.services.pick_save.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(cmd, path)).flatten())
+                            };
+                            picked = browse.flatten();
+                            ui.end_row();
+                            if !folder && !opening {
+                                ui.label("Name");
+                                ui.add(egui::TextEdit::singleline(&mut name).desired_width(420.0));
+                                ui.end_row();
+                            }
+                        });
+                        if let Some(p) = picked {
+                            *path = p;
+                        } else if !folder && !opening && (dir != old_dir || name != old_name) {
+                            *path = join_save_path(&dir, &name, &ext);
                         }
-                    });
-                    if let Some(p) = picked {
-                        *path = p;
-                    } else if !folder && !opening && (dir != old_dir || name != old_name) {
-                        *path = join_save_path(&dir, &name, &ext);
                     }
                     let file = soundcraft_engine::io::session_file(path);
                     let replaces = soundcraft_engine::io::replaces(&app.engine, cmd, &file);

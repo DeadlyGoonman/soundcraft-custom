@@ -138,6 +138,18 @@ fn prefs_path() -> Option<std::path::PathBuf> {
     config_dir().map(|b| b.join("ui.json"))
 }
 
+/// The saved plugin scan, read from the settings folder (a first launch scans in the
+/// background, probing each plugin file in a child process of this executable). Runs without
+/// preferences keep the old behavior: each format is scanned in-process on first use.
+fn plugin_scanner() -> soundcraft_ui_egui::extra_windows::plugin_scanner::PluginScanner {
+    use soundcraft_engine::plugin_scan::{PROBE_TIMEOUT, child_probe};
+    use soundcraft_ui_egui::extra_windows::plugin_scanner::PluginScanner;
+    match (prefs_enabled().then(config_dir).flatten(), std::env::current_exe()) {
+        (Some(dir), Ok(exe)) => PluginScanner::startup(Some(dir), Some(child_probe(exe, PROBE_TIMEOUT))),
+        _ => PluginScanner::default(),
+    }
+}
+
 /// Runs without preferences (`SOUNDCRAFT_NO_PREFS`, agents' test runs) neither read nor write them.
 fn prefs_enabled() -> bool {
     std::env::var_os("SOUNDCRAFT_NO_PREFS").is_none()
@@ -234,10 +246,15 @@ fn app_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result {
+    // A plugin probe process of the Plugin Scanner (see `plugin_scan`): load one plugin file,
+    // print what it holds and exit, before any logging or window.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = soundcraft_engine::plugin_scan::probe_command_line(&args) {
+        std::process::exit(code);
+    }
     // First, so every start-up record (and the engine's panic hook, installed with the first
     // Engine) is captured; see `logging`.
     let logger = logging::install();
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("SoundCraft {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -304,6 +321,7 @@ fn main() -> eframe::Result {
             app.leftovers = app.autosave_dir.as_deref().map(soundcraft_engine::autosave::leftovers).unwrap_or_default();
             app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
             app.extra.ui_scale = prefs.ui_scale;
+            app.extra.plugin_scanner = plugin_scanner();
             app.ui = prefs;
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());

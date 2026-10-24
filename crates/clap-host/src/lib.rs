@@ -68,7 +68,7 @@ pub fn parse_id(id: &str) -> Option<&str> {
 }
 
 /// One plugin found by a scan.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClapDescriptor {
     /// SoundCraft id: `clap:<plugin_id>`.
     pub id: String,
@@ -107,6 +107,12 @@ mod api {
     pub fn cached() -> Option<Vec<ClapDescriptor>> {
         registry::cached()
     }
+    pub fn set_scanned(list: Vec<ClapDescriptor>) {
+        registry::set_scanned(list)
+    }
+    pub fn forget_scanned() {
+        registry::forget_scanned()
+    }
     pub fn scan() -> Vec<ClapDescriptor> {
         registry::scan()
     }
@@ -137,6 +143,7 @@ mod api {
     pub fn cached() -> Option<Vec<ClapDescriptor>> {
         Some(Vec::new())
     }
+    pub fn set_scanned(_list: Vec<ClapDescriptor>) {}
     pub fn scan() -> Vec<ClapDescriptor> {
         Vec::new()
     }
@@ -186,6 +193,17 @@ pub fn scan_paths(dirs: &[PathBuf]) -> Vec<ClapDescriptor> {
 /// The plugins of the last scan, without scanning: `None` until something has scanned.
 pub fn cached() -> Option<Vec<ClapDescriptor>> {
     api::cached()
+}
+
+/// Replaces the in-memory scan with `list` (a saved scan read back at launch), so [`scan`] does
+/// not scan again. Plugin infos and remembered instantiation failures are kept.
+pub fn set_scanned(list: Vec<ClapDescriptor>) {
+    api::set_scanned(list)
+}
+
+/// Forgets the scan, so the next [`scan`] scans again. Plugins already loaded stay usable.
+pub fn forget_scanned() {
+    api::forget_scanned()
 }
 
 /// The plugins in one `.clap` file or bundle.

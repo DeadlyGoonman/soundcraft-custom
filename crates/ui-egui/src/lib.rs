@@ -21,6 +21,7 @@ pub mod mix_window;
 pub mod ops_windows;
 pub mod palette;
 pub mod panels;
+pub mod preferences;
 mod recent;
 pub mod recovery;
 pub mod sampler_window;
@@ -139,6 +140,8 @@ pub struct UiState {
     /// (the header's Keys toggle). Off by default: plugins with text fields need the keyboard.
     #[serde(default)]
     pub editor_keys: bool,
+    /// Setup › Preferences… (projects folder, project subfolders, bounce folder).
+    pub preferences: preferences::Prefs,
 }
 
 impl Default for UiState {
@@ -202,6 +205,7 @@ impl Default for UiState {
             ui_scale: 1.0,
             wave_view_zoom: 1.0,
             editor_scales: HashMap::new(),
+            preferences: preferences::Prefs::default(),
             editor_keys: false,
         }
     }

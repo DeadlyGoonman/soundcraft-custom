@@ -82,7 +82,7 @@ pub fn parse_id(id: &str) -> Option<[u8; 16]> {
 }
 
 /// One plugin found by a scan.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Vst3Descriptor {
     /// SoundCraft id: `vst3:<class_id>`.
     pub id: String,
@@ -123,6 +123,12 @@ mod api {
     pub fn cached() -> Option<Vec<Vst3Descriptor>> {
         registry::cached()
     }
+    pub fn set_scanned(list: Vec<Vst3Descriptor>) {
+        registry::set_scanned(list)
+    }
+    pub fn forget_scanned() {
+        registry::forget_scanned()
+    }
     pub fn scan() -> Vec<Vst3Descriptor> {
         registry::scan()
     }
@@ -156,6 +162,7 @@ mod api {
     pub fn cached() -> Option<Vec<Vst3Descriptor>> {
         Some(Vec::new())
     }
+    pub fn set_scanned(_list: Vec<Vst3Descriptor>) {}
     pub fn scan() -> Vec<Vst3Descriptor> {
         Vec::new()
     }
@@ -206,6 +213,17 @@ pub fn scan_paths(dirs: &[PathBuf]) -> Vec<Vst3Descriptor> {
 /// The plugins of the last scan, without scanning: `None` until something has scanned.
 pub fn cached() -> Option<Vec<Vst3Descriptor>> {
     api::cached()
+}
+
+/// Replaces the in-memory scan with `list` (a saved scan read back at launch), so [`scan`] does
+/// not scan again. Plugin infos and remembered instantiation failures are kept.
+pub fn set_scanned(list: Vec<Vst3Descriptor>) {
+    api::set_scanned(list)
+}
+
+/// Forgets the scan, so the next [`scan`] scans again. Plugins already loaded stay usable.
+pub fn forget_scanned() {
+    api::forget_scanned()
 }
 
 /// Shuts plugin hosting down: runs the module exit of every loaded binary that has no live

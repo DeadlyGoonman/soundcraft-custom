@@ -87,6 +87,15 @@ pub fn cached() -> Option<Vec<ClapDescriptor>> {
     registry().lock().unwrap_or_else(PoisonError::into_inner).scanned.clone()
 }
 
+pub fn set_scanned(list: Vec<ClapDescriptor>) {
+    registry().lock().unwrap_or_else(PoisonError::into_inner).scanned = Some(list);
+}
+
+/// Drops the scan list, so the next use scans again (plugins already loaded stay usable).
+pub fn forget_scanned() {
+    registry().lock().unwrap_or_else(PoisonError::into_inner).scanned = None;
+}
+
 pub fn rescan() -> Vec<ClapDescriptor> {
     let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
     r.scanned = None;

@@ -7,10 +7,12 @@ use egui::{Align2, Color32, Sense, Stroke, pos2, vec2};
 use serde_json::{Value, json};
 use soundcraft_model::{Speaker, TrackKind};
 
+pub mod plugin_scanner;
+
 /// How often an auto-updating configuration is refreshed (seconds).
 const AUTO_UPDATE_SECS: f64 = 2.0;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ExtraState {
     pub show_renderer: bool,
     pub show_ui_customization: bool,
@@ -23,6 +25,8 @@ pub struct ExtraState {
     pub tooltips: bool,
     last_auto_update: f64,
     applied: Option<(f32, bool)>,
+    /// Setup › Plugin Scanner (the saved plugin scan and background scans).
+    pub plugin_scanner: plugin_scanner::PluginScanner,
 }
 
 impl Default for ExtraState {
@@ -38,6 +42,7 @@ impl Default for ExtraState {
             tooltips: true,
             last_auto_update: 0.0,
             applied: None,
+            plugin_scanner: plugin_scanner::PluginScanner::default(),
         }
     }
 }
@@ -52,6 +57,7 @@ pub fn run(app: &mut SoundApp, id: &str, p: &Value) -> Option<Value> {
         "window.renderer" => flag(&mut app.extra.show_renderer),
         "window.ui_customization" => flag(&mut app.extra.show_ui_customization),
         "window.config_auto_update" => flag(&mut app.extra.auto_update_config),
+        "window.plugin_scanner" => flag(&mut app.extra.plugin_scanner.open),
         _ => return None,
     })
 }
@@ -61,6 +67,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     renderer(app, ctx);
     ui_customization(app, ctx);
     apply_customization(app, ctx);
+    crate::preferences::show(app, ctx);
+    plugin_scanner::window(app, ctx);
 }
 
 fn apply_customization(app: &mut SoundApp, ctx: &egui::Context) {
