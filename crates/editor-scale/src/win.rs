@@ -1,7 +1,8 @@
 //! The Windows implementation of [`ScaledWindow`]. UI (main) thread only.
 //!
 //! Two windows: a hidden *source* popup at native size (the plugin's parent, layered at alpha 1 and
-//! click-through) and a captioned *visible* window owned by it at native x factor. `pump` captures
+//! click-through, owned by the app's main window) and an editor frame ([`HostWindow`], owned by the
+//! source) whose body is the *canvas* the picture is presented in, at native x factor. `pump` captures
 //! the source with `PrintWindow` into a CPU frame, then presents it through D3D11 compute (FSR 1 or
 //! bilinear). If any D3D step fails the window switches once to a `StretchBlt` HALFTONE fallback.
 //!
@@ -12,7 +13,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use soundcraft_dsp::UpscaleFilter;
+use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, UpscaleFilter};
+
+use crate::frame::{HostWindow, WM_FRAME_HIDING, WM_FRAME_MOVED, app_owner};
 use windows::Win32::Foundation::{COLORREF, FALSE, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, ID3DBlob};
@@ -37,14 +40,13 @@ use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, BringWindowToTop, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
-    GetWindowLongPtrW, IsWindowVisible, LWA_ALPHA, PostMessageW, RealChildWindowFromPoint, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_MOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, LWA_ALPHA, PostMessageW,
+    RealChildWindowFromPoint, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetLayeredWindowAttributes,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::{HSTRING, Interface, PCSTR, PCWSTR, w};
+use windows::core::{Interface, PCSTR, PCWSTR, w};
 
 /// Largest accepted dimension (native or scaled), in pixels.
 const MAX_DIM: u32 = 16_384;
@@ -53,9 +55,6 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// `PW_CLIENTONLY` and `PW_RENDERFULLCONTENT` from WinUser.h.
 const PW_CLIENTONLY: u32 = 1;
 const PW_RENDERFULLCONTENT: u32 = 2;
-/// The visible window's frame: a captioned window that is not user-resizable.
-const VIEW_STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
-const VIEW_EX_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(0);
 
 /// Vendored AMD FidelityFX FSR 1 headers (MIT, see `shaders/LICENSE-FidelityFX-FSR.txt`).
 const FFX_A: &str = include_str!("../shaders/ffx_a.h");
@@ -76,11 +75,14 @@ pub struct ScaledWindow {
 // struct merely carries the pointer between the host's locks, as `HostWindow` does in the hosts.
 unsafe impl Send for ScaledWindow {}
 
-/// Everything behind the visible window. Owned through a raw pointer stored in the visible
-/// window's `GWLP_USERDATA`; freed in [`ScaledWindow::drop`] after the windows are destroyed.
+/// Everything behind the canvas. Owned through a raw pointer stored in the canvas's
+/// `GWLP_USERDATA`; freed in [`ScaledWindow::drop`] after the windows are destroyed.
 struct State {
     source: HWND,
-    visible: HWND,
+    /// The editor frame (header + canvas) the user sees.
+    window: HostWindow,
+    /// The frame's body: the swapchain and the input target.
+    canvas: HWND,
     native: (u32, u32),
     factor: f32,
     filter: UpscaleFilter,
@@ -107,16 +109,19 @@ impl ScaledWindow {
         let factor = clamp_factor(factor);
         let filter = effective_filter(filter);
         let source = create_source(instance, native)?;
-        let visible = match create_visible(instance, title, source, scaled_size(native, factor)) {
-            Ok(hwnd) => hwnd,
+        let (sw, sh) = scaled_size(native, factor);
+        let frame = match HostWindow::create(title, (f64::from(sw), f64::from(sh)), source, class_view()) {
+            Ok(frame) => frame,
             Err(e) => {
                 destroy(source);
                 return Err(e);
             }
         };
+        let canvas = frame.body();
         let state = Box::new(State {
             source,
-            visible,
+            window: frame,
+            canvas,
             native,
             factor,
             filter,
@@ -129,10 +134,10 @@ impl ScaledWindow {
             drag: None,
         });
         let raw = Box::into_raw(state);
-        // SAFETY: `visible` is a live window created on this thread; the pointer is read only by
+        // SAFETY: `canvas` is a live window created on this thread; the pointer is read only by
         // our own window procedure and stays valid until `Drop` clears it and frees the state.
         unsafe {
-            SetWindowLongPtrW(visible, GWLP_USERDATA, raw as isize);
+            SetWindowLongPtrW(canvas, GWLP_USERDATA, raw as isize);
         }
         let mut this = ScaledWindow { state: raw };
         this.st_mut().relayout()?;
@@ -144,9 +149,30 @@ impl ScaledWindow {
         self.st().source.0
     }
 
-    /// The visible window's handle (the one the user sees).
+    /// The frame's handle (the window the user sees).
     pub fn raw(&self) -> *mut c_void {
-        self.st().visible.0
+        self.st().window.raw()
+    }
+
+    /// What the frame's header shows.
+    pub fn set_header(&self, state: EditorHeaderState) {
+        self.st().window.set_header(state);
+    }
+
+    /// Header clicks and frame drags since the last call.
+    pub fn take_actions(&self) -> Vec<EditorHeaderAction> {
+        self.st().window.take_actions()
+    }
+
+    /// The frame's top-left corner on screen.
+    pub fn position(&self) -> Option<(i32, i32)> {
+        self.st().window.position()
+    }
+
+    /// Moves the frame (and its source with it).
+    pub fn move_to(&self, pos: (i32, i32)) {
+        self.st().window.move_to(pos);
+        self.st().follow_visible();
     }
 
     /// Changes the native (plugin) size; the visible window keeps the scale factor.
@@ -172,7 +198,7 @@ impl ScaledWindow {
     /// Captures and presents one frame, at most 60 times per second, only while visible.
     pub fn pump(&mut self) {
         let st = self.st_mut();
-        if !is_visible(st.visible) {
+        if !st.window.is_visible() {
             return;
         }
         let now = Instant::now();
@@ -201,20 +227,20 @@ impl ScaledWindow {
         }
     }
 
-    /// Shows the visible window (and its source) and brings it to the top.
+    /// Shows the frame (and its source) and brings it to the front.
     pub fn raise(&self) {
         let st = self.st();
-        // SAFETY: both handles are live windows owned by this object.
+        // SAFETY: the source is a live window owned by this object.
         unsafe {
             let _ = ShowWindow(st.source, SW_SHOWNOACTIVATE);
-            let _ = ShowWindow(st.visible, SW_SHOWNORMAL);
-            let _ = BringWindowToTop(st.visible);
         }
+        st.window.raise();
+        st.follow_visible();
     }
 
-    /// Whether the visible window is shown on screen.
+    /// Whether the frame is shown on screen.
     pub fn is_visible(&self) -> bool {
-        is_visible(self.st().visible)
+        self.st().window.is_visible()
     }
 
     /// Destroys both windows and frees the GPU and capture resources.
@@ -256,13 +282,14 @@ impl Drop for ScaledWindow {
         // SAFETY: `state` was created by `Box::into_raw` and is freed exactly once, here.
         let st = unsafe { Box::from_raw(self.state) };
         // Detach the pointer before destroying windows so no message can reach freed state.
-        // SAFETY: the visible window is still alive (destroyed below).
+        // SAFETY: the canvas is still alive (destroyed with the frame below).
         unsafe {
-            SetWindowLongPtrW(st.visible, GWLP_USERDATA, 0);
+            SetWindowLongPtrW(st.canvas, GWLP_USERDATA, 0);
         }
-        destroy(st.visible);
-        destroy(st.source);
+        let source = st.source;
+        // Dropping the state destroys the frame (and canvas) before its owner, the source.
         drop(st);
+        destroy(source);
     }
 }
 
@@ -271,21 +298,22 @@ impl State {
     fn relayout(&mut self) -> Result<(), String> {
         let (nw, nh) = self.native;
         let (sw, sh) = scaled_size(self.native, self.factor);
-        // Glue the source to the visible window's client top-left (plugin popups land nearby).
-        let origin = to_screen(self.visible, POINT { x: 0, y: 0 });
-        // SAFETY: both handles are live windows owned by this object.
+        self.window.set_native(f64::from(nw), f64::from(nh));
+        self.window.resize_body(f64::from(sw), f64::from(sh));
+        // Glue the source to the canvas's top-left (plugin popups land nearby).
+        let origin = to_screen(self.canvas, POINT { x: 0, y: 0 });
+        // SAFETY: the source is a live window owned by this object.
         unsafe {
             SetWindowPos(self.source, None, origin.x, origin.y, nw as i32, nh as i32, SWP_NOACTIVATE | SWP_NOZORDER)
                 .map_err(|e| format!("source resize: {e}"))?;
         }
-        resize_client(self.visible, (sw, sh))?;
         self.capture = None;
         self.capture = Some(Capture::new(nw, nh)?);
         self.frame.clear();
         self.frame.resize((nw as usize) * (nh as usize), 0);
         self.gpu = None;
         if !self.gpu_disabled {
-            match Gpu::new(self.visible, self.native, (sw, sh), self.filter) {
+            match Gpu::new(self.canvas, self.native, (sw, sh), self.filter) {
                 Ok(gpu) => self.gpu = Some(gpu),
                 Err(e) => self.disable_gpu(&e),
             }
@@ -308,26 +336,39 @@ impl State {
             return;
         };
         let (nw, nh) = self.native;
-        let (sw, sh) = scaled_size(self.native, self.factor);
-        // SAFETY: `hdc` comes from `GetDC` for our visible window and is released below; the
-        // memory DC in `capture` is alive for as long as `self`.
+        let (sw, sh) = self.canvas_size();
+        // SAFETY: `hdc` comes from `GetDC` for our canvas and is released below; the memory DC in
+        // `capture` is alive for as long as `self`.
         unsafe {
-            let hdc = GetDC(Some(self.visible));
+            let hdc = GetDC(Some(self.canvas));
             if hdc.0.is_null() {
                 return;
             }
             SetStretchBltMode(hdc, HALFTONE);
             let _ = SetBrushOrgEx(hdc, 0, 0, None);
             let _ = StretchBlt(hdc, 0, 0, sw as i32, sh as i32, Some(capture.dc), 0, 0, nw as i32, nh as i32, SRCCOPY);
-            ReleaseDC(Some(self.visible), hdc);
+            ReleaseDC(Some(self.canvas), hdc);
         }
     }
 
-    /// Maps a point in the visible window's client area to the source's screen position.
+    /// The canvas's client size (the picture is stretched to it, also while the frame is dragged).
+    fn canvas_size(&self) -> (u32, u32) {
+        let mut r = RECT::default();
+        // SAFETY: our live canvas; `r` is writable.
+        let _ = unsafe { GetClientRect(self.canvas, &mut r) };
+        if r.right <= r.left || r.bottom <= r.top {
+            return scaled_size(self.native, self.factor);
+        }
+        ((r.right - r.left) as u32, (r.bottom - r.top) as u32)
+    }
+
+    /// Maps a point in the canvas to the source's screen position.
     fn source_screen(&self, client: POINT) -> POINT {
-        let f = self.factor;
-        let x = (client.x as f32 / f).round() as i32;
-        let y = (client.y as f32 / f).round() as i32;
+        let (cw, ch) = self.canvas_size();
+        let fx = cw as f32 / self.native.0.max(1) as f32;
+        let fy = ch as f32 / self.native.1.max(1) as f32;
+        let x = (client.x as f32 / fx).round() as i32;
+        let y = (client.y as f32 / fy).round() as i32;
         let origin = to_screen(self.source, POINT { x: 0, y: 0 });
         POINT { x: origin.x + x, y: origin.y + y }
     }
@@ -346,9 +387,9 @@ impl State {
         if is_down {
             self.focus = target;
             self.drag = Some(target);
-            // SAFETY: the visible window is live and on this thread.
+            // SAFETY: the canvas is live and on this thread.
             unsafe {
-                SetCapture(self.visible);
+                SetCapture(self.canvas);
             }
         }
         let local = to_client(target, screen);
@@ -365,7 +406,7 @@ impl State {
     /// Wheel input: lParam is screen coordinates, so only the position needs mapping.
     fn forward_wheel(&self, msg: u32, wp: WPARAM, lp: LPARAM) {
         let on_visible = POINT { x: lparam_x(lp), y: lparam_y(lp) };
-        let client = to_client(self.visible, on_visible);
+        let client = to_client(self.canvas, on_visible);
         let screen = self.source_screen(client);
         let target = deepest_child_at(self.source, screen);
         post(target, msg, wp, make_lparam(screen.x, screen.y));
@@ -376,20 +417,19 @@ impl State {
         post(self.focus, msg, wp, lp);
     }
 
-    /// Keeps the source glued to the visible window after it moves.
+    /// Keeps the source glued to the canvas after the frame moves.
     fn follow_visible(&self) {
-        let origin = to_screen(self.visible, POINT { x: 0, y: 0 });
+        let origin = to_screen(self.canvas, POINT { x: 0, y: 0 });
         // SAFETY: the source is a live window owned by this object.
         unsafe {
             let _ = SetWindowPos(self.source, None, origin.x, origin.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
 
-    /// Hides both windows (the close button hides; `close` destroys).
+    /// Hides the source as the frame hides (the close button hides; `close` destroys).
     fn hide(&self) {
-        // SAFETY: both handles are live windows owned by this object.
+        // SAFETY: the source is a live window owned by this object.
         unsafe {
-            let _ = ShowWindow(self.visible, SW_HIDE);
             let _ = ShowWindow(self.source, SW_HIDE);
         }
     }
@@ -497,7 +537,7 @@ struct Gpu {
 }
 
 impl Gpu {
-    fn new(visible: HWND, native: (u32, u32), scaled: (u32, u32), filter: UpscaleFilter) -> Result<Self, String> {
+    fn new(canvas: HWND, native: (u32, u32), scaled: (u32, u32), filter: UpscaleFilter) -> Result<Self, String> {
         let shaders = shaders()?;
         let mut device: Option<ID3D11Device> = None;
         let mut ctx: Option<ID3D11DeviceContext> = None;
@@ -592,8 +632,8 @@ impl Gpu {
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
             Flags: 0,
         };
-        // SAFETY: `device` is a live device; `visible` is our live window; `desc` is valid.
-        let swap = unsafe { factory.CreateSwapChainForHwnd(&device, visible, &desc, None, None) }.map_err(|e| format!("swapchain: {e}"))?;
+        // SAFETY: `device` is a live device; `canvas` is our live window; `desc` is valid.
+        let swap = unsafe { factory.CreateSwapChainForHwnd(&device, canvas, &desc, None, None) }.map_err(|e| format!("swapchain: {e}"))?;
         let swap3: IDXGISwapChain3 = swap.cast().map_err(|e| format!("swapchain3: {e}"))?;
 
         Ok(Gpu {
@@ -838,7 +878,7 @@ fn class_source() -> PCWSTR {
     w!("SoundCraftEditorScaleSource")
 }
 
-fn class_view() -> PCWSTR {
+pub(crate) fn class_view() -> PCWSTR {
     w!("SoundCraftEditorScaleView")
 }
 
@@ -862,6 +902,7 @@ fn register_classes() -> Result<(), String> {
             lpfnWndProc: Some(view_proc),
             hInstance: instance,
             lpszClassName: class_view(),
+            hbrBackground: black,
             ..Default::default()
         };
         // SAFETY: the class structures and their name strings are static or live for the call.
@@ -881,7 +922,7 @@ unsafe extern "system" fn source_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
-/// Window procedure of the visible window: input forwarding and show/hide. A panic must not cross
+/// Window procedure of the canvas: input forwarding and following the frame. A panic must not cross
 /// the FFI boundary, so the body is caught and falls back to default processing.
 unsafe extern "system" fn view_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let handled = catch_unwind(AssertUnwindSafe(|| view_message(hwnd, msg, wp, lp)));
@@ -894,7 +935,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     }
 }
 
-/// Handles one message for the visible window; `None` means default processing.
+/// Handles one message for the canvas; `None` means default processing.
 fn view_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
     let st = state_of(hwnd)?;
     let handled = match msg {
@@ -910,11 +951,11 @@ fn view_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT>
             st.forward_key(msg, wp, lp);
             true
         }
-        WM_MOVE => {
+        WM_FRAME_MOVED => {
             st.follow_visible();
             true
         }
-        WM_CLOSE => {
+        WM_FRAME_HIDING => {
             st.hide();
             true
         }
@@ -923,9 +964,9 @@ fn view_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT>
     handled.then_some(LRESULT(0))
 }
 
-/// The state behind a visible window, or `None` while it has none (during window creation).
+/// The state behind a canvas, or `None` while it has none (during window creation).
 fn state_of<'a>(hwnd: HWND) -> Option<&'a mut State> {
-    // SAFETY: GWLP_USERDATA of the visible window is 0 or the `*mut State` stored in `new`, which
+    // SAFETY: GWLP_USERDATA of the canvas is 0 or the `*mut State` stored in `new`, which
     // stays valid until `Drop` clears the pointer and frees it.
     let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut State;
     if raw.is_null() {
@@ -938,9 +979,11 @@ fn state_of<'a>(hwnd: HWND) -> Option<&'a mut State> {
 
 fn create_source(instance: HINSTANCE, native: (u32, u32)) -> Result<HWND, String> {
     let ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT;
-    // SAFETY: class and name are static strings; the parent and menu are absent.
+    let owner = HWND(app_owner());
+    let owner = (!owner.0.is_null()).then_some(owner);
+    // SAFETY: class and name are static strings; the owner is null or the app's live main window.
     let hwnd =
-        unsafe { CreateWindowExW(ex, class_source(), w!(""), WS_POPUP, 0, 0, native.0 as i32, native.1 as i32, None, None, Some(instance), None) }
+        unsafe { CreateWindowExW(ex, class_source(), w!(""), WS_POPUP, 0, 0, native.0 as i32, native.1 as i32, owner, None, Some(instance), None) }
             .map_err(|e| format!("source window: {e}"))?;
     // SAFETY: `hwnd` was just created on this thread. Alpha 1 (not 0) keeps the window rendering.
     let layered = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 1, LWA_ALPHA) };
@@ -955,51 +998,11 @@ fn create_source(instance: HINSTANCE, native: (u32, u32)) -> Result<HWND, String
     Ok(hwnd)
 }
 
-fn create_visible(instance: HINSTANCE, title: &str, owner: HWND, client: (u32, u32)) -> Result<HWND, String> {
-    let mut rect = RECT { left: 0, top: 0, right: client.0 as i32, bottom: client.1 as i32 };
-    // SAFETY: `rect` is a valid RECT the call adjusts in place.
-    unsafe { AdjustWindowRectEx(&mut rect, VIEW_STYLE, false, VIEW_EX_STYLE) }.map_err(|e| format!("window rect: {e}"))?;
-    let title = HSTRING::from(title);
-    // SAFETY: class is registered; `title` lives across the call; the owner is our live source window.
-    unsafe {
-        CreateWindowExW(
-            VIEW_EX_STYLE,
-            class_view(),
-            &title,
-            VIEW_STYLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
-            Some(owner),
-            None,
-            Some(instance),
-            None,
-        )
-    }
-    .map_err(|e| format!("visible window: {e}"))
-}
-
-/// Resizes a visible window so its client area is `client` pixels.
-fn resize_client(hwnd: HWND, client: (u32, u32)) -> Result<(), String> {
-    let mut rect = RECT { left: 0, top: 0, right: client.0 as i32, bottom: client.1 as i32 };
-    // SAFETY: `rect` is valid for the call.
-    unsafe { AdjustWindowRectEx(&mut rect, VIEW_STYLE, false, VIEW_EX_STYLE) }.map_err(|e| format!("window rect: {e}"))?;
-    // SAFETY: `hwnd` is our live window; only the size changes.
-    unsafe { SetWindowPos(hwnd, None, 0, 0, rect.right - rect.left, rect.bottom - rect.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) }
-        .map_err(|e| format!("window resize: {e}"))
-}
-
 fn destroy(hwnd: HWND) {
     // SAFETY: called once per window we created; a failure (already gone) is ignored.
     unsafe {
         let _ = DestroyWindow(hwnd);
     }
-}
-
-fn is_visible(hwnd: HWND) -> bool {
-    // SAFETY: a plain query on a window handle; an invalid handle reports false.
-    unsafe { IsWindowVisible(hwnd) }.as_bool()
 }
 
 /// The screen position of a point given in `hwnd`'s client coordinates.
@@ -1064,7 +1067,7 @@ fn lparam_y(lp: LPARAM) -> i32 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use windows::Win32::UI::WindowsAndMessaging::{WS_CHILD, WS_VISIBLE};
+    use windows::Win32::UI::WindowsAndMessaging::{WINDOW_EX_STYLE, WS_CHILD, WS_VISIBLE};
 
     unsafe extern "system" fn child_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         // SAFETY: forwards the untouched arguments of a system-dispatched message.

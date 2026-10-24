@@ -29,16 +29,14 @@ pub enum Choice {
 
 /// Decides how an editor is shown. `factor` is the clamped scale (1.0 = the plugin's own size) and
 /// `native` says whether the plugin can draw itself at another size. `Auto` uses the plugin's own
-/// scaling when it has it and FSR 1 otherwise; `Native` is an error when the plugin lacks it.
+/// scaling when it has it and FSR 1 otherwise; `Native` on a fixed-size plugin is upscaled with
+/// FSR 1 too, so a scale never fails (the result is `Ok` for every input).
 pub fn plan(mode: EditorScaleMode, factor: f32, native: bool) -> Result<Choice, &'static str> {
     let unit = factor == 1.0;
     match mode {
-        EditorScaleMode::Auto if unit => Ok(Choice::Plain),
-        EditorScaleMode::Auto if native => Ok(Choice::Native),
-        EditorScaleMode::Auto => Ok(Choice::Upscale(UpscaleFilter::Fsr1)),
-        EditorScaleMode::Native if !native => Err("this plugin cannot scale its editor natively"),
-        EditorScaleMode::Native if unit => Ok(Choice::Plain),
-        EditorScaleMode::Native => Ok(Choice::Native),
+        EditorScaleMode::Auto | EditorScaleMode::Native if unit => Ok(Choice::Plain),
+        EditorScaleMode::Auto | EditorScaleMode::Native if native => Ok(Choice::Native),
+        EditorScaleMode::Auto | EditorScaleMode::Native => Ok(Choice::Upscale(UpscaleFilter::Fsr1)),
         EditorScaleMode::Upscale(_) if unit => Ok(Choice::Plain),
         EditorScaleMode::Upscale(filter) => Ok(Choice::Upscale(filter)),
     }
@@ -53,7 +51,7 @@ mod plan_tests {
         assert_eq!(plan(EditorScaleMode::Auto, 1.0, false), Ok(Choice::Plain));
         assert_eq!(plan(EditorScaleMode::Auto, 1.0, true), Ok(Choice::Plain));
         assert_eq!(plan(EditorScaleMode::Native, 1.0, true), Ok(Choice::Plain));
-        assert!(plan(EditorScaleMode::Native, 1.0, false).is_err());
+        assert_eq!(plan(EditorScaleMode::Native, 1.0, false), Ok(Choice::Plain));
         assert_eq!(plan(EditorScaleMode::Upscale(UpscaleFilter::Fsr1), 1.0, false), Ok(Choice::Plain));
     }
 
@@ -65,9 +63,9 @@ mod plan_tests {
     }
 
     #[test]
-    fn native_needs_native_support() {
+    fn native_on_a_fixed_size_plugin_is_upscaled() {
         assert_eq!(plan(EditorScaleMode::Native, 2.0, true), Ok(Choice::Native));
-        assert!(plan(EditorScaleMode::Native, 2.0, false).is_err());
+        assert_eq!(plan(EditorScaleMode::Native, 2.0, false), Ok(Choice::Upscale(UpscaleFilter::Fsr1)));
     }
 
     #[test]
@@ -77,48 +75,112 @@ mod plan_tests {
     }
 }
 
+pub mod header;
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod frame;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod win;
 
 #[cfg(windows)]
+pub use frame::{HostWindow, app_owner, client_size, resize};
+#[cfg(windows)]
 pub use win::ScaledWindow;
 
-/// Non-Windows stand-in: the upscaler is unavailable, so [`ScaledWindow::new`] always fails.
 #[cfg(not(windows))]
-pub struct ScaledWindow;
+pub use stub::{HostWindow, ScaledWindow, app_owner, client_size, resize};
 
+/// Non-Windows stand-ins: editor frames and upscaling are unavailable, so `new` always fails and
+/// the other functions are no-ops.
 #[cfg(not(windows))]
-impl ScaledWindow {
-    /// Always an error here: host-side upscaling is Windows only.
-    pub fn new(_title: &str, _native_w: u32, _native_h: u32, _factor: f32, _filter: soundcraft_dsp::UpscaleFilter) -> Result<Self, String> {
-        Err("editor upscaling is only available on Windows".into())
-    }
-    /// Null: there is no source window.
-    pub fn parent(&self) -> *mut std::ffi::c_void {
-        std::ptr::null_mut()
-    }
-    /// Null: there is no visible window.
-    pub fn raw(&self) -> *mut std::ffi::c_void {
+mod stub {
+    use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, UpscaleFilter};
+    use std::ffi::c_void;
+
+    /// Null: no owner window.
+    pub fn app_owner() -> *mut c_void {
         std::ptr::null_mut()
     }
     /// No-op.
-    pub fn resize_native(&mut self, _w: u32, _h: u32) {}
-    /// No-op.
-    pub fn set_scale(&mut self, _factor: f32, _filter: soundcraft_dsp::UpscaleFilter) {}
-    /// No-op.
-    pub fn pump(&mut self) {}
-    /// No-op.
-    pub fn raise(&self) {}
-    /// Always false.
-    pub fn is_visible(&self) -> bool {
-        false
-    }
+    pub fn resize(_window: *mut c_void, _w: f64, _h: f64) {}
     /// Always `None`.
-    #[doc(hidden)]
-    pub fn last_frame_pixel(&self, _x: u32, _y: u32) -> Option<u32> {
+    pub fn client_size(_window: *mut c_void) -> Option<(f64, f64)> {
         None
     }
-    /// No-op.
-    pub fn close(self) {}
+
+    macro_rules! common {
+        () => {
+            /// Null.
+            pub fn parent(&self) -> *mut c_void {
+                std::ptr::null_mut()
+            }
+            /// Null.
+            pub fn raw(&self) -> *mut c_void {
+                std::ptr::null_mut()
+            }
+            /// No-op.
+            pub fn raise(&self) {}
+            /// Always false.
+            pub fn is_visible(&self) -> bool {
+                false
+            }
+            /// No-op.
+            pub fn close(self) {}
+            /// No-op.
+            pub fn set_header(&self, _state: EditorHeaderState) {}
+            /// Always empty.
+            pub fn take_actions(&self) -> Vec<EditorHeaderAction> {
+                Vec::new()
+            }
+            /// Always `None`.
+            pub fn position(&self) -> Option<(i32, i32)> {
+                None
+            }
+            /// No-op.
+            pub fn move_to(&self, _pos: (i32, i32)) {}
+        };
+    }
+
+    /// Editor frames are Windows only.
+    pub struct HostWindow;
+
+    impl HostWindow {
+        /// Always an error here.
+        pub fn new(_title: &str, _w: f64, _h: f64) -> Result<Self, String> {
+            Err("editor windows are only hosted on Windows".into())
+        }
+        common!();
+        /// No-op.
+        pub fn set_native(&self, _w: f64, _h: f64) {}
+        /// No-op.
+        pub fn resize_body(&self, _w: f64, _h: f64) {}
+        /// Always `None`.
+        pub fn body_size(&self) -> Option<(f64, f64)> {
+            None
+        }
+    }
+
+    /// Host-side upscaling is Windows only.
+    pub struct ScaledWindow;
+
+    impl ScaledWindow {
+        /// Always an error here.
+        pub fn new(_title: &str, _native_w: u32, _native_h: u32, _factor: f32, _filter: UpscaleFilter) -> Result<Self, String> {
+            Err("editor upscaling is only available on Windows".into())
+        }
+        common!();
+        /// No-op.
+        pub fn resize_native(&mut self, _w: u32, _h: u32) {}
+        /// No-op.
+        pub fn set_scale(&mut self, _factor: f32, _filter: UpscaleFilter) {}
+        /// No-op.
+        pub fn pump(&mut self) {}
+        /// Always `None`.
+        #[doc(hidden)]
+        pub fn last_frame_pixel(&self, _x: u32, _y: u32) -> Option<u32> {
+            None
+        }
+    }
 }
