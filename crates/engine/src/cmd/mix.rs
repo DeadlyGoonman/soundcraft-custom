@@ -95,6 +95,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("mix.insert", "Insert Plugin", [], None, "{track?, slot?: 0..9 | a..j, plugin: id, params?: {id: value}}", has_selection, insert),
         cmd!("mix.insert_remove", "Remove Insert", [], None, "{track?, slot}", has_selection, insert_remove),
         cmd!("mix.insert_bypass", "Bypass Insert", [], None, "{track?, slot, value?: bool}", has_selection, insert_bypass),
+        cmd!(
+            noundo "mix.insert_delta",
+            "Delta Monitor Insert",
+            [],
+            None,
+            "{track?, slot, value?: bool} — hear only what the insert changes (wet minus dry); not saved",
+            has_selection,
+            insert_delta
+        ),
         cmd!("mix.insert_param", "Set Plugin Parameter", [], None, "{track?, slot, param, value}", has_selection, insert_param),
         cmd!(
             "mix.insert_params",
@@ -368,6 +377,16 @@ fn insert_bypass(e: &mut Engine, p: &Value) -> Result<Value> {
         .ok_or_else(|| bad("mix.insert_bypass", "empty slot"))?;
     ins.bypass = val.unwrap_or(!ins.bypass);
     Ok(json!({"bypass": ins.bypass}))
+}
+
+fn insert_delta(e: &mut Engine, p: &Value) -> Result<Value> {
+    let (t, slot) = track_slot(e, p, "mix.insert_delta", INSERT_SLOTS)?;
+    let val = p.get("value").and_then(Value::as_bool);
+    let s = e.session_mut();
+    let ins =
+        s.track_mut(t).and_then(|tr| tr.mixer.inserts.get_mut(slot)).and_then(Option::as_mut).ok_or_else(|| bad("mix.insert_delta", "empty slot"))?;
+    ins.delta = val.unwrap_or(!ins.delta);
+    Ok(json!({"delta": ins.delta}))
 }
 
 fn insert_param(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -1022,5 +1041,25 @@ mod tests {
         assert_eq!(r["slot"], 0);
         let r = e.execute("mix.send", &json!({"track": "Gtr", "bus": "Verb"})).unwrap();
         assert_eq!(r["slot"], 0);
+    }
+
+    #[test]
+    fn insert_delta_toggles_without_undo_or_saving() {
+        let (mut e, t) = tone_session(&[]);
+        e.execute("mix.insert", &json!({"track": t.0, "slot": 0, "plugin": "gain"})).unwrap();
+        let undoable = e.can_undo();
+        let dirty = e.is_dirty();
+        let delta = |e: &Engine| e.session().track(t).unwrap().mixer.inserts[0].as_ref().unwrap().delta;
+        assert_eq!(e.execute("mix.insert_delta", &json!({"track": t.0, "slot": 0})).unwrap(), json!({"delta": true}));
+        assert!(delta(&e));
+        assert_eq!(e.execute("mix.insert_delta", &json!({"track": t.0, "slot": 0, "value": true})).unwrap(), json!({"delta": true}));
+        assert!(delta(&e));
+        // Not on the undo stack and not a change to the document.
+        assert_eq!(e.can_undo(), undoable);
+        assert_eq!(e.is_dirty(), dirty);
+        let saved = serde_json::to_value(e.session().track(t).unwrap().mixer.inserts[0].as_ref().unwrap()).unwrap();
+        assert!(saved.get("delta").is_none(), "{saved}");
+        assert_eq!(e.execute("mix.insert_delta", &json!({"track": t.0, "slot": 0})).unwrap(), json!({"delta": false}));
+        assert!(e.execute("mix.insert_delta", &json!({"track": t.0, "slot": 3})).is_err(), "empty slot");
     }
 }

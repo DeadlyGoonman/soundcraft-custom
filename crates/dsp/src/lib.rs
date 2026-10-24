@@ -291,6 +291,38 @@ pub trait PluginEditor: Send {
     fn set_scale(&mut self, _scale: EditorScale) -> Result<(), String> {
         Err("this editor cannot be scaled".into())
     }
+    /// Shows SoundCraft's state in the header strip of the editor window (bypass, delta, scale).
+    /// Called by the UI every frame; a no-op for editors without a header.
+    fn set_header(&mut self, _state: EditorHeaderState) {}
+    /// Clicks made in the editor window's header since the last call, oldest first.
+    fn take_header_actions(&mut self) -> Vec<EditorHeaderAction> {
+        Vec::new()
+    }
+}
+
+/// What the header strip on top of a plugin editor window shows.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EditorHeaderState {
+    /// The insert is bypassed.
+    pub bypass: bool,
+    /// Delta monitoring (wet minus dry) is on.
+    pub delta: bool,
+    /// The slot holds an instrument (no dry signal, so delta is unavailable).
+    pub is_instrument: bool,
+    pub scale: EditorScale,
+    /// The plugin can draw itself at another size.
+    pub native_scaling: bool,
+    /// The plugin's view can be given another size (without a scale factor).
+    pub can_resize: bool,
+}
+
+/// A click in an editor window's header, for the UI to apply as a command.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EditorHeaderAction {
+    SetBypass(bool),
+    SetDelta(bool),
+    /// A scale chosen from the header menu or by dragging the window frame.
+    SetScale(EditorScale),
 }
 
 /// The filter that stretches a plugin editor drawn at its own size (host-side upscaling).

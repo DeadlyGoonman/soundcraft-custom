@@ -435,6 +435,15 @@ fn same_document(saved: &Session, doc: &Session) -> bool {
     to.selected_clips.clone_from(&from.selected_clips);
     to.playhead = from.playhead;
     to.zoom = from.zoom;
+    // Delta monitoring is a listening aid that is never saved.
+    let monitors = |s: &Session| s.tracks.iter().any(|t| t.mixer.inserts.iter().flatten().any(|i| i.delta));
+    if monitors(saved) || monitors(&doc) {
+        let mut saved = saved.clone();
+        for s in [&mut saved, &mut doc] {
+            s.tracks.iter_mut().flat_map(|t| t.mixer.inserts.iter_mut().flatten()).for_each(|i| i.delta = false);
+        }
+        return saved == doc;
+    }
     *saved == doc
 }
 

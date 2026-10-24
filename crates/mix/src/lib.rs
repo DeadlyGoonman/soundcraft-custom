@@ -213,6 +213,12 @@ struct PluginSlot {
     /// Last values pushed to the plugin, in the insert's parameter-map order.
     applied: Vec<f32>,
     failed: bool,
+    /// Delta monitoring: the input of this block (preallocated) and the delay that lines it up
+    /// with the plugin's latency before it is subtracted from the output.
+    dry: Vec<Vec<f32>>,
+    dry_delay: DelayLine,
+    /// Delta was on last block (the delay line holds history to clear when it turns off).
+    delta_on: bool,
 }
 
 struct Strip {
@@ -249,6 +255,21 @@ struct Strip {
 const MAX_LATENCY: usize = 1 << 20;
 
 /// A multichannel delay line (samples), resized only when the delay changes.
+impl PluginSlot {
+    fn new(id: String, ch: usize, plugin: Box<dyn Plugin>, max_block: usize) -> Self {
+        PluginSlot {
+            id,
+            ch,
+            plugin,
+            applied: Vec::new(),
+            failed: false,
+            dry: vec![vec![0.0; max_block]; ch],
+            dry_delay: DelayLine::default(),
+            delta_on: false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct DelayLine {
     bufs: Vec<Vec<f32>>,
@@ -411,7 +432,7 @@ impl SlotCtx<'_> {
             let state = if third { ins.state_bytes() } else { None };
             create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch).map(|n| n.plugin)
         }?;
-        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), failed: false })
+        Some(PluginSlot::new(ins.plugin.clone(), ch, plugin, self.mb))
     }
 }
 
@@ -762,8 +783,7 @@ impl MixEngine {
                     {
                         apply_params(slot, ins, t, i, pos);
                         slot.plugin.set_transport(&transport);
-                        slot.plugin.process(&mut strip.buf, frames);
-                        if contain_failure(slot, &mut strip.buf, frames) {
+                        if !run_insert(slot, ins.delta, &mut strip.buf, frames) {
                             strip.failures.record(i);
                         }
                     }
@@ -1033,8 +1053,7 @@ fn process_strip(
         }
         apply_params(slot, ins, t, i, pos);
         slot.plugin.set_transport(&transport);
-        slot.plugin.process(&mut strip.buf, frames);
-        if contain_failure(slot, &mut strip.buf, frames) {
+        if !run_insert(slot, ins.delta, &mut strip.buf, frames) {
             strip.failures.record(i);
             continue;
         }
@@ -1092,6 +1111,46 @@ fn process_strip(
 
 /// Silences a block the plugin filled with NaN or infinity and takes the plugin out until the
 /// next [`MixEngine::reset`]. True then.
+/// Processes one active, unbypassed insert in place. With `delta` the slot outputs only what the
+/// plugin changed: its output minus its input delayed by the plugin's latency. False when the
+/// plugin failed this block (its output is then silenced).
+fn run_insert(slot: &mut PluginSlot, delta: bool, buf: &mut [Vec<f32>], frames: usize) -> bool {
+    if delta {
+        if slot.dry.len() < buf.len() {
+            slot.dry.resize_with(buf.len(), Vec::new);
+        }
+        for (d, src) in slot.dry.iter_mut().zip(buf.iter()) {
+            if d.len() < frames {
+                d.resize(frames, 0.0);
+            }
+            let n = frames.min(src.len());
+            if let (Some(d), Some(src)) = (d.get_mut(..n), src.get(..n)) {
+                d.copy_from_slice(src);
+            }
+        }
+    } else if slot.delta_on {
+        slot.dry_delay.clear();
+    }
+    slot.delta_on = delta;
+    slot.plugin.process(buf, frames);
+    if contain_failure(slot, buf, frames) {
+        return false;
+    }
+    if delta {
+        let ch = buf.len();
+        slot.dry_delay.set(slot.plugin.latency(), ch);
+        if let Some(dry) = slot.dry.get_mut(..ch) {
+            slot.dry_delay.process(dry, frames);
+        }
+        for (w, d) in buf.iter_mut().zip(slot.dry.iter()) {
+            for (w, d) in w.iter_mut().zip(d.iter()).take(frames) {
+                *w -= d;
+            }
+        }
+    }
+    true
+}
+
 fn contain_failure(slot: &mut PluginSlot, buf: &mut [Vec<f32>], frames: usize) -> bool {
     // A branch-free fold vectorizes; `all` runs about 8 times slower here.
     if buf.iter().all(|c| c.get(..frames).unwrap_or(c).iter().fold(true, |ok, x| ok & x.is_finite())) {
@@ -3389,5 +3448,155 @@ mod tests {
         }
         let e_ls = out[4][100].powi(2) + out[6][100].powi(2);
         assert!((e_ls - x(4).powi(2)).abs() < 1e-5, "Ls energy is preserved");
+    }
+
+    /// Passes audio through unchanged, `delay` samples late (an "identity" plugin with latency).
+    struct Delayed {
+        info_from: Box<dyn Plugin>,
+        delay: usize,
+        ring: Vec<Vec<f32>>,
+        idx: usize,
+    }
+
+    impl Delayed {
+        fn new(delay: usize, ch: usize) -> Self {
+            Delayed { info_from: soundcraft_dsp::create("gain").unwrap(), delay, ring: vec![vec![0.0; delay]; ch], idx: 0 }
+        }
+    }
+
+    impl Plugin for Delayed {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.info_from.info()
+        }
+        fn prepare(&mut self, _sr: f32, _mb: usize, _ch: usize) {}
+        fn reset(&mut self) {}
+        fn set_param(&mut self, _id: &str, _v: f32) -> bool {
+            false
+        }
+        fn param(&self, _id: &str) -> Option<f32> {
+            None
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            let start = self.idx;
+            for (c, ch) in io.iter_mut().enumerate() {
+                let mut i = start;
+                for x in ch.iter_mut().take(frames) {
+                    std::mem::swap(&mut self.ring[c][i], x);
+                    i = (i + 1) % self.delay;
+                }
+            }
+            self.idx = (start + frames) % self.delay;
+        }
+        fn latency(&self) -> usize {
+            self.delay
+        }
+    }
+
+    fn noise(n: usize, seed: u32) -> Vec<f32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect()
+    }
+
+    #[test]
+    fn delta_of_an_identity_plugin_with_latency_is_exact_silence() {
+        let mut slot = PluginSlot::new("clap:test.delayed".into(), 2, Box::new(Delayed::new(37, 2)), 128);
+        for (b, block) in [100usize, 128, 7, 64, 128].into_iter().enumerate() {
+            let mut buf = vec![noise(block, b as u32), noise(block, 99 + b as u32)];
+            assert!(run_insert(&mut slot, true, &mut buf, block));
+            assert!(buf.iter().all(|c| c.iter().all(|x| *x == 0.0)), "block {b}");
+        }
+        // Off: the plain (delayed) signal again, and the dry history is cleared for next time.
+        let mut buf = vec![vec![1.0; 64]; 2];
+        assert!(run_insert(&mut slot, false, &mut buf, 64));
+        assert!(buf[0][37..].iter().all(|x| *x == 1.0));
+        assert!(slot.dry_delay.bufs.iter().all(|b| b.iter().all(|x| *x == 0.0)));
+    }
+
+    fn with_gain(s: &mut Session, t: TrackId, delta: bool, bypass: bool) {
+        let mut ins = Insert::new("gain");
+        ins.params.insert("gain".into(), 6.0);
+        ins.delta = delta;
+        ins.bypass = bypass;
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
+    }
+
+    fn render_blocks(s: &Session, blocks: usize) -> Vec<Vec<f32>> {
+        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut all = vec![Vec::new(), Vec::new()];
+        let mut out = vec![vec![0.0f32; 512]; 2];
+        for b in 0..blocks {
+            eng.render(s, (b * 512) as i64, 512, &mut out);
+            for (a, o) in all.iter_mut().zip(out.iter()) {
+                a.extend_from_slice(o);
+            }
+        }
+        all
+    }
+
+    fn assert_wet_minus_dry(delta: &[Vec<f32>], wet: &[Vec<f32>], dry: &[Vec<f32>]) {
+        for c in 0..2 {
+            for i in 0..delta[c].len() {
+                assert!((delta[c][i] - (wet[c][i] - dry[c][i])).abs() < 1e-6, "ch {c} sample {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn delta_plays_only_what_the_insert_changes() {
+        let (mut s, t) = session_with_dc(0.5, 48_000);
+        let dry = render_blocks(&s, 4);
+        with_gain(&mut s, t, false, false);
+        let wet = render_blocks(&s, 4);
+        with_gain(&mut s, t, true, false);
+        let delta = render_blocks(&s, 4);
+        assert_wet_minus_dry(&delta, &wet, &dry);
+        // A steady gain g turns into (g - 1) x.
+        let x = dry[0][1500];
+        let g = wet[0][1500] / x;
+        assert!(x.abs() > 0.1 && g > 1.5, "{x} {g}");
+        assert!((delta[0][1500] - (g - 1.0) * x).abs() < 1e-5);
+        // Bypass wins: the slot is simply skipped.
+        with_gain(&mut s, t, true, true);
+        assert_eq!(render_blocks(&s, 4), dry);
+    }
+
+    #[test]
+    fn delta_works_on_master_inserts() {
+        let (mut s, _) = session_with_dc(0.5, 48_000);
+        let m = s.add_track(TrackKind::Master, ChannelFormat::Stereo, Some("Master"));
+        let dry = render_blocks(&s, 3);
+        with_gain(&mut s, m, false, false);
+        let wet = render_blocks(&s, 3);
+        with_gain(&mut s, m, true, false);
+        let delta = render_blocks(&s, 3);
+        assert!(delta[0][1000].abs() > 0.05);
+        assert_wet_minus_dry(&delta, &wet, &dry);
+    }
+
+    #[test]
+    fn delta_keeps_delay_compensation_and_allocates_once() {
+        let (mut s, t) = session_with_dc(0.5, 48_000);
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("maximizer"));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        render_block(&mut eng, &s, 0);
+        let latency = eng.latency;
+        assert!(latency > 0);
+        s.track_mut(t).unwrap().mixer.inserts[0].as_mut().unwrap().delta = true;
+        render_block(&mut eng, &s, 512);
+        assert_eq!(eng.latency, latency, "delta does not change the reported latency");
+        let ptrs = |eng: &MixEngine| {
+            let slot = eng.strips[&t].plugins[0].as_ref().unwrap();
+            (slot.dry[0].as_ptr(), slot.dry_delay.bufs[0].as_ptr())
+        };
+        let before = ptrs(&eng);
+        for b in 2..6 {
+            render_block(&mut eng, &s, b * 512);
+        }
+        assert_eq!(ptrs(&eng), before, "no allocation in steady state");
     }
 }
