@@ -1339,11 +1339,21 @@ fn as_audio_thread(audio: bool, f: impl FnOnce()) {
     f();
 }
 
+/// Whether strips are rendered on one thread even when there are enough of them to share out
+/// (the Playback Engine's and Preferences' "Mix tracks on several cores" turned off).
+static SERIAL_STRIPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Renders strips on one thread (`true`) or shares them out to the worker pool (`false`, the
+/// default). Set from the audio settings; takes effect on the next block.
+pub fn set_serial_strips(serial: bool) {
+    SERIAL_STRIPS.store(serial, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Process strips, in parallel on native targets when there are enough of them.
 #[cfg(not(target_arch = "wasm32"))]
 fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
     use rayon::prelude::*;
-    if work.len() >= 4 {
+    if work.len() >= 4 && !SERIAL_STRIPS.load(std::sync::atomic::Ordering::Relaxed) {
         // The workers render on behalf of this thread: on the audio thread, they are it too.
         let audio = on_audio_thread();
         work.par_iter_mut().for_each(|w| as_audio_thread(audio, || f(w)));
@@ -1351,6 +1361,19 @@ fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
         work.iter_mut().for_each(f);
     }
 }
+
+/// Starts the worker pool [`MixEngine::render`] shares strips out to. Rayon creates it on first
+/// use, which would otherwise be the first block of the first playback, on the audio thread: a
+/// thread per core spawned inside one buffer period (1 ms at 48 frames), a dropout. Call it from
+/// a non-realtime thread before audio starts; later calls are free.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn warm_up_workers() {
+    let _ = rayon::current_num_threads();
+}
+
+/// No worker pool on this target.
+#[cfg(target_arch = "wasm32")]
+pub fn warm_up_workers() {}
 
 #[cfg(target_arch = "wasm32")]
 fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {

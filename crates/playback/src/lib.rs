@@ -210,6 +210,21 @@ struct AudioState {
     /// Retired plugin instances go back to the UI thread to be dropped there.
     garbage: Sender<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<SyncSender<Arc<Session>>>,
+    /// Something was rendered since the engine was last reset, so the next Play/Stop/Locate has
+    /// plugin state to clear. Stop already resets, so a Play after it skips a second reset of
+    /// every plugin in the first, tightest block.
+    dirty: bool,
+    /// Device frames of the fade-in at Play still to apply, and its length (0 = none).
+    declick: usize,
+    declick_len: usize,
+}
+
+/// The fade-in at Play, in ms: starting mid-waveform is a step from silence, a click. A locate
+/// does not fade.
+const DECLICK_MS: f64 = 2.0;
+
+fn declick_frames(device_rate: f64) -> usize {
+    (device_rate.max(0.0) * DECLICK_MS / 1000.0) as usize
 }
 
 fn new_engine(sr: f32) -> MixEngine {
@@ -241,6 +256,17 @@ impl AudioState {
             device_rate,
             input: None,
             recording: false,
+            dirty: false,
+            declick: 0,
+            declick_len: declick_frames(device_rate),
+        }
+    }
+
+    /// Clears plugin state, unless nothing was rendered since the last reset.
+    fn reset_mix(&mut self) {
+        if self.dirty {
+            self.mix.reset();
+            self.dirty = false;
         }
     }
 
@@ -250,7 +276,10 @@ impl AudioState {
             match c {
                 Cmd::Input(r) => self.input = Some(r),
                 #[cfg(all(windows, feature = "asio"))]
-                Cmd::DeviceRate(rate) => self.device_rate = rate,
+                Cmd::DeviceRate(rate) => {
+                    self.device_rate = rate;
+                    self.declick_len = declick_frames(rate);
+                }
                 Cmd::Recording(r) => self.recording = r,
                 Cmd::Session(s, instances) => {
                     changed = true;
@@ -280,19 +309,20 @@ impl AudioState {
                     self.playing = true;
                     self.pending_len = 0;
                     self.read = 0.0;
-                    self.mix.reset();
+                    self.declick = self.declick_len;
+                    self.reset_mix();
                 }
                 Cmd::Stop => {
                     self.playing = false;
                     self.end = None;
                     self.looped = None;
-                    self.mix.reset();
+                    self.reset_mix();
                 }
                 Cmd::Locate(at) => {
                     self.pos = at;
                     self.pending_len = 0;
                     self.read = 0.0;
-                    self.mix.reset();
+                    self.reset_mix();
                 }
             }
         }
@@ -349,6 +379,7 @@ impl AudioState {
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
+        self.dirty = true;
         self.send_garbage();
         self.pending_len = n;
         if let Ok(mut m) = self.shared.meters.try_lock() {
@@ -436,6 +467,12 @@ impl AudioState {
                     *o = if c < nch.max(1) && sounding { sample(c).clamp(-1.0, 1.0) } else { 0.0 };
                 }
             }
+            if self.declick > 0 {
+                // Linear from 0: the first frame after Play is silent, then full level.
+                let g = (1.0 - self.declick as f32 / self.declick_len.max(1) as f32).max(0.0);
+                frame.iter_mut().for_each(|o| *o *= g);
+                self.declick -= 1;
+            }
             self.read += step;
         }
     }
@@ -454,13 +491,24 @@ struct Side {
     /// Instances that refused their stored state: saves keep that state until the plugin's editor
     /// is opened.
     refused: HashSet<(TrackId, usize)>,
+    /// Latency each live instance reported when it was created, in samples.
+    latency: HashMap<(TrackId, usize), usize>,
     garbage: Receiver<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<Receiver<Arc<Session>>>,
 }
 
 impl Side {
     fn new(rate: f32, garbage: Receiver<Vec<Box<dyn Plugin>>>) -> Side {
-        Side { shadow: HashMap::new(), rate, editors: HashMap::new(), states: BTreeMap::new(), refused: HashSet::new(), garbage, old_sessions: None }
+        Side {
+            shadow: HashMap::new(),
+            rate,
+            editors: HashMap::new(),
+            states: BTreeMap::new(),
+            refused: HashSet::new(),
+            latency: HashMap::new(),
+            garbage,
+            old_sessions: None,
+        }
     }
 
     /// Drops retired instances (closing their editors first, inside the plugin's drop) and
@@ -487,6 +535,7 @@ impl Side {
         self.shadow.remove(&key);
         self.states.remove(&key);
         self.refused.remove(&key);
+        self.latency.remove(&key);
         if let Some(mut e) = self.editors.remove(&key) {
             e.close();
         }
@@ -558,6 +607,8 @@ impl Player {
     /// Open the output device `cfg` chooses (system, device, rate, buffer size), falling back to the
     /// defaults for whatever is unavailable. Never fails: without a device it runs a silent clock.
     pub fn with_config(session: Arc<Session>, cfg: &AudioConfig) -> Player {
+        // Start the mix's worker threads here, not in the first block of the first playback.
+        soundcraft_mix::warm_up_workers();
         let mut note = None;
         let mut p = Player::open(Arc::clone(&session), cfg, &mut note);
         p.fallback_note = note;
@@ -615,6 +666,7 @@ impl Player {
     }
 
     fn open(session: Arc<Session>, cfg: &AudioConfig, note: &mut Option<String>) -> Player {
+        soundcraft_mix::set_serial_strips(cfg.serial_mixing);
         #[cfg(not(all(windows, feature = "asio")))]
         let _ = note;
         let shared = Arc::new(Shared {
@@ -949,6 +1001,12 @@ impl Player {
         self.side().editors.contains_key(&(track, slot))
     }
 
+    /// The latency the hosted plugin in this slot reported when it was created, in samples. None
+    /// for a slot without a live hosted plugin. Main thread only.
+    pub fn insert_latency(&self, track: TrackId, slot: usize) -> Option<usize> {
+        self.side().latency.get(&(track, slot)).copied()
+    }
+
     /// Opens the plugin's own editor window. Main thread only.
     pub fn open_editor(&self, track: TrackId, slot: usize) -> Result<(), String> {
         self.side().open_editor((track, slot))
@@ -1147,6 +1205,7 @@ impl Side {
             log::debug!("plugin instance for {:?} slot {}: {} ({} ch, created: {})", spec.track, spec.slot, spec.id, spec.ch, made.is_some());
             self.shadow.insert(key, (spec.id.clone(), spec.ch, made.is_some()));
             if let Some(soundcraft_mix::NewInstance { mut plugin, refused_state }) = made {
+                self.latency.insert(key, plugin.latency());
                 if let Some(e) = plugin.editor() {
                     self.editors.insert(key, e);
                 }
@@ -1531,9 +1590,62 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let (tx, rx) = channel();
-        let st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, channel().0);
+        let mut st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, channel().0);
+        // These tests compare exact levels from the first frame: no start fade.
+        st.declick_len = 0;
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         st
+    }
+
+    #[test]
+    fn playback_fades_in_over_a_few_ms_from_play_but_not_from_a_locate() {
+        use soundcraft_model::ChannelFormat;
+        let mut st = audio_output_state(ChannelFormat::Mono, vec![vec![0.8; 48_000]]);
+        st.declick_len = declick_frames(48_000.0);
+        let len = st.declick_len;
+        assert_eq!(len, 96, "2 ms at 48 kHz");
+        let level = 0.8 * soundcraft_dsp::db_to_gain(-3.0);
+        // 48-frame callbacks, like a small ASIO buffer.
+        let mut heard = Vec::new();
+        let mut out = [0.0f32; 48];
+        for _ in 0..4 {
+            st.fill(&mut out, 1);
+            heard.extend_from_slice(&out);
+        }
+        assert_eq!(heard[0], 0.0, "starts from silence");
+        assert!(heard.windows(2).take(len).all(|w| w[1] >= w[0]), "rises monotonically");
+        assert!((heard[len / 2] - level * 0.5).abs() < 1e-3, "halfway at half level: {}", heard[len / 2]);
+        assert!(heard[len..].iter().all(|x| (x - level).abs() < 1e-6), "full level after the fade");
+        let (tx, rx) = channel();
+        st.rx = rx;
+        tx.send(Cmd::Locate(1000)).unwrap();
+        st.fill(&mut out, 1);
+        assert!(out.iter().all(|x| (x - level).abs() < 1e-6), "a locate does not fade: {out:?}");
+    }
+
+    #[test]
+    fn play_after_stop_does_not_reset_the_plugins_a_second_time() {
+        let s = Arc::new(soundcraft_model::Session::default());
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let mut st = AudioState::new(rx, shared, s, 48_000.0, channel().0);
+        let mut out = vec![0.0f32; 2 * 64];
+        st.fill(&mut out, 2);
+        assert!(!st.dirty, "nothing rendered while stopped");
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        st.fill(&mut out, 2);
+        assert!(st.dirty, "playing renders");
+        tx.send(Cmd::Stop).unwrap();
+        st.fill(&mut out, 2);
+        assert!(!st.dirty, "Stop reset the engine");
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        st.drain();
+        assert!(!st.dirty, "so Play has nothing left to reset");
     }
 
     #[test]

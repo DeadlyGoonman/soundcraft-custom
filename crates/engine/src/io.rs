@@ -394,17 +394,136 @@ pub struct Bounce {
     enc: Option<soundcraft_audio_io::FileEncoder<Out>>,
     target_db: f32,
     mp3: Option<Mp3Stage>,
+    /// The MP3 stage's ffmpeg process, kept here too: the writer thread may hold `mp3` while a
+    /// cancel has to kill ffmpeg.
+    mp3_proc: Option<ProcHandle>,
+    /// Ends as an MP3 (also while `mp3` is lent to the writer thread).
+    mp3_out: bool,
+    /// Meters and encodes the write pass on its own thread while the mix renders.
+    writer: Option<Writer>,
 }
 
-/// The ffmpeg pass that turns a bounce's temporary WAV into the MP3 at the bounce's path.
+/// What the writer thread holds while it runs and hands back when it is done.
+type Sink = (soundcraft_dsp::meter::LoudnessMeter, Option<soundcraft_audio_io::FileEncoder<Out>>, Option<Mp3Stage>);
+
+/// The thread that meters and encodes rendered blocks, so encoding overlaps rendering. Blocks go
+/// to it through a short queue and come back through `back` to be filled again.
+struct Writer {
+    tx: Option<std::sync::mpsc::SyncSender<(Vec<Vec<f32>>, usize)>>,
+    back: std::sync::mpsc::Receiver<Vec<Vec<f32>>>,
+    handle: std::thread::JoinHandle<(Sink, Result<()>)>,
+}
+
+/// Blocks queued for the writer thread: enough to ride out uneven blocks, few enough to stay small.
+const WRITER_QUEUE: usize = 4;
+
+/// Meters one block of the write pass and writes it to the file encoder or to ffmpeg.
+fn feed(
+    (meter, enc, mp3): (&mut soundcraft_dsp::meter::LoudnessMeter, &mut Option<soundcraft_audio_io::FileEncoder<Out>>, &mut Option<Mp3Stage>),
+    path: &Path,
+    rate: u32,
+    block: &[Vec<f32>],
+    n: usize,
+) -> Result<()> {
+    meter.process(block, n);
+    if let Some(enc) = enc {
+        enc.write(block, n).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?;
+    }
+    if let Some(m) = mp3 {
+        m.write(block, n, rate)?;
+    }
+    Ok(())
+}
+
+/// The ffmpeg process of an MP3 bounce, shared between the writer thread and the bounce.
+type ProcHandle = std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>;
+
+/// Locks the process slot; a poisoned lock still holds the process, so it is used anyway.
+fn proc_lock(p: &ProcHandle) -> std::sync::MutexGuard<'_, Option<std::process::Child>> {
+    p.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The ffmpeg process that encodes a bounce to the MP3 at the bounce's path. It is fed raw 32-bit
+/// float samples through its stdin while the mix renders (no temporary WAV), so encoding runs
+/// alongside rendering instead of after it.
 struct Mp3Stage {
     ffmpeg: PathBuf,
-    wav: PathBuf,
     out_part: PathBuf,
     meta: Option<soundcraft_audio_io::Metadata>,
     kbps: u32,
-    child: Option<std::process::Child>,
+    /// Shared with the bounce, so cancelling can kill ffmpeg while the writer thread is blocked
+    /// on its pipe.
+    child: ProcHandle,
+    /// Open while samples are still coming; closed (None) once ffmpeg is left to finish.
+    stdin: Option<std::io::BufWriter<std::process::ChildStdin>>,
     stderr: Option<std::thread::JoinHandle<String>>,
+    /// Interleaved little-endian bytes of one block.
+    scratch: Vec<u8>,
+}
+
+impl Mp3Stage {
+    /// Starts ffmpeg reading `channels` channels at `rate` from its stdin.
+    fn spawn(&mut self, rate: u32, channels: usize) -> Result<()> {
+        let args = crate::mp3::args(&self.out_part, self.meta.as_ref(), rate, channels, self.kbps);
+        let mut child = crate::mp3::spawn(&self.ffmpeg, &args).map_err(|err| EngineError::Io(format!("cannot run ffmpeg: {err}")))?;
+        self.stderr = child.stderr.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let mut bytes = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut std::io::Read::take(&mut pipe, 1 << 16), &mut bytes);
+                text.push_str(&String::from_utf8_lossy(&bytes));
+                let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+                text
+            })
+        });
+        self.stdin = child.stdin.take().map(|pipe| std::io::BufWriter::with_capacity(1 << 18, pipe));
+        *proc_lock(&self.child) = Some(child);
+        Ok(())
+    }
+
+    /// Feeds one block, starting ffmpeg on the first. A pipe error means ffmpeg quit: its own
+    /// message is the error.
+    fn write(&mut self, block: &[Vec<f32>], n: usize, rate: u32) -> Result<()> {
+        if proc_lock(&self.child).is_none() {
+            self.spawn(rate, block.len().max(1))?;
+        }
+        self.scratch.clear();
+        for i in 0..n {
+            for ch in block {
+                // As the float WAV writer stores them: NaN as silence, clamped to [-1, 1].
+                let v = ch.get(i).copied().unwrap_or(0.0);
+                let v = if v.is_nan() { 0.0 } else { v.clamp(-1.0, 1.0) };
+                self.scratch.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let wrote = match &mut self.stdin {
+            Some(pipe) => std::io::Write::write_all(pipe, &self.scratch),
+            None => Ok(()),
+        };
+        wrote.map_err(|err| self.failed(&err.to_string()))
+    }
+
+    /// Closes ffmpeg's input so it finishes the file. Starts it first for an empty bounce.
+    fn close_input(&mut self, rate: u32, channels: usize) -> Result<()> {
+        if proc_lock(&self.child).is_none() {
+            self.spawn(rate, channels.max(1))?;
+        }
+        let flushed = self.stdin.take().map_or(Ok(()), |mut pipe| std::io::Write::flush(&mut pipe));
+        flushed.map_err(|err| self.failed(&err.to_string()))
+    }
+
+    /// Stops ffmpeg after a pipe error and reports what it said.
+    fn failed(&mut self, err: &str) -> EngineError {
+        self.stdin = None;
+        let taken = proc_lock(&self.child).take();
+        if let Some(mut child) = taken {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let text = self.stderr.take().and_then(|h| h.join().ok()).unwrap_or_default();
+        let text: String = text.trim().chars().take(500).collect();
+        EngineError::Io(if text.is_empty() { format!("ffmpeg: {err}") } else { format!("ffmpeg failed: {text}") })
+    }
 }
 
 /// A finished bounce: the size of its file and its levels.
@@ -466,20 +585,29 @@ impl Bounce {
             enc: Some(enc),
             target_db: -0.1,
             mp3: None,
+            mp3_proc: None,
+            mp3_out: false,
+            writer: None,
         })
     }
 
-    /// Makes this bounce (whose path is a temporary WAV) end as an MP3 at `path`, encoded by
-    /// `ffmpeg` once the WAV is complete. Lossy encoding can overshoot, so a normalized bounce
-    /// peaks at -1 dBFS.
+    /// Makes this bounce end as an MP3 at `path`, encoded by `ffmpeg` from the rendered samples as
+    /// they come (its own path, meant for a temporary WAV, is not written). Lossy encoding can
+    /// overshoot, so a normalized bounce peaks at -1 dBFS.
     pub fn to_mp3(mut self, path: &Path, ffmpeg: &Path, meta: Option<soundcraft_audio_io::Metadata>, kbps: u32) -> Result<Bounce> {
         let name = path.file_name().map_or_else(|| "bounce".into(), |n| n.to_string_lossy().into_owned());
         let out_part = path.with_file_name(format!("{name}.part"));
         crate::file_access::check_write(path).map_err(EngineError::Io)?;
         crate::file_access::check_write(&out_part).map_err(EngineError::Io)?;
-        let wav = std::mem::replace(&mut self.path, path.to_path_buf());
+        // The samples go straight to ffmpeg: drop the WAV writer and its part file.
+        drop(self.enc.take());
+        let _ = std::fs::remove_file(&self.part);
+        self.path = path.to_path_buf();
         self.target_db = -1.0;
-        self.mp3 = Some(Mp3Stage { ffmpeg: ffmpeg.to_path_buf(), wav, out_part, meta, kbps, child: None, stderr: None });
+        self.mp3_out = true;
+        let proc: ProcHandle = std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.mp3_proc = Some(std::sync::Arc::clone(&proc));
+        self.mp3 = Some(Mp3Stage { ffmpeg: ffmpeg.to_path_buf(), out_part, meta, kbps, child: proc, stdin: None, stderr: None, scratch: Vec::new() });
         Ok(self)
     }
 
@@ -500,9 +628,9 @@ impl Bounce {
             (true, false) => 0.5 + pass / 2.0,
         };
         match &self.mp3 {
-            Some(m) if m.child.is_some() => 0.95,
-            Some(_) => render * 0.9,
-            None => render,
+            Some(m) if proc_lock(&m.child).is_some() && m.stdin.is_none() => 0.95,
+            _ if self.mp3_out => render * 0.9,
+            _ => render,
         }
     }
 
@@ -519,10 +647,7 @@ impl Bounce {
                     self.done += n;
                     self.peak = self.peak.max(soundcraft_dsp::offline::peak(&self.block));
                     if !self.measuring {
-                        self.meter.process(&self.block, n);
-                        if let Some(enc) = &mut self.enc {
-                            enc.write(&self.block, n).map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?;
-                        }
+                        self.write_block(n)?;
                     }
                 }
                 None if self.measuring => {
@@ -553,45 +678,107 @@ impl Bounce {
     }
 
     fn encoding(&self) -> bool {
-        self.mp3.as_ref().is_some_and(|m| m.child.is_some())
+        self.mp3.as_ref().is_some_and(|m| proc_lock(&m.child).is_some() && m.stdin.is_none())
     }
 
     fn levels(&self, bytes: u64) -> Bounced {
         Bounced { bytes, peak_db: soundcraft_dsp::gain_to_db(self.peak), lufs: self.meter.integrated_lufs(), true_peak_db: self.meter.true_peak_db() }
     }
 
+    /// Hands the rendered `self.block` to the writer thread (started on the first block), or
+    /// meters and writes it here where there are no threads.
+    fn write_block(&mut self, n: usize) -> Result<()> {
+        let rate = self.session.sample_rate.hz();
+        if self.writer.is_none() && !cfg!(target_arch = "wasm32") {
+            self.writer = self.start_writer(rate);
+        }
+        let Some(w) = &mut self.writer else {
+            return feed((&mut self.meter, &mut self.enc, &mut self.mp3), &self.path, rate, &self.block, n);
+        };
+        let spare = w.back.try_recv().unwrap_or_default();
+        let block = std::mem::replace(&mut self.block, spare);
+        let sent = w.tx.as_ref().is_some_and(|tx| tx.send((block, n)).is_ok());
+        if sent {
+            return Ok(());
+        }
+        // The writer stopped early: it failed, and says why.
+        self.join_writer().and(Err(EngineError::Io(format!("{}: the bounce writer stopped", self.path.display()))))
+    }
+
+    /// Lends the meter and encoders to a new writer thread. None when no thread can be started, and
+    /// then the blocks are written inline.
+    fn start_writer(&mut self, rate: u32) -> Option<Writer> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<Vec<f32>>, usize)>(WRITER_QUEUE);
+        let (back_tx, back) = std::sync::mpsc::channel();
+        let mut sink: Sink =
+            (std::mem::replace(&mut self.meter, soundcraft_dsp::meter::LoudnessMeter::new(1.0, 0)), self.enc.take(), self.mp3.take());
+        let path = self.path.clone();
+        let (lend_tx, lend_rx) = std::sync::mpsc::channel::<Sink>();
+        let spawned = std::thread::Builder::new().name("soundcraft-bounce-writer".into()).spawn(move || {
+            let Ok((mut meter, mut enc, mut mp3)) = lend_rx.recv() else {
+                return (sink_placeholder(), Err(EngineError::Io("the bounce writer got nothing to write".into())));
+            };
+            while let Ok((block, n)) = rx.recv() {
+                if let Err(err) = feed((&mut meter, &mut enc, &mut mp3), &path, rate, &block, n) {
+                    return ((meter, enc, mp3), Err(err));
+                }
+                let _ = back_tx.send(block);
+            }
+            ((meter, enc, mp3), Ok(()))
+        });
+        match spawned {
+            Ok(handle) => match lend_tx.send(sink) {
+                Ok(()) => Some(Writer { tx: Some(tx), back, handle }),
+                Err(std::sync::mpsc::SendError(returned)) => {
+                    sink = returned;
+                    (self.meter, self.enc, self.mp3) = sink;
+                    None
+                }
+            },
+            Err(_) => {
+                (self.meter, self.enc, self.mp3) = sink;
+                None
+            }
+        }
+    }
+
+    /// Waits for the writer thread to write what it was sent and takes the meter and encoders
+    /// back. Its error, if it failed.
+    fn join_writer(&mut self) -> Result<()> {
+        let Some(mut w) = self.writer.take() else { return Ok(()) };
+        drop(w.tx.take());
+        match w.handle.join() {
+            Ok((sink, result)) => {
+                (self.meter, self.enc, self.mp3) = sink;
+                result
+            }
+            Err(_) => Err(EngineError::Io(format!("{}: the bounce writer failed", self.path.display()))),
+        }
+    }
+
     fn finish(&mut self) -> Result<Option<Bounced>> {
-        let target = self.mp3.as_ref().map_or_else(|| self.path.clone(), |m| m.wav.clone());
+        self.join_writer()?;
         let bytes = match self.enc.take() {
-            Some(enc) => enc.finish().map_err(|err| EngineError::Io(format!("{}: {err}", target.display())))?.complete(&self.part, &target)?,
+            Some(enc) => enc.finish().map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?.complete(&self.part, &self.path)?,
             None => 0,
         };
         let Some(m) = &mut self.mp3 else {
             return Ok(Some(self.levels(bytes)));
         };
-        let args = crate::mp3::args(&m.wav, &m.out_part, m.meta.as_ref(), self.session.sample_rate.hz(), m.kbps);
-        let mut child = crate::mp3::spawn(&m.ffmpeg, &args).map_err(|err| EngineError::Io(format!("cannot run ffmpeg: {err}")))?;
-        m.stderr = child.stderr.take().map(|mut pipe| {
-            std::thread::spawn(move || {
-                let mut text = String::new();
-                let mut bytes = Vec::new();
-                let _ = std::io::Read::read_to_end(&mut std::io::Read::take(&mut pipe, 1 << 16), &mut bytes);
-                text.push_str(&String::from_utf8_lossy(&bytes));
-                let _ = std::io::copy(&mut pipe, &mut std::io::sink());
-                text
-            })
-        });
-        m.child = Some(child);
+        let channels = bounce_layout(&self.session, self.bus, self.fold.is_some()).1;
+        m.close_input(self.session.sample_rate.hz(), channels)?;
         Ok(None)
     }
 
     /// Checks (or with `block`, waits for) the ffmpeg pass; on success the MP3 replaces the path.
     fn poll_mp3(&mut self, block: bool) -> Result<Option<Bounced>> {
         let Some(m) = &mut self.mp3 else { return Ok(None) };
-        let Some(child) = &mut m.child else { return Ok(None) };
+        let mut guard = proc_lock(&m.child);
+        let Some(child) = guard.as_mut() else { return Ok(None) };
         let status = if block { child.wait().map(Some) } else { child.try_wait() }.map_err(|err| EngineError::Io(format!("ffmpeg: {err}")))?;
         let Some(status) = status else { return Ok(None) };
-        m.child = None;
+        *guard = None;
+        drop(guard);
         let text = m.stderr.take().and_then(|h| h.join().ok()).unwrap_or_default();
         if !status.success() {
             let text = text.trim();
@@ -600,22 +787,27 @@ impl Bounce {
         }
         let bytes = std::fs::metadata(&m.out_part).map(|md| md.len()).map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?;
         replace_with(&m.out_part, &self.path, Ok(()))?;
-        let _ = std::fs::remove_file(&m.wav);
         Ok(Some(self.levels(bytes)))
     }
 }
 
 impl Drop for Bounce {
-    /// Removes the part files (and the temporary WAV of an MP3 bounce) unless the bounce completed.
+    /// Removes the part files unless the bounce completed.
     fn drop(&mut self) {
-        drop(self.enc.take());
-        let _ = std::fs::remove_file(&self.part);
-        if let Some(mut m) = self.mp3.take() {
-            if let Some(mut child) = m.child.take() {
+        // ffmpeg goes first: the writer may be blocked writing to its pipe, and joining it
+        // before the kill would wait forever.
+        if let Some(proc) = self.mp3_proc.take() {
+            let taken = proc_lock(&proc).take();
+            if let Some(mut child) = taken {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            let _ = std::fs::remove_file(&m.wav);
+        }
+        let _ = self.join_writer();
+        drop(self.enc.take());
+        let _ = std::fs::remove_file(&self.part);
+        if let Some(mut m) = self.mp3.take() {
+            m.stdin = None;
             let _ = std::fs::remove_file(&m.out_part);
         }
     }
@@ -686,6 +878,11 @@ impl std::io::Seek for Out {
             Out::Memory(m) => m.seek(pos),
         }
     }
+}
+
+/// What a writer thread hands back when it was never given the real sink.
+fn sink_placeholder() -> Sink {
+    (soundcraft_dsp::meter::LoudnessMeter::new(1.0, 0), None, None)
 }
 
 const MAX_BOUNCE_SECS: f64 = 4.0 * 3600.0;
@@ -1829,10 +2026,9 @@ mod save_tests {
         open_session(&mut missing, &path("A/A.scraft")).unwrap();
         save_session(&mut missing, &path("B/Moved.scraft")).unwrap();
         let mut r = Engine::default();
-        assert_eq!(
-            open_session(&mut r, &path("B/Moved.scraft")).unwrap(),
-            vec![dir.join("A").join("Audio Files/Audio 1_02.wav").display().to_string()]
-        );
+        // Compared as paths: Windows writes the stored name with `/`, the join with `\`.
+        let missing_files: Vec<std::path::PathBuf> = open_session(&mut r, &path("B/Moved.scraft")).unwrap().iter().map(std::path::PathBuf::from).collect();
+        assert_eq!(missing_files, vec![dir.join("A").join("Audio Files").join("Audio 1_02.wav")]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

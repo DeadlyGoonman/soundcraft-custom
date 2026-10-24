@@ -488,11 +488,15 @@ mod tests {
         let wav = dir.join("mix.mp3.render.wav");
         let opts = soundcraft_audio_io::EncodeOptions { bit_depth: soundcraft_audio_io::BitDepth::Float32, ..Default::default() };
         let range = soundcraft_time::Range::new(0, 48000 * 60);
+        // A real ffmpeg is started by the first block and killed on drop; a missing one fails it.
+        let ffmpeg = crate::mp3::ffmpeg_path();
+        let ffmpeg = ffmpeg.as_deref().unwrap_or(std::path::Path::new("Z:/no/ffmpeg.exe"));
         if let Ok(job) = crate::io::Bounce::new(e.session_arc(), &wav, range, &opts, None, false, true)
-            .and_then(|b| b.to_mp3(&dir.join("mix.mp3"), std::path::Path::new("Z:/no/ffmpeg.exe"), None, 128))
+            .and_then(|b| b.to_mp3(&dir.join("mix.mp3"), ffmpeg, None, 128))
         {
             let mut job = job;
-            assert!(job.step(|| false).is_ok());
+            let stepped = job.step(|| false);
+            assert!(stepped.is_ok() || crate::mp3::ffmpeg_path().is_none(), "{:?}", stepped.err());
             drop(job);
         }
         assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));

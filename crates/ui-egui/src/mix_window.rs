@@ -609,6 +609,25 @@ fn level_icon(r: Rect) -> Rect {
     Rect::from_min_max(pos2(outer.max.x - 9.0, outer.min.y + 2.0), pos2(outer.max.x - 4.0, outer.max.y - 2.0))
 }
 
+/// An insert's latency for its hover tip, in ms and samples at the session rate. A hosted plugin
+/// reports it when it is created; a built-in one is created once to ask, and the answer is kept
+/// in egui's memory. None when the latency is not known (e.g. a hosted plugin that failed to load).
+fn insert_latency(app: &SoundApp, ctx: &egui::Context, track: TrackId, slot: usize, plugin: &str) -> Option<String> {
+    let samples = app.player.as_ref().and_then(|p| p.insert_latency(track, slot)).or_else(|| {
+        let key = egui::Id::new(("insert_latency", plugin));
+        ctx.data_mut(|d| d.get_temp::<usize>(key)).or_else(|| {
+            let n = soundcraft_dsp::create(plugin)?.latency();
+            ctx.data_mut(|d| d.insert_temp(key, n));
+            Some(n)
+        })
+    })?;
+    let rate = app.engine.session().sample_rate.hz();
+    if rate == 0 {
+        return None;
+    }
+    Some(format!("Latency: {:.2} ms ({samples} samples)", samples as f64 * 1000.0 / f64::from(rate)))
+}
+
 pub(crate) fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rect) {
     let t = Tokens::current();
     let id = track.id;
@@ -665,6 +684,15 @@ pub(crate) fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: 
         format!("{name}: click to open the plugin's editor · {cmd}click to bypass · right-click to change")
     } else {
         format!("{name}: click to open · {cmd}click to bypass · right-click to change")
+    };
+    // Looked up only while the slot is hovered: a built-in plugin is created to ask its latency.
+    let latency = match &ins {
+        Some(i) if resp.hovered() => insert_latency(app, ui.ctx(), id, slot, &i.plugin),
+        _ => None,
+    };
+    let tip = match latency {
+        Some(l) => format!("{tip}\n{l}"),
+        None => tip,
     };
     let menu_resp = if ins.is_none() { resp.clone() } else { resp.clone().on_hover_text(tip) };
     let popup = if ins.is_none() { egui::Popup::menu(&menu_resp) } else { egui::Popup::context_menu(&menu_resp) };

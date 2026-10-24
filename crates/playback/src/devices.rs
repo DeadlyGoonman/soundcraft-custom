@@ -32,6 +32,9 @@ pub struct AudioConfig {
     pub sample_rate: Option<u32>,
     /// Device buffer in frames.
     pub buffer_size: Option<u32>,
+    /// Render every track on one thread instead of sharing them out to the worker pool. Off by
+    /// default (the pool is faster on big sessions); on avoids cross-thread waits at tiny buffers.
+    pub serial_mixing: bool,
 }
 
 /// One device as the settings window lists it.
@@ -230,6 +233,7 @@ mod tests {
             input: None,
             sample_rate: Some(48_000),
             buffer_size: Some(256),
+            serial_mixing: true,
         };
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<AudioConfig>(&s).unwrap(), c);

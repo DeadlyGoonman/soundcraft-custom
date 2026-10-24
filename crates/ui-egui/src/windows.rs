@@ -618,6 +618,15 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
             let buffers = out.map(DeviceInfo::buffer_sizes).unwrap_or_else(|| soundcraft_playback::devices::STANDARD_BUFFERS.to_vec());
             number_combo(ui, "pe-buffer", &mut draft.buffer_size, &buffers, "samples");
             ui.end_row();
+            ui.label("Mixing");
+            let mut cores = !draft.serial_mixing;
+            if crate::widgets::checkbox(ui, &mut cores, "Mix tracks on several cores")
+                .on_hover_text("On: tracks render on the worker pool (faster for big sessions). Off: one thread renders everything (fewer cross-thread waits at tiny buffers).")
+                .changed()
+            {
+                draft.serial_mixing = !cores;
+            }
+            ui.end_row();
         });
         if let Some(note) = asio_draft_note(&systems, &draft, app.player.as_ref().filter(|p| p.input_tap().is_some()).map(|p| p.device_name.as_str()))
         {
