@@ -27,7 +27,7 @@ pub mod record;
 
 pub use devices::{AudioConfig, asio_available, asio_control_panel};
 
-use soundcraft_dsp::{EditorScale, Plugin, PluginEditor, PluginStateReader};
+use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorScale, Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
 use soundcraft_model::{Session, TrackId};
 use soundcraft_time::{Range, Samples};
@@ -990,6 +990,46 @@ impl Player {
         self.side().editors.values().any(|e| e.is_open())
     }
 
+    /// Shows the host's header state (bypass, delta, scale) in the plugin's editor. Main thread only.
+    pub fn set_editor_header(&self, track: TrackId, slot: usize, state: EditorHeaderState) {
+        if let Some(e) = self.side().editors.get_mut(&(track, slot)) {
+            e.set_header(state);
+        }
+    }
+
+    /// Header actions (bypass, delta, scale) the user made in open editors since the last call.
+    /// Main thread only.
+    pub fn take_header_actions(&self) -> Vec<(TrackId, usize, EditorHeaderAction)> {
+        let mut out = Vec::new();
+        for (&(t, slot), e) in self.side().editors.iter_mut() {
+            out.extend(e.take_header_actions().into_iter().map(|a| (t, slot, a)));
+        }
+        out
+    }
+
+    /// A player with no audio device (a silent clock), for tests.
+    #[doc(hidden)]
+    pub fn silent(session: Arc<Session>) -> Player {
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let side_rate = session.sample_rate.as_f64() as f32;
+        let (tx, rx) = channel();
+        let (gtx, grx) = channel();
+        let p = Player::silent_clock_with(shared, tx, rx, session, Mutex::new(Side::new(side_rate, grx)), gtx);
+        p.side().return_old_sessions(&p.tx);
+        p
+    }
+
+    /// Hosts a fake editor in a slot, for tests.
+    #[doc(hidden)]
+    pub fn insert_test_editor(&self, track: TrackId, slot: usize, editor: Box<dyn PluginEditor>) {
+        self.side().editors.insert((track, slot), editor);
+    }
+
     /// Shows a parameter change made elsewhere in the plugin's open editor.
     pub fn editor_set_param(&self, track: TrackId, slot: usize, id: &str, value: f32) {
         if let Some(e) = self.side().editors.get_mut(&(track, slot)) {
@@ -1688,6 +1728,58 @@ mod tests {
         fn idle(&mut self) -> Vec<(String, f32)> {
             Vec::new()
         }
+    }
+
+    struct Header {
+        seen: Arc<Mutex<Vec<EditorHeaderState>>>,
+        queued: Vec<EditorHeaderAction>,
+    }
+
+    impl PluginEditor for Header {
+        fn open(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn close(&mut self) {}
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn idle(&mut self) -> Vec<(String, f32)> {
+            Vec::new()
+        }
+        fn set_header(&mut self, state: EditorHeaderState) {
+            self.seen.lock().unwrap().push(state);
+        }
+        fn take_header_actions(&mut self) -> Vec<EditorHeaderAction> {
+            std::mem::take(&mut self.queued)
+        }
+    }
+
+    #[test]
+    fn header_state_and_actions_pass_through_the_player() {
+        let p = Player::silent(Arc::new(Session::default()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (a, b) = (TrackId(1), TrackId(2));
+        p.insert_test_editor(
+            a,
+            3,
+            Box::new(Header { seen: Arc::clone(&seen), queued: vec![EditorHeaderAction::SetBypass(true), EditorHeaderAction::SetDelta(true)] }),
+        );
+        p.insert_test_editor(b, 0, Box::new(Header { seen: Arc::clone(&seen), queued: vec![EditorHeaderAction::SetScale(EditorScale::default())] }));
+        let state = EditorHeaderState { bypass: true, ..EditorHeaderState::default() };
+        p.set_editor_header(a, 3, state);
+        p.set_editor_header(a, 9, state); // no editor: ignored
+        assert_eq!(*seen.lock().unwrap(), vec![state]);
+        let mut got = p.take_header_actions();
+        got.sort_by_key(|(t, s, _)| (t.0, *s));
+        assert_eq!(
+            got,
+            vec![
+                (a, 3, EditorHeaderAction::SetBypass(true)),
+                (a, 3, EditorHeaderAction::SetDelta(true)),
+                (b, 0, EditorHeaderAction::SetScale(EditorScale::default())),
+            ]
+        );
+        assert!(p.take_header_actions().is_empty(), "drained");
     }
 
     #[test]

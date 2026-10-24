@@ -748,6 +748,58 @@ impl SoundApp {
             let key = format!("param:{}:{slot}:{param}", t.0);
             let _ = self.engine.execute_merged("mix.insert_param", &json!({"track": t.0, "slot": slot, "param": param, "value": value}), &key);
         }
+        let actions = p.take_header_actions();
+        for (t, slot, action) in actions {
+            use soundcraft_dsp::EditorHeaderAction as A;
+            let instrument = slot == soundcraft_mix::INSTRUMENT_SLOT;
+            let result = match action {
+                A::SetBypass(_) | A::SetDelta(_) if instrument => Ok(()),
+                A::SetBypass(v) => {
+                    self.engine.execute("mix.insert_bypass", &json!({"track": t.0, "slot": slot, "value": v})).map(drop).map_err(|e| e.to_string())
+                }
+                A::SetDelta(v) => {
+                    self.engine.execute("mix.insert_delta", &json!({"track": t.0, "slot": slot, "value": v})).map(drop).map_err(|e| e.to_string())
+                }
+                A::SetScale(s) => self.set_slot_editor_scale(t, slot, s),
+            };
+            if let Err(e) = result {
+                self.ui.status = e;
+            }
+        }
+        self.push_editor_headers();
+    }
+
+    /// Shows each open editor the insert's bypass/delta and its remembered scale.
+    fn push_editor_headers(&self) {
+        let Some(p) = &self.player else { return };
+        if !p.any_editor_open() {
+            return;
+        }
+        let session = self.engine.session();
+        for t in &session.tracks {
+            let slots = (0..t.mixer.inserts.len()).chain(std::iter::once(soundcraft_mix::INSTRUMENT_SLOT));
+            for slot in slots {
+                if !p.editor_open(t.id, slot) {
+                    continue;
+                }
+                let instrument = slot == soundcraft_mix::INSTRUMENT_SLOT;
+                let ins = if instrument { t.instrument.as_ref() } else { t.mixer.inserts.get(slot).and_then(Option::as_ref) };
+                let Some(ins) = ins else { continue };
+                let scale = self.ui.editor_scales.get(&ins.plugin).copied().unwrap_or_default();
+                p.set_editor_header(
+                    t.id,
+                    slot,
+                    soundcraft_dsp::EditorHeaderState {
+                        bypass: ins.bypass,
+                        delta: ins.delta,
+                        is_instrument: instrument,
+                        scale,
+                        native_scaling: p.editor_native_scaling(t.id, slot),
+                        can_resize: false,
+                    },
+                );
+            }
+        }
     }
 
     /// Every two minutes, copy a modified session to the autosave folder (not while recording).
