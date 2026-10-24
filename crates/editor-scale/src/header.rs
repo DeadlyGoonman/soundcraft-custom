@@ -1,13 +1,11 @@
-//! The header strip on top of every plugin editor window: platform-free layout, hit testing, the
-//! scale menu and frame-drag helpers. The Win32 window that draws it lives in `frame`.
+//! The header strip on top of every plugin editor window: platform-free layout, hit testing and
+//! frame-drag helpers. The Win32 window that draws it lives in `frame`. The editor is scaled by
+//! dragging the frame (or from the insert's right-click menu); the header holds Bypass and Delta.
 
-use soundcraft_dsp::{EditorHeaderState, EditorScale, EditorScaleMode};
+use soundcraft_dsp::{EditorHeaderState, EditorScaleMode};
 
 /// Header height at 96 dpi, in pixels.
 pub const HEADER_DIP: i32 = 28;
-
-/// Scale presets offered in the header menu, in percent.
-pub const PRESETS: [u32; 10] = [50, 75, 100, 125, 150, 175, 200, 250, 300, 400];
 
 /// Factors a dragged frame snaps to when it ends within 2% of one.
 pub const SNAPS: [f32; 4] = [1.0, 1.25, 1.5, 2.0];
@@ -30,18 +28,16 @@ impl Rect {
 /// A clickable part of the header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
-    /// "150% ▾": opens the scale menu.
-    Scale,
     Bypass,
     /// "Δ Delta": wet minus dry.
     Delta,
 }
 
-/// Where the header's buttons are for a width and dpi: `[Scale ▾] … [Bypass] [Δ Delta]`.
+/// Where the header's buttons are for a width and dpi: `… [Bypass] [Δ Delta]`, right-aligned
+/// (next to the close button above them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
     pub height: i32,
-    pub scale: Rect,
     pub bypass: Rect,
     pub delta: Rect,
 }
@@ -62,18 +58,17 @@ pub fn layout(width: i32, dpi: u32) -> Layout {
     let h = height(dpi);
     let pad = px(4, dpi);
     let (top, bottom) = (pad, h - pad);
-    let scale = Rect { left: pad, top, right: pad + px(76, dpi), bottom };
     let delta_w = px(68, dpi);
     let bypass_w = px(64, dpi);
-    let right = width.max(scale.right + pad + bypass_w + pad + delta_w + pad) - pad;
+    let right = width.max(pad + bypass_w + pad + delta_w + pad) - pad;
     let delta = Rect { left: right - delta_w, top, right, bottom };
     let bypass = Rect { left: delta.left - pad - bypass_w, top, right: delta.left - pad, bottom };
-    Layout { height: h, scale, bypass, delta }
+    Layout { height: h, bypass, delta }
 }
 
 /// The button under a header point.
 pub fn hit(l: &Layout, x: i32, y: i32) -> Option<Button> {
-    [(l.scale, Button::Scale), (l.bypass, Button::Bypass), (l.delta, Button::Delta)].into_iter().find(|(r, _)| r.contains(x, y)).map(|(_, b)| b)
+    [(l.bypass, Button::Bypass), (l.delta, Button::Delta)].into_iter().find(|(r, _)| r.contains(x, y)).map(|(_, b)| b)
 }
 
 /// Delta needs a dry signal: unavailable on instruments and while bypassed.
@@ -81,57 +76,8 @@ pub fn delta_enabled(s: &EditorHeaderState) -> bool {
     !s.bypass && !s.is_instrument
 }
 
-/// The scale button's text, e.g. "150% ▾".
-pub fn scale_label(scale: EditorScale) -> String {
-    format!("{}% \u{25BE}", (scale.clamped_factor() * 100.0).round() as u32)
-}
-
-/// One choice of the scale menu: a size. There is no mode to pick: an editor scales natively
-/// when the plugin can, otherwise the FSR 1 upscaler stretches it ([`crate::plan`] with `Auto`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MenuChoice {
-    Percent(u32),
-}
-
-const PERCENT_BASE: u32 = 1000;
-
-/// The Win32 menu command id of a choice (never 0).
-pub fn menu_id(c: MenuChoice) -> u32 {
-    match c {
-        MenuChoice::Percent(p) => PERCENT_BASE + p,
-    }
-}
-
-/// The choice behind a menu command id.
-pub fn menu_choice(id: u32) -> Option<MenuChoice> {
-    let p = id.checked_sub(PERCENT_BASE)?;
-    PRESETS.contains(&p).then_some(MenuChoice::Percent(p))
-}
-
-/// One entry of the scale menu.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MenuItem {
-    pub id: u32,
-    pub label: String,
-    pub checked: bool,
-}
-
-/// The scale menu for the header state: the size presets, the current one checked.
-pub fn menu_items(s: &EditorHeaderState) -> Vec<MenuItem> {
-    let cur = (s.scale.clamped_factor() * 100.0).round() as u32;
-    PRESETS.iter().map(|&p| MenuItem { id: menu_id(MenuChoice::Percent(p)), label: format!("{p}%"), checked: p == cur }).collect()
-}
-
-/// The scale after picking `c` with `cur` in effect: the size changes, the mode (native, or the
-/// upscaler the user opted into in the insert menu) stays.
-pub fn apply_choice(cur: EditorScale, c: MenuChoice) -> EditorScale {
-    match c {
-        MenuChoice::Percent(p) => EditorScale { factor: p as f32 / 100.0, mode: cur.mode },
-    }
-}
-
 /// Whether the editor can be scaled: the plugin draws itself at another size, or its saved mode
-/// is one of the upscalers. Otherwise the Scale menu is greyed out and the frame is fixed.
+/// is one of the upscalers. Otherwise the frame is fixed (no sizing border).
 pub fn scalable(s: &EditorHeaderState) -> bool {
     s.native_scaling || matches!(s.scale.mode, EditorScaleMode::Upscale(_))
 }
@@ -187,23 +133,22 @@ pub fn locked_body(native: (f64, f64), want: (f64, f64), edge: Edge, min: f64, m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soundcraft_dsp::UpscaleFilter;
+    use soundcraft_dsp::{EditorScale, UpscaleFilter};
 
     #[test]
     fn layout_scales_with_dpi_and_stays_inside() {
         for (dpi, h) in [(96, 28), (144, 42), (192, 56)] {
             let l = layout(800, dpi);
             assert_eq!(l.height, h);
-            assert_eq!(l.scale.left, px(4, dpi));
-            assert_eq!(l.delta.right, 800 - px(4, dpi));
-            assert!(l.scale.right < l.bypass.left && l.bypass.right < l.delta.left);
-            for r in [l.scale, l.bypass, l.delta] {
-                assert!(r.top >= 0 && r.bottom <= h && r.left < r.right);
+            assert_eq!(l.delta.right, 800 - px(4, dpi), "right-aligned");
+            assert!(l.bypass.right < l.delta.left);
+            for r in [l.bypass, l.delta] {
+                assert!(r.top >= 0 && r.bottom <= h && r.left < r.right && r.left >= 0);
             }
         }
-        // Too narrow: the buttons still don't overlap (the header just runs past the window).
+        // Too narrow: the buttons still don't overlap or leave the left edge.
         let l = layout(50, 96);
-        assert!(l.scale.right < l.bypass.left);
+        assert!(l.bypass.left >= 0 && l.bypass.right < l.delta.left);
     }
 
     #[test]
@@ -211,42 +156,13 @@ mod tests {
         for dpi in [96, 144, 192] {
             let l = layout(640, dpi);
             let mid = |r: Rect| ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
-            for (r, b) in [(l.scale, Button::Scale), (l.bypass, Button::Bypass), (l.delta, Button::Delta)] {
+            for (r, b) in [(l.bypass, Button::Bypass), (l.delta, Button::Delta)] {
                 let (x, y) = mid(r);
                 assert_eq!(hit(&l, x, y), Some(b), "{dpi}");
             }
-            assert_eq!(hit(&l, 320, l.height / 2), None, "the gap");
-            assert_eq!(hit(&l, l.scale.left, 0), None, "above the buttons");
+            assert_eq!(hit(&l, 20, l.height / 2), None, "the left side is empty");
+            assert_eq!(hit(&l, l.bypass.left, 0), None, "above the buttons");
         }
-    }
-
-    #[test]
-    fn menu_ids_round_trip() {
-        for p in PRESETS {
-            assert_eq!(menu_choice(menu_id(MenuChoice::Percent(p))), Some(MenuChoice::Percent(p)));
-        }
-        assert_eq!(menu_choice(0), None);
-        assert_eq!(menu_choice(PERCENT_BASE + 333), None);
-        let ids: std::collections::HashSet<u32> = menu_items(&EditorHeaderState::default()).iter().map(|i| i.id).collect();
-        assert_eq!(ids.len(), PRESETS.len());
-    }
-
-    #[test]
-    fn the_menu_offers_sizes_only() {
-        let s = EditorHeaderState { scale: EditorScale { factor: 1.5, mode: EditorScaleMode::Upscale(UpscaleFilter::Nis) }, ..Default::default() };
-        let items = menu_items(&s);
-        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(labels, ["50%", "75%", "100%", "125%", "150%", "175%", "200%", "250%", "300%", "400%"]);
-        let checked: Vec<&str> = items.iter().filter(|i| i.checked).map(|i| i.label.as_str()).collect();
-        assert_eq!(checked, ["150%"]);
-        assert_eq!(scale_label(s.scale), "150% \u{25BE}");
-    }
-
-    #[test]
-    fn a_picked_size_keeps_the_mode() {
-        assert_eq!(apply_choice(EditorScale::default(), MenuChoice::Percent(200)), EditorScale { factor: 2.0, mode: EditorScaleMode::Auto });
-        let fsr = EditorScale { factor: 1.0, mode: EditorScaleMode::Upscale(UpscaleFilter::Fsr1) };
-        assert_eq!(apply_choice(fsr, MenuChoice::Percent(150)), EditorScale { factor: 1.5, ..fsr });
     }
 
     #[test]
