@@ -81,8 +81,17 @@ pub fn ui_aliases() -> Vec<(&'static str, &'static str)> {
     v.extend(mix_view_aliases().iter().copied());
     v.extend(AUDIOSUITE.iter().map(|(p, _)| (*p, "audiosuite.process")));
     v.extend(MENU_WINDOWS.iter().copied());
+    v.extend(EXTRA_ITEMS.iter().copied());
     v
 }
+
+/// Menu items of our own, outside the incumbent catalog: (path, command).
+const EXTRA_ITEMS: &[(&str, &str)] = &[
+    ("File > New > New Project...", "session.new"),
+    ("File > New > Open from Template...", "session.new_from_template"),
+    ("Edit > Move Clips to Track Above", "clip.move_to_adjacent_track"),
+    ("Edit > Move Clips to Track Below", "clip.move_to_adjacent_track"),
+];
 
 /// Mix-view menu paths, allocated once. Rebuilding them on every menu draw leaked a copy per frame.
 fn mix_view_aliases() -> &'static [(&'static str, &'static str)] {
@@ -216,6 +225,21 @@ pub fn tree() -> Vec<MenuNode> {
     for (path, _) in MENU_WINDOWS {
         insert_path(&mut roots, path);
     }
+    // File › New is a submenu: a blank project or a copy of an existing one.
+    if let Some(file) = roots.iter_mut().find(|n| n.label == "File")
+        && let Some(new) = file.children.iter_mut().find(|n| n.path == "File > New...")
+    {
+        *new = MenuNode { label: "New".into(), path: "File > New".into(), children: Vec::new() };
+    }
+    insert_path(&mut roots, "File > New > New Project...");
+    insert_path(&mut roots, "File > New > Open from Template...");
+    // Shift+Up/Down, after Edit › Shift... (Pro Tools has no such items).
+    if let Some(edit) = roots.iter_mut().find(|n| n.label == "Edit") {
+        let at = edit.children.iter().position(|n| n.label == "Shift...").map_or(edit.children.len(), |i| i + 1);
+        for (i, label) in ["Move Clips to Track Above", "Move Clips to Track Below"].into_iter().enumerate() {
+            edit.children.insert(at + i, MenuNode { label: label.into(), path: format!("Edit > {label}"), children: Vec::new() });
+        }
+    }
     roots
 }
 
@@ -314,7 +338,11 @@ fn menu_node(app: &mut SoundApp, ui: &mut egui::Ui, n: &MenuNode, extra: &[(&str
     let (enabled, checked) = item_state(app, &n.path, id.as_deref());
     let label = live_label(app, id.as_deref()).unwrap_or_else(|| n.label.clone());
     let label = if checked { format!("✔ {label}") } else { label };
-    let shortcut = id.as_deref().and_then(shortcut_for).unwrap_or("");
+    let shortcut = match n.path.as_str() {
+        "Edit > Move Clips to Track Above" => "Shift+Up",
+        "Edit > Move Clips to Track Below" => "Shift+Down",
+        _ => id.as_deref().and_then(shortcut_for).unwrap_or(""),
+    };
     let btn = egui::Button::new(label).shortcut_text(crate::shortcuts::shortcut_label(shortcut, ui.ctx().os().is_mac()));
     if ui.add_enabled(enabled, btn).clicked()
         && let Some(id) = id
@@ -423,6 +451,7 @@ fn params_for(path: &str, id: &str) -> Value {
             json!({"mode": if leaf.starts_with("AFL") { "afl" } else if leaf.starts_with("PFL") { "pfl" } else { "sip" }, "xor": leaf.starts_with("X-OR")})
         }
         "clip.rating" => json!({"rating": leaf.parse::<u8>().unwrap_or(0)}),
+        "clip.move_to_adjacent_track" => json!({"direction": if leaf.ends_with("Above") { "up" } else { "down" }}),
         "track.change_width" => json!({"format": leaf}),
         "view.mix_section" => json!({"section": mix_section_id(leaf)}),
         "audiosuite.process" => json!({"process": AUDIOSUITE.iter().find(|(p, _)| *p == path).map_or("", |(_, x)| *x)}),
@@ -768,6 +797,40 @@ mod tests {
         assert!(app.dialogs.open.is_none());
         assert!(!app.engine.is_dirty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_new_is_a_submenu_of_new_project_and_open_from_template() {
+        let roots = tree();
+        let file = roots.iter().find(|n| n.label == "File").unwrap();
+        assert!(file.children.iter().all(|n| n.path != "File > New..."));
+        let new = file.children.iter().find(|n| n.label == "New").unwrap();
+        assert_eq!(file.children.first().map(|n| n.label.as_str()), Some("New"), "still first in File");
+        let items: Vec<&str> = new.children.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(items, ["New Project...", "Open from Template..."]);
+        let extra = ui_aliases();
+        assert_eq!(command_for_path("File > New > New Project...", &extra).as_deref(), Some("session.new"));
+        assert_eq!(command_for_path("File > New > Open from Template...", &extra).as_deref(), Some("session.new_from_template"));
+        assert_eq!(shortcut_for("session.new"), Some("Cmd+N"));
+
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        invoke_menu(&mut app, "session.new", "File > New > New Project...");
+        assert_eq!(app.dialogs.open_name(), Some("new_session"));
+        app.dialogs.open = None;
+        invoke_menu(&mut app, "session.new_from_template", "File > New > Open from Template...");
+        assert!(matches!(&app.dialogs.open, Some(crate::dialogs::Dialog::PathPrompt { cmd, .. }) if cmd == "session.new_from_template"));
+    }
+
+    #[test]
+    fn edit_menu_moves_clips_a_track_up_or_down() {
+        let edit = tree().into_iter().find(|n| n.label == "Edit").unwrap();
+        let extra = ui_aliases();
+        for (label, dir) in [("Move Clips to Track Above", "up"), ("Move Clips to Track Below", "down")] {
+            let n = edit.children.iter().find(|n| n.label == label).unwrap();
+            let id = command_for_path(&n.path, &extra).unwrap();
+            assert_eq!(id, "clip.move_to_adjacent_track");
+            assert_eq!(params_for(&n.path, &id), json!({"direction": dir}));
+        }
     }
 
     #[test]
