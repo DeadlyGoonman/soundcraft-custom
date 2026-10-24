@@ -2,9 +2,15 @@
 //!
 //! Two windows: a hidden *source* popup at native size (the plugin's parent, layered at alpha 1 and
 //! click-through, owned by the app's main window) and an editor frame ([`HostWindow`], owned by the
-//! source) whose body is the *canvas* the picture is presented in, at native x factor. `pump` captures
-//! the source with `PrintWindow` into a CPU frame, then presents it through D3D11 compute (FSR 1 or
-//! bilinear). If any D3D step fails the window switches once to a `StretchBlt` HALFTONE fallback.
+//! source) whose body is the *canvas* the picture is presented in, at native x factor. The plugin is
+//! never resized or scaled: it draws at its own size and only its picture is stretched.
+//!
+//! Capture is Windows.Graphics.Capture: DWM hands over the source's composed picture as a D3D11
+//! texture (no repaint is asked of the plugin, no CPU copy), which goes straight into the D3D11
+//! compute filter (FSR 1 or bilinear). A canvas timer pumps it at up to 60 fps, independent of the
+//! app's own frame rate. Without WGC, `PrintWindow` captures into a CPU frame instead (slow: it
+//! makes the plugin repaint synchronously). If any D3D step fails the window switches once to a
+//! `StretchBlt` HALFTONE fallback.
 //!
 //! Every `unsafe` block states its safety argument in a `// SAFETY:` comment.
 
@@ -16,11 +22,15 @@ use std::time::{Duration, Instant};
 use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, UpscaleFilter};
 
 use crate::frame::{HostWindow, WM_FRAME_HIDING, WM_FRAME_MOVED, app_owner};
+use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
+use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{COLORREF, FALSE, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, ID3DBlob};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS, D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS, D3D11_BOX, D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER,
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
     D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
     D3D11CreateDevice, ID3D11Buffer, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext, ID3D11SamplerState, ID3D11ShaderResourceView,
@@ -29,6 +39,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
 };
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
     IDXGIFactory2, IDXGISwapChain1,
@@ -39,20 +50,28 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
+use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, LWA_ALPHA, PostMessageW,
-    RealChildWindowFromPoint, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetLayeredWindowAttributes,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, KillTimer, LWA_ALPHA,
+    PostMessageW, RealChildWindowFromPoint, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::{PCSTR, PCWSTR, w};
+use windows::core::{Interface, PCSTR, PCWSTR, w};
 
 /// Largest accepted dimension (native or scaled), in pixels.
 const MAX_DIM: u32 = 16_384;
 /// Minimum spacing between captures: at most 60 frames per second.
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const FRAME_INTERVAL: Duration = Duration::from_millis(15);
+/// The canvas timer that pumps frames (ms; Windows rounds to its ~15.6 ms tick).
+const PUMP_TIMER: usize = 1;
+const PUMP_MS: u32 = 15;
+/// Posted to the canvas (from the capture thread) when a WGC frame arrived.
+const WM_WGC_FRAME: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x61;
 /// `PW_CLIENTONLY` and `PW_RENDERFULLCONTENT` from WinUser.h.
 const PW_CLIENTONLY: u32 = 1;
 const PW_RENDERFULLCONTENT: u32 = 2;
@@ -101,11 +120,13 @@ struct State {
     have_frame: bool,
     /// The capture being checked before it replaces `frame`.
     shot: Vec<u32>,
-    /// Black pixels in `frame`, and captures held back in a row by [`flash_guard`].
+    /// Black pixels in `frame`, and since when captures are held back by [`flash_guard`].
     black: usize,
-    held: u32,
-    /// Captures in a row each tile was patched from the last frame (see [`patch_blank_tiles`]).
-    tile_held: Vec<u8>,
+    held_since: Option<Instant>,
+    /// Since when each tile is patched from the last frame (see [`patch_blank_tiles`]).
+    tile_held: Vec<Option<Instant>>,
+    /// Frames presented so far (tests and benchmarks).
+    presented: u64,
     /// Child that receives keyboard messages: the last one the mouse went down on.
     focus: HWND,
     /// Child that owns the button press in progress (mouse capture).
@@ -149,8 +170,9 @@ impl ScaledWindow {
             have_frame: false,
             shot: Vec::new(),
             black: 0,
-            held: 0,
+            held_since: None,
             tile_held: Vec::new(),
+            presented: 0,
             focus: source,
             drag: None,
         });
@@ -162,6 +184,10 @@ impl ScaledWindow {
         }
         let mut this = ScaledWindow { state: raw };
         this.st_mut().relayout()?;
+        // Frames are pumped by the canvas's own timer (the app's message loop dispatches it), so
+        // the picture keeps up even while the app draws few frames of its own.
+        // SAFETY: our live canvas; no callback (WM_TIMER goes to the window procedure).
+        unsafe { SetTimer(Some(canvas), PUMP_TIMER, PUMP_MS, None) };
         Ok(this)
     }
 
@@ -216,59 +242,10 @@ impl ScaledWindow {
         log_err(result);
     }
 
-    /// Captures and presents one frame, at most 60 times per second, only while visible.
+    /// Captures and presents one frame, at most 60 times per second, only while visible. The
+    /// canvas timer calls this too; hosts may call it every UI frame.
     pub fn pump(&mut self) {
-        let st = self.st_mut();
-        if !st.window.is_visible() {
-            return;
-        }
-        let now = Instant::now();
-        if st.last_pump.is_some_and(|t| now.duration_since(t) < FRAME_INTERVAL) {
-            return;
-        }
-        st.last_pump = Some(now);
-        let Some(capture) = st.capture.as_ref() else {
-            return;
-        };
-        // A failed capture, or one that suddenly turns much of the editor black (a GPU-drawn plugin
-        // caught mid-repaint), keeps the last good frame on screen: nothing is presented, so the
-        // swapchain still shows it. An unchanged frame is not presented again either.
-        if !capture.grab(st.source, &mut st.shot) {
-            if st.have_frame {
-                return;
-            }
-        } else {
-            if st.have_frame {
-                patch_blank_tiles(&st.frame, &mut st.shot, st.native, &mut st.tile_held);
-            }
-            let black = black_pixels(&st.shot);
-            if !flash_guard(st.have_frame.then_some(st.black), black, st.shot.len(), st.held) {
-                st.held += 1;
-                return;
-            }
-            st.held = 0;
-            st.black = black;
-            if st.have_frame && st.shot == st.frame {
-                return;
-            }
-            std::mem::swap(&mut st.frame, &mut st.shot);
-            st.have_frame = true;
-        }
-
-        let mut gpu_error = None;
-        let mut presented = false;
-        if let Some(gpu) = st.gpu.as_mut() {
-            match gpu.draw(&st.frame) {
-                Ok(()) => presented = true,
-                Err(e) => gpu_error = Some(e),
-            }
-        }
-        if let Some(e) = gpu_error {
-            st.disable_gpu(&e);
-        }
-        if !presented {
-            st.draw_gdi();
-        }
+        self.st_mut().pump();
     }
 
     /// Shows the frame (and its source) and brings it to the front.
@@ -327,8 +304,40 @@ impl ScaledWindow {
         if x >= st.native.0 || y >= st.native.1 {
             return None;
         }
+        if let Some(g) = st.gpu.as_ref().filter(|g| g.wgc.is_some()) {
+            // WGC frames live only on the GPU: BGRA in memory is 0xAARRGGBB as a u32.
+            let ix = (u64::from(x) * u64::from(g.input.0) / u64::from(st.native.0.max(1))) as u32;
+            let iy = (u64::from(y) * u64::from(g.input.1) / u64::from(st.native.1.max(1))) as u32;
+            return st.have_frame.then(|| g.read_pixel(&g.capture_tex, ix, iy)).flatten();
+        }
         let index = (y as usize) * (st.native.0 as usize) + x as usize;
         st.frame.get(index).copied()
+    }
+
+    /// Tests and benchmarks: frames presented so far.
+    #[doc(hidden)]
+    pub fn frames_presented(&self) -> u64 {
+        self.st().presented
+    }
+
+    /// Whether frames come from Windows.Graphics.Capture (false: the PrintWindow fallback).
+    #[doc(hidden)]
+    pub fn uses_wgc(&self) -> bool {
+        self.st().gpu.as_ref().is_some_and(|g| g.wgc.is_some())
+    }
+
+    /// Tests: the native pixel and screen point a canvas point is forwarded to.
+    #[doc(hidden)]
+    pub fn map_canvas_point(&self, x: i32, y: i32) -> (POINT, POINT) {
+        let st = self.st();
+        (map_to_native(POINT { x, y }, st.canvas_size(), st.native), st.source_screen(POINT { x, y }))
+    }
+
+    /// Tests: the screen origins of the canvas and of the source (they must match).
+    #[doc(hidden)]
+    pub fn origins(&self) -> (POINT, POINT) {
+        let st = self.st();
+        (to_screen(st.canvas, POINT { x: 0, y: 0 }), to_screen(st.source, POINT { x: 0, y: 0 }))
     }
 
     fn st(&self) -> &State {
@@ -350,6 +359,7 @@ impl Drop for ScaledWindow {
         // Detach the pointer before destroying windows so no message can reach freed state.
         // SAFETY: the canvas is still alive (destroyed with the frame below).
         unsafe {
+            let _ = KillTimer(Some(st.canvas), PUMP_TIMER);
             SetWindowLongPtrW(st.canvas, GWLP_USERDATA, 0);
         }
         let source = st.source;
@@ -380,12 +390,12 @@ impl State {
         self.shot.clear();
         self.shot.resize((nw as usize) * (nh as usize), 0);
         self.have_frame = false;
-        self.held = 0;
+        self.held_since = None;
         self.tile_held.clear();
-        self.tile_held.resize(tile_count(self.native), 0);
+        self.tile_held.resize(tile_count(self.native), None);
         self.gpu = None;
         if !self.gpu_disabled {
-            match Gpu::new(self.canvas, self.native, (sw, sh), self.filter) {
+            match Gpu::new(self.canvas, self.source, self.native, (sw, sh), self.filter) {
                 Ok(mut gpu) => {
                     gpu.probe = self.probe;
                     self.gpu_builds += 1;
@@ -395,6 +405,85 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    /// One frame: the latest WGC frame straight into the filter, or a PrintWindow capture.
+    fn pump(&mut self) {
+        if !self.window.is_visible() {
+            return;
+        }
+        let now = Instant::now();
+        if self.last_pump.is_some_and(|t| now.duration_since(t) < FRAME_INTERVAL) {
+            return;
+        }
+        if let Some(gpu) = self.gpu.as_mut().filter(|g| g.wgc.is_some()) {
+            match gpu.grab_wgc() {
+                // Nothing new since the last frame: the swapchain still shows it.
+                Ok(false) => return,
+                Ok(true) => {
+                    self.last_pump = Some(now);
+                    self.have_frame = true;
+                    match gpu.present() {
+                        Ok(()) => self.presented += 1,
+                        Err(e) => self.disable_gpu(&e),
+                    }
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("editor upscale: window capture failed, using PrintWindow: {e}");
+                    gpu.wgc = None;
+                }
+            }
+        }
+        self.last_pump = Some(now);
+        self.pump_print_window(now);
+    }
+
+    /// The fallback capture: `PrintWindow` into a CPU frame, filtered for dropouts, then uploaded.
+    fn pump_print_window(&mut self, now: Instant) {
+        let Some(capture) = self.capture.as_ref() else {
+            return;
+        };
+        // A failed capture, or one that suddenly turns much of the editor black (a plugin caught
+        // mid-repaint), keeps the last good frame on screen: nothing is presented, so the
+        // swapchain still shows it. An unchanged frame is not presented again either.
+        if !capture.grab(self.source, &mut self.shot) {
+            if self.have_frame {
+                return;
+            }
+        } else {
+            if self.have_frame {
+                patch_blank_tiles(&self.frame, &mut self.shot, self.native, &mut self.tile_held, now);
+            }
+            let black = black_pixels(&self.shot);
+            let held_for = self.held_since.map_or(Duration::ZERO, |t| now.duration_since(t));
+            if !flash_guard(self.have_frame.then_some(self.black), black, self.shot.len(), held_for) {
+                self.held_since.get_or_insert(now);
+                return;
+            }
+            self.held_since = None;
+            self.black = black;
+            if self.have_frame && self.shot == self.frame {
+                return;
+            }
+            std::mem::swap(&mut self.frame, &mut self.shot);
+            self.have_frame = true;
+        }
+        let mut gpu_error = None;
+        let mut presented = false;
+        if let Some(gpu) = self.gpu.as_mut() {
+            match gpu.draw(&self.frame) {
+                Ok(()) => presented = true,
+                Err(e) => gpu_error = Some(e),
+            }
+        }
+        if let Some(e) = gpu_error {
+            self.disable_gpu(&e);
+        }
+        if !presented {
+            self.draw_gdi();
+        }
+        self.presented += 1;
     }
 
     /// Switches to the GDI fallback for good, logging the reason once.
@@ -438,15 +527,11 @@ impl State {
         ((r.right - r.left) as u32, (r.bottom - r.top) as u32)
     }
 
-    /// Maps a point in the canvas to the source's screen position.
+    /// Maps a point in the canvas to the source's screen position (the plugin pixel under it).
     fn source_screen(&self, client: POINT) -> POINT {
-        let (cw, ch) = self.canvas_size();
-        let fx = cw as f32 / self.native.0.max(1) as f32;
-        let fy = ch as f32 / self.native.1.max(1) as f32;
-        let x = (client.x as f32 / fx).round() as i32;
-        let y = (client.y as f32 / fy).round() as i32;
+        let p = map_to_native(client, self.canvas_size(), self.native);
         let origin = to_screen(self.source, POINT { x: 0, y: 0 });
-        POINT { x: origin.x + x, y: origin.y + y }
+        POINT { x: origin.x + p.x, y: origin.y + p.y }
     }
 
     /// Mouse input: maps the point to the deepest child under it (or the captured one) and posts
@@ -592,10 +677,16 @@ impl Drop for Capture {
 /// The D3D11 path: upload the captured frame, run EASU + RCAS (or bilinear), copy into the
 /// flip-model swapchain's back buffer and present.
 struct Gpu {
+    device: ID3D11Device,
     ctx: ID3D11DeviceContext,
+    /// Windows.Graphics.Capture of the source (`None`: frames are uploaded from the CPU).
+    wgc: Option<Wgc>,
     swap: IDXGISwapChain1,
     capture_tex: ID3D11Texture2D,
     capture_srv: ID3D11ShaderResourceView,
+    /// The capture texture's size: the native size, or a WGC frame's when DWM scales the source's
+    /// picture (a DPI-unaware plugin window): the filter then stretches the whole frame.
+    input: (u32, u32),
     /// Intermediate EASU output (FSR 1 only).
     mid_srv: Option<ID3D11ShaderResourceView>,
     mid_uav: Option<ID3D11UnorderedAccessView>,
@@ -615,7 +706,7 @@ struct Gpu {
 }
 
 impl Gpu {
-    fn new(canvas: HWND, native: (u32, u32), scaled: (u32, u32), filter: UpscaleFilter) -> Result<Self, String> {
+    fn new(canvas: HWND, source: HWND, native: (u32, u32), scaled: (u32, u32), filter: UpscaleFilter) -> Result<Self, String> {
         let shaders = shaders()?;
         let mut device: Option<ID3D11Device> = None;
         let mut ctx: Option<ID3D11DeviceContext> = None;
@@ -713,11 +804,21 @@ impl Gpu {
         // SAFETY: `device` is a live device; `canvas` is our live window; `desc` is valid.
         let swap = unsafe { factory.CreateSwapChainForHwnd(&device, canvas, &desc, None, None) }.map_err(|e| format!("swapchain: {e}"))?;
 
+        let wgc = match Wgc::new(&device, source, canvas, native) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                log::info!("editor upscale: Windows.Graphics.Capture unavailable, using PrintWindow: {e}");
+                None
+            }
+        };
         Ok(Gpu {
+            device,
             ctx,
+            wgc,
             swap,
             capture_tex,
             capture_srv,
+            input: native,
             mid_srv,
             mid_uav,
             out_tex,
@@ -738,13 +839,55 @@ impl Gpu {
     /// Uploads one native frame, runs the filter passes and presents the result.
     fn draw(&mut self, frame: &[u32]) -> Result<(), String> {
         let (nw, nh) = self.native;
-        let (sw, sh) = self.scaled;
+        self.set_input(self.native)?;
         if frame.len() != (nw as usize) * (nh as usize) {
             return Err("frame size mismatch".into());
         }
         // SAFETY: `frame` holds nw*nh 32-bit pixels with a row pitch of nw*4 bytes and outlives the
         // call; `capture_tex` is our texture of that size and format.
         unsafe { self.ctx.UpdateSubresource(&self.capture_tex, 0, None, frame.as_ptr().cast(), nw * 4, 0) };
+        self.present()
+    }
+
+    /// Copies the newest WGC frame (if any arrived) into the capture texture. `Ok(false)` when
+    /// nothing new arrived.
+    fn grab_wgc(&mut self) -> Result<bool, String> {
+        let (nw, nh) = self.native;
+        let Some(wgc) = self.wgc.as_mut() else { return Ok(false) };
+        let Some((tex, size)) = wgc.latest()? else { return Ok(false) };
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: a plain query on a live texture.
+        unsafe { tex.GetDesc(&mut desc) };
+        // The frame's content (the pool's buffer may be larger after a resize).
+        let content = (size.0.clamp(1, desc.Width.max(1)), size.1.clamp(1, desc.Height.max(1)));
+        let _ = (nw, nh);
+        self.set_input(content)?;
+        // SAFETY: both textures are live on our device with the same format; the box lies inside both.
+        unsafe {
+            let b = D3D11_BOX { left: 0, top: 0, front: 0, right: content.0, bottom: content.1, back: 1 };
+            self.ctx.CopySubresourceRegion(&self.capture_tex, 0, 0, 0, 0, &tex, 0, Some(&b));
+        }
+        Ok(true)
+    }
+
+    /// Makes the capture texture `size` and tells the filter (no-op when it already is).
+    fn set_input(&mut self, size: (u32, u32)) -> Result<(), String> {
+        if size == self.input {
+            return Ok(());
+        }
+        let tex = texture(&self.device, size.0, size.1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_SHADER_RESOURCE.0 as u32)?;
+        self.capture_srv = view_srv(&self.device, &tex)?;
+        self.capture_tex = tex;
+        self.input = size;
+        let values: [f32; 4] = [size.0 as f32, size.1 as f32, self.scaled.0 as f32, self.scaled.1 as f32];
+        // SAFETY: `values` is 16 bytes, matching the constant buffer; the buffer is ours.
+        unsafe { self.ctx.UpdateSubresource(&self.params, 0, None, values.as_ptr().cast(), 0, 0) };
+        Ok(())
+    }
+
+    /// Runs the filter passes on the capture texture and presents the result.
+    fn present(&mut self) -> Result<(), String> {
+        let (sw, sh) = self.scaled;
         match self.filter {
             UpscaleFilter::Bilinear => {
                 if let Some(cs) = self.bilinear.clone() {
@@ -781,6 +924,14 @@ impl Gpu {
     /// Test readback: the centre pixel of `tex` (R8G8B8A8) as `0xAARRGGBB`.
     fn read_center(&self, tex: &ID3D11Texture2D) -> Option<u32> {
         let (sw, sh) = self.scaled;
+        let p = self.read_pixel(tex, sw / 2, sh / 2)?;
+        // RGBA in memory -> 0xAARRGGBB.
+        let [r, g, b, a] = p.to_le_bytes();
+        Some(u32::from_be_bytes([a, r, g, b]))
+    }
+
+    /// Test readback: one pixel of `tex` as the u32 of its 4 bytes in memory.
+    fn read_pixel(&self, tex: &ID3D11Texture2D, x: u32, y: u32) -> Option<u32> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: plain queries and a staging copy of our own texture, mapped and unmapped here; the
         // mapped pointer is read within the row pitch reported for it.
@@ -790,19 +941,19 @@ impl Gpu {
             desc.BindFlags = 0;
             desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
             desc.MiscFlags = 0;
-            let device = self.ctx.GetDevice().ok()?;
             let mut staging = None;
-            device.CreateTexture2D(&desc, None, Some(&mut staging)).ok()?;
+            self.device.CreateTexture2D(&desc, None, Some(&mut staging)).ok()?;
             let staging = staging?;
             self.ctx.CopyResource(&staging, tex);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).ok()?;
-            let (x, y) = ((sw / 2) as usize, (sh / 2) as usize);
-            let p = mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize + x * 4).cast::<u32>().read_unaligned();
+            if x >= desc.Width || y >= desc.Height {
+                self.ctx.Unmap(&staging, 0);
+                return None;
+            }
+            let p = mapped.pData.cast::<u8>().add(y as usize * mapped.RowPitch as usize + x as usize * 4).cast::<u32>().read_unaligned();
             self.ctx.Unmap(&staging, 0);
-            // RGBA in memory -> 0xAARRGGBB.
-            let [r, g, b, a] = p.to_le_bytes();
-            Some(u32::from_be_bytes([a, r, g, b]))
+            Some(p)
         }
     }
 
@@ -823,6 +974,90 @@ impl Gpu {
             self.ctx.CSSetShaderResources(0, Some(&[None]));
         }
     }
+}
+
+/// A Windows.Graphics.Capture session on the source window: DWM delivers its composed picture as
+/// D3D11 textures on our device. Free-threaded frame pool, polled from the UI thread.
+struct Wgc {
+    pool: Direct3D11CaptureFramePool,
+    session: GraphicsCaptureSession,
+    _item: GraphicsCaptureItem,
+    _device: IDirect3DDevice,
+    size: SizeInt32,
+}
+
+impl Wgc {
+    fn new(device: &ID3D11Device, source: HWND, canvas: HWND, native: (u32, u32)) -> Result<Wgc, String> {
+        // SAFETY: WinRT init on this thread (S_FALSE / a different mode already set are fine);
+        // the device and window are live; the interop factory call only reads the handle.
+        unsafe {
+            let _ = RoInitialize(RO_INIT_SINGLETHREADED);
+            let dxgi: IDXGIDevice = device.cast().map_err(|e| format!("IDXGIDevice: {e}"))?;
+            let d3d: IDirect3DDevice =
+                CreateDirect3D11DeviceFromDXGIDevice(&dxgi).and_then(|i| i.cast()).map_err(|e| format!("WinRT device: {e}"))?;
+            let interop =
+                windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().map_err(|e| format!("capture interop: {e}"))?;
+            let item: GraphicsCaptureItem = interop.CreateForWindow(source).map_err(|e| format!("capture item: {e}"))?;
+            let size = SizeInt32 { Width: native.0 as i32, Height: native.1 as i32 };
+            let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&d3d, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size)
+                .map_err(|e| format!("frame pool: {e}"))?;
+            // Each new frame wakes the canvas at once (the handler runs on a capture thread; posting
+            // a message is thread-safe and the canvas outlives the pool, which is closed first).
+            let notify = canvas.0 as isize;
+            let handler = windows::Foundation::TypedEventHandler::<Direct3D11CaptureFramePool, windows::core::IInspectable>::new(move |_, _| {
+                let _ = PostMessageW(Some(HWND(notify as *mut c_void)), WM_WGC_FRAME, WPARAM(0), LPARAM(0));
+                Ok(())
+            });
+            pool.FrameArrived(&handler).map_err(|e| format!("frame event: {e}"))?;
+            let session = pool.CreateCaptureSession(&item).map_err(|e| format!("capture session: {e}"))?;
+            // No yellow border and no cursor in the picture (older Windows lacks these: ignored).
+            let _ = session.SetIsBorderRequired(false);
+            let _ = session.SetIsCursorCaptureEnabled(false);
+            session.StartCapture().map_err(|e| format!("start capture: {e}"))?;
+            Ok(Wgc { pool, session, _item: item, _device: d3d, size })
+        }
+    }
+
+    /// The newest frame since the last call (older ones are dropped), as a texture and the size
+    /// of its content.
+    fn latest(&mut self) -> Result<Option<(ID3D11Texture2D, (u32, u32))>, String> {
+        let mut newest = None;
+        while let Ok(frame) = self.pool.TryGetNextFrame() {
+            newest = Some(frame);
+        }
+        let Some(frame) = newest else { return Ok(None) };
+        let size = frame.ContentSize().map_err(|e| format!("frame size: {e}"))?;
+        if size.Width != self.size.Width || size.Height != self.size.Height {
+            // The source changed size: buffers follow (this frame is still usable).
+            self.size = size;
+            let _ = self.pool.Recreate(&self._device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+        }
+        let surface = frame.Surface().map_err(|e| format!("frame surface: {e}"))?;
+        let access: IDirect3DDxgiInterfaceAccess = surface.cast().map_err(|e| format!("surface access: {e}"))?;
+        // SAFETY: the surface is a live D3D11 texture of our device for as long as we hold it.
+        let tex: ID3D11Texture2D = unsafe { access.GetInterface() }.map_err(|e| format!("frame texture: {e}"))?;
+        let _ = frame.Close();
+        Ok(Some((tex, (size.Width.max(1) as u32, size.Height.max(1) as u32))))
+    }
+}
+
+impl Drop for Wgc {
+    fn drop(&mut self) {
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
+    }
+}
+
+/// The native pixel under a canvas point: the canvas shows the native picture stretched to its
+/// size (whatever the factor, after drags and snaps), so the pixel whose centre the point is
+/// over, clamped to the picture.
+fn map_to_native(client: POINT, canvas: (u32, u32), native: (u32, u32)) -> POINT {
+    let axis = |c: i32, size: u32, n: u32| -> i32 {
+        let n = n.max(1);
+        let v = ((f64::from(c) + 0.5) * f64::from(n) / f64::from(size.max(1))).floor() as i64;
+        v.clamp(0, i64::from(n) - 1) as i32
+    };
+    POINT { x: axis(client.x, canvas.0, native.0), y: axis(client.y, canvas.1, native.1) }
 }
 
 /// Compiled compute blobs, shared by every window of the process.
@@ -965,9 +1200,9 @@ fn tile_uniform(px: &[u32], w: usize, h: usize, tx: usize, ty: usize) -> bool {
 /// Per-region dropout filter. Some plugins draw a part of their editor (UAD/Softube's header
 /// strip, say) through its own child window or surface, and a capture now and then catches that
 /// part blank, mid-repaint. A tile that turns a single flat colour while it had detail in the last
-/// shown frame keeps its last pixels, for up to [`HOLD_FRAMES`] captures in a row (a region that
-/// really went flat gets through after that). `held` has one counter per tile.
-fn patch_blank_tiles(prev: &[u32], shot: &mut [u32], native: (u32, u32), held: &mut [u8]) {
+/// shown frame keeps its last pixels for up to [`HOLD`] (a region that really went flat gets
+/// through after that). `held` says since when each tile is held.
+fn patch_blank_tiles(prev: &[u32], shot: &mut [u32], native: (u32, u32), held: &mut [Option<Instant>], now: Instant) {
     let (w, h) = (native.0 as usize, native.1 as usize);
     if prev.len() != w * h || shot.len() != w * h {
         return;
@@ -975,13 +1210,13 @@ fn patch_blank_tiles(prev: &[u32], shot: &mut [u32], native: (u32, u32), held: &
     let tiles_x = w.div_ceil(TILE);
     for ty in 0..h.div_ceil(TILE) {
         for tx in 0..tiles_x {
-            let Some(count) = held.get_mut(ty * tiles_x + tx) else { continue };
+            let Some(since) = held.get_mut(ty * tiles_x + tx) else { continue };
             let dropout = tile_uniform(shot, w, h, tx, ty) && !tile_uniform(prev, w, h, tx, ty);
-            if !dropout || u32::from(*count) >= HOLD_FRAMES {
-                *count = 0;
+            if !dropout || since.is_some_and(|t| now.duration_since(t) >= HOLD) {
+                *since = None;
                 continue;
             }
-            *count += 1;
+            since.get_or_insert(now);
             let (x0, x1) = (tx * TILE, (tx * TILE + TILE).min(w));
             for y in ty * TILE..(ty * TILE + TILE).min(h) {
                 let row = y * w;
@@ -997,17 +1232,17 @@ fn black_pixels(px: &[u32]) -> usize {
     px.iter().filter(|&&p| p & 0x00FF_FFFF == 0).count()
 }
 
-/// Captures in a row a sudden blackout may be held back (about 130 ms at 60 fps): content that
-/// really turned dark gets through after that.
-const HOLD_FRAMES: u32 = 8;
+/// How long a sudden blackout (whole frame or tile) may be held back: content that really turned
+/// dark gets through after that. Time-based, so a slow capture rate doesn't stretch it.
+const HOLD: Duration = Duration::from_millis(150);
 
 /// Whether a capture with `black` of `total` pixels black may replace the shown frame (`prev`
 /// black pixels, `None` before the first frame), given `held` captures already held back. A jump
 /// of more than a quarter of the editor to black is a capture glitch, not a picture.
-fn flash_guard(prev: Option<usize>, black: usize, total: usize, held: u32) -> bool {
+fn flash_guard(prev: Option<usize>, black: usize, total: usize, held_for: Duration) -> bool {
     match prev {
-        None => black < total || held >= HOLD_FRAMES,
-        Some(prev) => black <= prev.saturating_add(total / 4) || held >= HOLD_FRAMES,
+        None => black < total || held_for >= HOLD,
+        Some(prev) => black <= prev.saturating_add(total / 4) || held_for >= HOLD,
     }
 }
 
@@ -1133,6 +1368,14 @@ fn view_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT>
         }
         // The swapchain owns every pixel of the canvas: erasing it would flash black over it.
         WM_ERASEBKGND => true,
+        WM_TIMER if wp.0 == PUMP_TIMER => {
+            st.pump();
+            true
+        }
+        WM_WGC_FRAME => {
+            st.pump();
+            true
+        }
         WM_FRAME_HIDING => {
             st.hide();
             true
@@ -1245,7 +1488,20 @@ fn lparam_y(lp: LPARAM) -> i32 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use windows::Win32::UI::WindowsAndMessaging::{WINDOW_EX_STYLE, WS_CHILD, WS_VISIBLE};
+    use windows::Win32::UI::WindowsAndMessaging::{WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE};
+
+    /// Dispatches this thread's pending messages (paints, timers), as the app's event loop does.
+    fn pump_messages() {
+        use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage};
+        let mut msg = MSG::default();
+        // SAFETY: a plain message loop over this thread's queue.
+        unsafe {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
 
     unsafe extern "system" fn child_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         // SAFETY: forwards the untouched arguments of a system-dispatched message.
@@ -1304,6 +1560,7 @@ mod tests {
             if found.map(|p| p & 0x00FF_FFFF) == Some(0x00FF_0000) {
                 break;
             }
+            pump_messages();
             std::thread::sleep(Duration::from_millis(25));
         }
         eprintln!("editor-scale test: D3D11 filter active = {}", sw.uses_gpu());
@@ -1326,6 +1583,7 @@ mod tests {
             if let Some(p) = sw.last_presented_center() {
                 seen.push(p & 0x00FF_FFFF);
             }
+            pump_messages();
             std::thread::sleep(Duration::from_millis(20));
         }
         if builds == 0 {
@@ -1344,8 +1602,9 @@ mod tests {
         let n = 32 * 16;
         // Detail everywhere: a gradient.
         let prev: Vec<u32> = (0..n as u32).map(|i| 0xFF00_0000 | i).collect();
-        let mut held = vec![0u8; tile_count(native)];
+        let mut held = vec![None; tile_count(native)];
         assert_eq!(held.len(), 2);
+        let t0 = Instant::now();
         // The left tile drops out to flat black; the right one changes for real.
         let mut shot: Vec<u32> = (0..n as u32).map(|i| 0xFF00_0000 | (i + 7)).collect();
         for y in 0..16 {
@@ -1354,20 +1613,21 @@ mod tests {
             }
         }
         let fresh = shot.clone();
-        patch_blank_tiles(&prev, &mut shot, native, &mut held);
+        patch_blank_tiles(&prev, &mut shot, native, &mut held, t0);
         assert_eq!(shot[5 * 32 + 3], prev[5 * 32 + 3], "the blank tile shows its last pixels");
         assert_eq!(shot[5 * 32 + 20], fresh[5 * 32 + 20], "a real change elsewhere goes through");
-        assert_eq!(held, vec![1, 0]);
-        // A region that stays flat is accepted after HOLD_FRAMES captures.
-        for _ in 1..HOLD_FRAMES {
+        assert_eq!(held, vec![Some(t0), None]);
+        // Still within HOLD: held, however many captures come in.
+        for _ in 0..20 {
             let mut again = fresh.clone();
-            patch_blank_tiles(&prev, &mut again, native, &mut held);
+            patch_blank_tiles(&prev, &mut again, native, &mut held, t0 + HOLD / 2);
             assert_eq!(again[3], prev[3]);
         }
+        // A region that stays flat is accepted once HOLD has passed.
         let mut last = fresh.clone();
-        patch_blank_tiles(&prev, &mut last, native, &mut held);
+        patch_blank_tiles(&prev, &mut last, native, &mut held, t0 + HOLD);
         assert_eq!(last[3], 0xFF00_0000, "really flat now");
-        assert_eq!(held[0], 0);
+        assert_eq!(held[0], None);
     }
 
     #[test]
@@ -1376,17 +1636,21 @@ mod tests {
         // captured frame too, not just the first child.
         let mut sw = ScaledWindow::new("editor-scale children test", 64, 48, 2.0, UpscaleFilter::Fsr1).expect("create");
         let parent = HWND(sw.parent());
-        let _red = red_child(parent, 64, 48);
-        let blue = coloured_child(parent, 0x00FF_0000, (0, 0, 64, 12));
-        let _nested = coloured_child(blue, 0x0000_FF00, (40, 2, 8, 8));
+        let red = coloured_child(parent, 0x0000_00FF, (0, 0, 64, 48));
+        let blue = coloured_child(red, 0x00FF_0000, (0, 0, 64, 12));
+        let _green = coloured_child(blue, 0x0000_FF00, (40, 2, 8, 8));
         sw.raise();
         let mut got = (None, None, None);
         for _ in 0..40 {
             sw.pump();
             got = (sw.last_frame_pixel(10, 30), sw.last_frame_pixel(10, 5), sw.last_frame_pixel(43, 5));
-            if got.0.map(|p| p & 0x00FF_FFFF) == Some(0x00FF_0000) && got.1.map(|p| p & 0x00FF_FFFF) == Some(0x0000_00FF) {
+            if got.0.map(|p| p & 0x00FF_FFFF) == Some(0x00FF_0000)
+                && got.1.map(|p| p & 0x00FF_FFFF) == Some(0x0000_00FF)
+                && got.2.map(|p| p & 0x00FF_FFFF) == Some(0x0000_FF00)
+            {
                 break;
             }
+            pump_messages();
             std::thread::sleep(Duration::from_millis(25));
         }
         assert_eq!(got.0.map(|p| p & 0x00FF_FFFF), Some(0x00FF_0000), "the main child (red)");
@@ -1416,7 +1680,7 @@ mod tests {
                 WINDOW_EX_STYLE(0),
                 PCWSTR(name.as_ptr()),
                 w!(""),
-                WS_CHILD | WS_VISIBLE,
+                WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                 x,
                 y,
                 w,
@@ -1433,13 +1697,126 @@ mod tests {
     #[test]
     fn blackouts_are_held_back_briefly() {
         assert_eq!(black_pixels(&[0xFF00_0000, 0, 0x00FF_0000]), 2);
-        assert!(flash_guard(None, 10, 100, 0), "a first frame with a picture");
-        assert!(!flash_guard(None, 100, 100, 0), "a first frame that is all black waits");
-        assert!(flash_guard(Some(10), 30, 100, 0), "small changes pass");
-        assert!(!flash_guard(Some(10), 90, 100, 0), "a sudden blackout is held");
-        assert!(!flash_guard(Some(10), 90, 100, HOLD_FRAMES - 1));
-        assert!(flash_guard(Some(10), 90, 100, HOLD_FRAMES), "real dark content gets through");
-        assert!(flash_guard(Some(90), 5, 100, 0), "brighter is always fine");
+        let zero = Duration::ZERO;
+        assert!(flash_guard(None, 10, 100, zero), "a first frame with a picture");
+        assert!(!flash_guard(None, 100, 100, zero), "a first frame that is all black waits");
+        assert!(flash_guard(Some(10), 30, 100, zero), "small changes pass");
+        assert!(!flash_guard(Some(10), 90, 100, zero), "a sudden blackout is held");
+        assert!(!flash_guard(Some(10), 90, 100, HOLD / 2));
+        assert!(flash_guard(Some(10), 90, 100, HOLD), "real dark content gets through");
+        assert!(flash_guard(Some(90), 5, 100, zero), "brighter is always fine");
+    }
+
+    #[test]
+    fn canvas_points_land_on_the_plugin_pixel_under_them() {
+        let p = |x, y| POINT { x, y };
+        // 2x: each plugin pixel is a 2x2 block on the canvas.
+        assert_eq!(map_to_native(p(0, 0), (128, 96), (64, 48)), p(0, 0));
+        assert_eq!(map_to_native(p(1, 1), (128, 96), (64, 48)), p(0, 0));
+        assert_eq!(map_to_native(p(2, 3), (128, 96), (64, 48)), p(1, 1));
+        assert_eq!(map_to_native(p(127, 95), (128, 96), (64, 48)), p(63, 47));
+        // After a drag to an odd size (1.5625x) and back to a snap (1.25x).
+        assert_eq!(map_to_native(p(100, 75), (100, 75), (64, 48)), p(63, 47), "clamped to the picture");
+        assert_eq!(map_to_native(p(50, 37), (100, 75), (64, 48)), p(32, 24));
+        assert_eq!(map_to_native(p(79, 59), (80, 60), (64, 48)), p(63, 47));
+        assert_eq!(map_to_native(p(5, 5), (80, 60), (64, 48)), p(4, 4));
+        // Outside (a captured drag past the edge) stays on the edge pixel.
+        assert_eq!(map_to_native(p(-10, 500), (128, 96), (64, 48)), p(0, 47));
+    }
+
+    #[test]
+    fn the_source_sits_exactly_under_the_canvas() {
+        let mut sw = ScaledWindow::new("editor-scale origin test", 320, 240, 2.0, UpscaleFilter::Fsr1).expect("create");
+        sw.raise();
+        let (canvas, source) = sw.origins();
+        assert_eq!((canvas.x, canvas.y), (source.x, source.y), "below the header, in the same place");
+        sw.move_to((120, 140));
+        let (canvas, source) = sw.origins();
+        assert_eq!((canvas.x, canvas.y), (source.x, source.y), "after a move");
+        sw.set_scale(1.25, UpscaleFilter::Fsr1);
+        let (canvas, source) = sw.origins();
+        assert_eq!((canvas.x, canvas.y), (source.x, source.y), "after a rescale");
+        // A canvas point maps onto the source pixel at the same native position.
+        let (px, screen) = sw.map_canvas_point(41, 21);
+        assert_eq!((px.x, px.y), (33, 17));
+        assert_eq!((screen.x - source.x, screen.y - source.y), (33, 17));
+    }
+
+    static ANIM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    unsafe extern "system" fn anim_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        use windows::Win32::Graphics::Gdi::{BeginPaint, CreateSolidBrush, EndPaint, FillRect, PAINTSTRUCT};
+        use windows::Win32::UI::WindowsAndMessaging::WM_PAINT;
+        if msg == WM_PAINT {
+            let v = ANIM.load(std::sync::atomic::Ordering::Relaxed);
+            let mut ps = PAINTSTRUCT::default();
+            // SAFETY: a paint of our own test window; the brush is deleted after use.
+            unsafe {
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let brush = CreateSolidBrush(COLORREF(0x0000_0040 | ((v & 0xFF) << 8)));
+                FillRect(hdc, &ps.rcPaint, brush);
+                let _ = DeleteObject(HGDIOBJ(brush.0));
+                let _ = EndPaint(hwnd, &ps);
+            }
+            return LRESULT(0);
+        }
+        // SAFETY: default processing of a system-dispatched message.
+        unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    }
+
+    #[test]
+    fn an_animated_editor_is_upscaled_at_a_steady_frame_rate() {
+        use windows::Win32::Graphics::Gdi::{InvalidateRect, UpdateWindow};
+        use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage};
+        let sw = ScaledWindow::new("editor-scale fps test", 400, 300, 1.5, UpscaleFilter::Fsr1).expect("create");
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(anim_proc),
+            hInstance: module_instance().expect("module"),
+            lpszClassName: w!("SoundCraftEditorScaleTestAnim"),
+            ..Default::default()
+        };
+        // SAFETY: a static class description; a duplicate registration is ignored.
+        unsafe {
+            let _ = RegisterClassW(&class);
+        }
+        // SAFETY: the parent is our live source window.
+        let child = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("SoundCraftEditorScaleTestAnim"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                400,
+                300,
+                Some(HWND(sw.parent())),
+                None,
+                Some(module_instance().expect("module")),
+                None,
+            )
+        }
+        .expect("animated child");
+        sw.raise();
+        let start = Instant::now();
+        let before = sw.frames_presented();
+        while start.elapsed() < Duration::from_secs(1) {
+            ANIM.fetch_add(9, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: our own live windows; the message loop pumps the canvas timer like the app's.
+            unsafe {
+                let _ = InvalidateRect(Some(child), None, false);
+                let _ = UpdateWindow(child);
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        let fps = sw.frames_presented() - before;
+        eprintln!("editor-scale fps test: {fps} frames in 1 s (WGC = {}, GPU = {})", sw.uses_wgc(), sw.uses_gpu());
+        assert!(fps >= 45, "an animated editor reaches at least 45 fps, got {fps}");
     }
 
     #[test]
