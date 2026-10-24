@@ -15,7 +15,7 @@
 #![allow(clippy::unnecessary_cast)]
 
 use crate::{Vst3Error, scan};
-use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorScale, Transport};
+use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorScale, Transport, UpscaleFilter};
 use soundcraft_editor_scale::{Choice, ScaledWindow, plan};
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_int, c_void};
@@ -2063,6 +2063,9 @@ struct EditorInner {
     header: EditorHeaderState,
     /// Where the last window was, so a reopened editor (new scale, closed and opened) stays put.
     pos: Option<(i32, i32)>,
+    /// The window being replaced by a reopen: kept (empty) until the new one is up and focused,
+    /// so closing it hands focus to nobody else (the app's main window would come forward).
+    retired: Option<EditorWindow>,
 }
 
 /// The link between an instance and its editor and state handles. The instance may process on
@@ -2202,6 +2205,9 @@ impl EditorLink {
             size = fitted;
         }
         win.raise();
+        if let Some(old) = g.retired.take() {
+            old.close();
+        }
         g.view = Some(view);
         g.frame = Some(frame);
         g.window = Some(win);
@@ -2289,11 +2295,23 @@ impl EditorLink {
         if g.view.is_none() {
             return Ok(());
         }
-        if was_scaled || matches!(choice, Choice::Upscale(_)) {
-            EditorLink::teardown(&mut g);
+        let open_choice = if was_scaled { Choice::Upscale(UpscaleFilter::Fsr1) } else { Choice::Native };
+        if let (Choice::Upscale(filter), Some(EditorWindow::Scaled(s))) = (choice, g.window.as_mut()) {
+            // Upscaled stays upscaled: only the picture changes size; the plugin is not touched.
+            s.set_scale(factor, filter);
+            return Ok(());
+        }
+        if !soundcraft_editor_scale::in_place(open_choice, choice) {
+            // Another kind of window: the view moves over. The old window stays until the new
+            // one has the focus, and the new one opens where the old one was.
+            EditorLink::retire(&mut g);
             let title = g.title.clone();
             drop(g);
-            return self.open(&title);
+            let opened = self.open(&title);
+            if let Some(old) = self.lock().retired.take() {
+                old.close();
+            }
+            return opened;
         }
         if native {
             EditorLink::apply_live(&mut g);
@@ -2347,6 +2365,16 @@ impl EditorLink {
         // Remember the size the window really got (Windows may keep it above a minimum), so the
         // next idle sees no change instead of resizing the view again every frame.
         frame.set_size(window::client_size(win.raw()).unwrap_or(fitted));
+    }
+
+    /// Detaches the view like [`EditorLink::teardown`] but keeps its window in `retired`.
+    fn retire(g: &mut EditorInner) {
+        let window = g.window.take();
+        EditorLink::teardown(g);
+        if let Some(w) = window {
+            g.pos = w.position().or(g.pos);
+            g.retired = Some(w);
+        }
     }
 
     fn teardown(g: &mut EditorInner) {

@@ -36,7 +36,7 @@ use clap_sys::plugin::clap_plugin;
 use clap_sys::process::{CLAP_PROCESS_ERROR, clap_process};
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::{CLAP_VERSION, clap_version_is_compatible};
-use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorScale, Transport, UpscaleFilter};
+use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorScale, EditorScaleMode, Transport, UpscaleFilter};
 use soundcraft_editor_scale::{Choice, ScaledWindow, plan};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -291,6 +291,7 @@ impl Bundle {
                 scale: EditorScale::default(),
                 header: EditorHeaderState::default(),
                 pos: None,
+                retired: None,
             }),
             host: Arc::clone(&inst.state),
         });
@@ -770,6 +771,8 @@ struct GuiInner {
     header: EditorHeaderState,
     /// Where the last window was, so a reopened editor stays put.
     pos: Option<(i32, i32)>,
+    /// The window being replaced by a reopen: kept (empty) until the new one is up and focused.
+    retired: Option<EditorWindow>,
 }
 
 /// The window an embedded editor is shown in: a host window the plugin draws in at its scale, or a
@@ -872,6 +875,7 @@ impl Default for GuiLink {
                 scale: EditorScale::default(),
                 header: EditorHeaderState::default(),
                 pos: None,
+                retired: None,
             }),
             host: Arc::new(HostState::default()),
         }
@@ -1122,8 +1126,50 @@ impl GuiLink {
         if let Some(win) = &g.window {
             win.raise();
         }
+        if let Some(old) = g.retired.take() {
+            old.close();
+        }
         g.visible = true;
         Ok(())
+    }
+
+    /// Applies a new scale to an open upscaled editor without touching the plugin (only the
+    /// picture is resized). False when the editor isn't upscaled or the scale isn't an upscale.
+    pub fn rescale_in_place(&self, scale: EditorScale) -> bool {
+        if !on_main_thread() {
+            return false;
+        }
+        let mut g = self.lock();
+        let EditorScaleMode::Upscale(filter) = scale.mode else { return false };
+        let factor = scale.clamped_factor();
+        let Some(EditorWindow::Scaled(s)) = g.window.as_mut() else { return false };
+        s.set_scale(factor, filter);
+        g.scale = EditorScale { factor, mode: scale.mode };
+        true
+    }
+
+    /// Closes the editor for a reopen: the plugin's GUI goes, its window is kept until the new
+    /// one is up and focused (closing it first would bring the app's main window forward).
+    pub fn close_for_reopen(&self) {
+        if !on_main_thread() {
+            return;
+        }
+        let mut g = self.lock();
+        let window = g.window.take();
+        GuiLink::destroy(&mut g);
+        if let Some(w) = window {
+            g.pos = w.position().or(g.pos);
+            g.retired = Some(w);
+        }
+    }
+
+    /// Closes a window left over from [`GuiLink::close_for_reopen`] (when the reopen failed).
+    pub fn drop_retired(&self) {
+        if on_main_thread()
+            && let Some(old) = self.lock().retired.take()
+        {
+            old.close();
+        }
     }
 
     fn destroy(g: &mut GuiInner) {

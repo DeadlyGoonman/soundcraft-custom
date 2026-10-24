@@ -31,14 +31,23 @@ pub enum Choice {
 /// `native` says whether the plugin can draw itself at another size. `Auto`/`Native` (the
 /// default) scale natively only: a plugin that can't scale itself opens at its own size. The
 /// upscaler is used only when the user opted into an `Upscale` mode, then also for fixed-size
-/// plugins. The mode never changes by itself. Always `Ok`.
+/// plugins, and at every size (100% too). The mode never changes by itself. Always `Ok`.
 pub fn plan(mode: EditorScaleMode, factor: f32, native: bool) -> Result<Choice, &'static str> {
     Ok(match mode {
-        _ if factor == 1.0 => Choice::Plain,
+        // Also at 100%: the plugin then lives in the upscaler's source window from the start, so
+        // a later size (drag, preset) only resizes the picture and never touches the plugin.
         EditorScaleMode::Upscale(filter) => Choice::Upscale(filter),
+        _ if factor == 1.0 => Choice::Plain,
         EditorScaleMode::Auto | EditorScaleMode::Native if native => Choice::Native,
         EditorScaleMode::Auto | EditorScaleMode::Native => Choice::Plain,
     })
+}
+
+/// Whether a scale change can be applied to an open editor without closing and reopening it: an
+/// upscaled window stays upscaled (only the picture is resized, the plugin is not touched), and a
+/// native window stays native (the plugin is resized live).
+pub fn in_place(open: Choice, new: Choice) -> bool {
+    matches!((open, new), (Choice::Upscale(_), Choice::Upscale(_)) | (Choice::Native | Choice::Plain, Choice::Native | Choice::Plain))
 }
 
 #[cfg(test)]
@@ -55,9 +64,19 @@ mod plan_tests {
     }
 
     #[test]
+    fn upscaled_and_native_windows_rescale_in_place() {
+        let up = Choice::Upscale(UpscaleFilter::Fsr1);
+        assert!(in_place(up, Choice::Upscale(UpscaleFilter::Bilinear)), "drag or preset in an upscale mode");
+        assert!(in_place(Choice::Native, Choice::Plain));
+        assert!(in_place(Choice::Plain, Choice::Native));
+        assert!(!in_place(up, Choice::Native), "a mode change moves the plugin to another window");
+        assert!(!in_place(Choice::Plain, up));
+    }
+
+    #[test]
     fn upscale_modes_are_opt_in_and_work_for_fixed_size_plugins() {
         let fsr = EditorScaleMode::Upscale(UpscaleFilter::Fsr1);
-        assert_eq!(plan(fsr, 1.0, false), Ok(Choice::Plain));
+        assert_eq!(plan(fsr, 1.0, false), Ok(Choice::Upscale(UpscaleFilter::Fsr1)), "upscaled window from 100% on");
         assert_eq!(plan(fsr, 2.0, false), Ok(Choice::Upscale(UpscaleFilter::Fsr1)));
         assert_eq!(plan(EditorScaleMode::Upscale(UpscaleFilter::Bilinear), 1.5, true), Ok(Choice::Upscale(UpscaleFilter::Bilinear)));
     }

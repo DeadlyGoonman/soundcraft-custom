@@ -350,13 +350,20 @@ impl PluginEditor for ClapEditor {
         plan(new.mode, new.factor, self.link.native_scaling()).map_err(str::to_string)?;
         let prev = self.link.editor_scale();
         let was_open = self.link.is_open();
+        if was_open && prev != new && self.link.rescale_in_place(new) {
+            // Upscaled stays upscaled: only the picture was resized; the plugin is untouched.
+            return Ok(());
+        }
         self.link.set_editor_scale(new);
-        // Applied on open: an open editor is closed and reopened at the new scale.
+        // Applied on open: an open editor is closed and reopened at the new scale, in place (the
+        // old window goes only once the new one has the focus).
         if !was_open || prev == new {
             return Ok(());
         }
-        self.link.close();
-        self.link.open(self.info.name).inspect_err(|_| self.link.set_editor_scale(prev))
+        self.link.close_for_reopen();
+        let opened = self.link.open(self.info.name).inspect_err(|_| self.link.set_editor_scale(prev));
+        self.link.drop_retired();
+        opened
     }
 
     fn set_header(&mut self, state: soundcraft_dsp::EditorHeaderState) {

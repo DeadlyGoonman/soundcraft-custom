@@ -14,15 +14,20 @@ struct Shared {
     state: EditorHeaderState,
     scales: Vec<EditorScale>,
     queued: Vec<EditorHeaderAction>,
+    opens: usize,
+    closes: usize,
 }
 
 struct Fake(Arc<Mutex<Shared>>);
 
 impl PluginEditor for Fake {
     fn open(&mut self) -> Result<(), String> {
+        self.0.lock().unwrap().opens += 1;
         Ok(())
     }
-    fn close(&mut self) {}
+    fn close(&mut self) {
+        self.0.lock().unwrap().closes += 1;
+    }
     fn is_open(&self) -> bool {
         true
     }
@@ -91,6 +96,20 @@ fn a_scale_chosen_in_the_header_is_applied_and_remembered() {
     assert_eq!(h.state().ui.editor_scales.get(&plugin), Some(&scale));
     h.run_steps(2);
     assert_eq!(shared.lock().unwrap().state.scale, scale, "the editor is shown the remembered scale");
+}
+
+#[test]
+fn a_dragged_upscaled_size_only_rescales_the_editor() {
+    let (mut h, id, shared) = setup();
+    let fsr = EditorScale { factor: 1.37, mode: EditorScaleMode::Upscale(soundcraft_dsp::UpscaleFilter::Fsr1) };
+    shared.lock().unwrap().queued = vec![EditorHeaderAction::SetScale(fsr)];
+    h.run_steps(3);
+    let s = shared.lock().unwrap();
+    assert_eq!(s.scales, vec![fsr], "handed to the editor once, mode kept");
+    assert_eq!((s.opens, s.closes), (0, 0), "the app never closes or reopens the editor for it");
+    drop(s);
+    let plugin = insert(&h, id).plugin;
+    assert_eq!(h.state().ui.editor_scales.get(&plugin), Some(&fsr), "remembered for the plugin");
 }
 
 #[test]

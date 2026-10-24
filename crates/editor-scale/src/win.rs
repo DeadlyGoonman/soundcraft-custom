@@ -1820,6 +1820,28 @@ mod tests {
     }
 
     #[test]
+    fn rescaling_an_upscaled_window_keeps_the_focus_where_it_is() {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let mut sw = ScaledWindow::new("editor-scale focus test", 320, 240, 1.0, UpscaleFilter::Fsr1).expect("create");
+        let _child = red_child(HWND(sw.parent()), 320, 240);
+        sw.raise();
+        pump_messages();
+        // SAFETY: plain queries.
+        let before = unsafe { GetForegroundWindow() };
+        let source = sw.parent();
+        for (f, filter) in [(1.5, UpscaleFilter::Fsr1), (2.0, UpscaleFilter::Bilinear), (1.25, UpscaleFilter::Fsr1)] {
+            sw.set_scale(f, filter);
+            pump_messages();
+            // SAFETY: as above.
+            assert_eq!(unsafe { GetForegroundWindow() }, before, "a rescale activates no window");
+            assert_eq!(sw.parent(), source, "the plugin's window is never replaced");
+            assert!(sw.is_visible());
+        }
+        let (canvas, src) = sw.origins();
+        assert_eq!((canvas.x, canvas.y), (src.x, src.y));
+    }
+
+    #[test]
     fn scaled_size_and_clamps() {
         assert_eq!(scaled_size((64, 48), 2.0), (128, 96));
         assert_eq!(clamp_factor(f32::NAN), 1.0);
