@@ -838,7 +838,7 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
 pub const EDITOR_SCALE_PERCENTS: [u32; 10] = [50, 75, 100, 125, 150, 175, 200, 250, 300, 400];
 
 /// The scale for `percent`. There is no mode to choose: the plugin scales itself when it can,
-/// otherwise the FSR 1 upscaler stretches it (`Auto`).
+/// otherwise it opens at its own size (`Auto`; there is no host-side upscaling).
 pub fn scale_at_percent(percent: u32) -> soundcraft_dsp::EditorScale {
     soundcraft_dsp::EditorScale { factor: percent as f32 / 100.0, mode: soundcraft_dsp::EditorScaleMode::Auto }
 }
@@ -846,13 +846,19 @@ pub fn scale_at_percent(percent: u32) -> soundcraft_dsp::EditorScale {
 /// The Editor Scale submenu of a hosted plugin's slot: zoom percentages.
 fn editor_scale_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, plugin: &str) {
     let current = app.ui.editor_scales.get(plugin).copied().unwrap_or_default();
-    ui.menu_button("Editor Scale", |ui| {
-        for pct in EDITOR_SCALE_PERCENTS {
-            let selected = (current.clamped_factor() * 100.0).round() as u32 == pct;
-            if ui.radio(selected, format!("{pct} %")).clicked() {
-                set_slot_scale(app, ui, id, slot, scale_at_percent(pct));
+    // Scaling is native only: greyed out for a plugin that can't draw itself at another size.
+    let native = app.player.as_ref().is_some_and(|p| p.editor_native_scaling(id, slot));
+    ui.add_enabled_ui(native, |ui| {
+        ui.menu_button("Editor Scale", |ui| {
+            for pct in EDITOR_SCALE_PERCENTS {
+                let selected = (current.clamped_factor() * 100.0).round() as u32 == pct;
+                if ui.radio(selected, format!("{pct} %")).clicked() {
+                    set_slot_scale(app, ui, id, slot, scale_at_percent(pct));
+                }
             }
-        }
+        })
+        .response
+        .on_disabled_hover_text("This plugin doesn't support scaling");
     });
 }
 

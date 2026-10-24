@@ -1030,8 +1030,9 @@ impl GuiLink {
         g.created = true;
         let factor = g.scale.clamped_factor();
         if let Err(e) = apply_scale(&g, vt, factor) {
-            GuiLink::destroy(&mut g);
-            return Err(e);
+            // Scaling is native only: a plugin that refuses the scale opens at its own size.
+            log::info!("clap: {e}; the editor opens at its own size");
+            let _ = apply_scale(&g, vt, 1.0);
         }
         if let (Some(f), Ok(t)) = (vt.suggest_title, CString::new(title)) {
             // SAFETY: live plugin with a created floating GUI; `t` outlives the call.
@@ -1064,10 +1065,12 @@ impl GuiLink {
         g.created = true;
         let factor = g.scale.clamped_factor();
         // An upscaled editor draws at its own size: no scale goes to the plugin.
-        let applied = if upscale.is_some() { 1.0 } else { factor };
+        let mut applied = if upscale.is_some() { 1.0 } else { factor };
         if let Err(e) = apply_scale(g, vt, applied) {
-            GuiLink::destroy(g);
-            return Err(e);
+            // Scaling is native only: a plugin that refuses the scale opens at its own size.
+            log::info!("clap: {e}; the editor opens at its own size");
+            applied = 1.0;
+            let _ = apply_scale(g, vt, 1.0);
         }
         // The size read below is the scaled one, so the host window opens at the right size.
         let (mut w, mut h) = (640u32, 480u32);

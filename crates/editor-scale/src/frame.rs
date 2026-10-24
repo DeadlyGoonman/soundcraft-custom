@@ -24,6 +24,10 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Controls::{
+    ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ACTIVATE, TTM_ADDTOOLW, TTM_NEWTOOLRECTW,
+    TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -36,7 +40,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT, WM_SIZE, WM_SIZING, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
-use windows::core::{HSTRING, PCWSTR, w};
+use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, SWP_FRAMECHANGED, WS_EX_TOPMOST, WS_POPUP};
+use windows::core::{HSTRING, PCWSTR, PWSTR, w};
 
 use crate::header::{self, Button, Edge};
 
@@ -46,7 +51,11 @@ pub(crate) const WM_FRAME_MOVED: u32 = WM_APP + 0x51;
 pub(crate) const WM_FRAME_HIDING: u32 = WM_APP + 0x52;
 
 /// Close button only: no minimize or maximize box.
-const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_THICKFRAME.0 | WS_CLIPCHILDREN.0);
+/// Close button only: no minimize or maximize box. A plugin that can scale itself also gets a
+/// sizing border ([`WS_THICKFRAME`], set from the header state); a fixed-size one keeps a fixed frame.
+const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_CLIPCHILDREN.0);
+/// The scale button's tooltip while it is greyed out.
+const NO_SCALING: &str = "This plugin doesn't support scaling";
 const EX_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(0);
 /// Factors a drag may reach.
 const MIN_FACTOR: f64 = 0.5;
@@ -78,6 +87,10 @@ struct Frame {
     dragged: Cell<bool>,
     /// A host resize is in progress: no drag limits apply to it.
     programmatic: Cell<bool>,
+    /// The header's tooltip window (null when it could not be created).
+    tooltip: Cell<HWND>,
+    /// The tooltip's text, kept alive for the tooltip window.
+    tip_text: RefCell<Vec<u16>>,
 }
 
 /// A plugin editor's window: frame, header and body. Main thread only; dropping it destroys the
@@ -167,12 +180,94 @@ fn dpi_of(hwnd: HWND) -> u32 {
     if d == 0 { 96 } else { d }
 }
 
-/// Non-client width and height of the frame at `dpi`.
-fn nonclient(dpi: u32) -> (i32, i32) {
+/// Non-client width and height of the frame `top` (with its current style) at `dpi`.
+fn nonclient(top: HWND, dpi: u32) -> (i32, i32) {
     let mut r = RECT::default();
-    // SAFETY: `r` is a valid, writable rect.
-    let _ = unsafe { AdjustWindowRectExForDpi(&mut r, STYLE, false, EX_STYLE, dpi) };
+    // SAFETY: a plain style query; `r` is a valid, writable rect.
+    unsafe {
+        let style = WINDOW_STYLE(GetWindowLongPtrW(top, GWL_STYLE) as u32);
+        let _ = AdjustWindowRectExForDpi(&mut r, style, false, EX_STYLE, dpi);
+    }
     (r.right - r.left, r.bottom - r.top)
+}
+
+/// Adds or removes the sizing border, keeping the body's size.
+fn set_resizable(top: HWND, f: &Frame, on: bool) {
+    // SAFETY: style query and change on our own live window.
+    let style = unsafe { GetWindowLongPtrW(top, GWL_STYLE) } as u32;
+    if (style & WS_THICKFRAME.0 != 0) == on {
+        return;
+    }
+    let body = client_size(top.0);
+    let style = if on { style | WS_THICKFRAME.0 } else { style & !WS_THICKFRAME.0 };
+    // SAFETY: as above; SWP_FRAMECHANGED makes the new border take effect.
+    unsafe {
+        SetWindowLongPtrW(top, GWL_STYLE, style as isize);
+        let _ = SetWindowPos(top, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+    if let Some((w, h)) = body {
+        resize(top.0, w, h);
+    }
+    let tip = f.tooltip.get();
+    if !tip.0.is_null() {
+        // SAFETY: our live tooltip window.
+        unsafe { SendMessageW(tip, TTM_ACTIVATE, Some(WPARAM(usize::from(!on))), None) };
+    }
+}
+
+/// A tooltip on the header's scale button ("This plugin doesn't support scaling"), active while
+/// the button is greyed out. Null when common controls are unavailable.
+fn create_tooltip(top: HWND, header: HWND, f: &Frame) -> HWND {
+    // SAFETY: common-controls init and a tooltip window owned by our frame; the tool's text
+    // buffer lives in `f` as long as the windows.
+    unsafe {
+        let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_BAR_CLASSES };
+        let _ = InitCommonControlsEx(&icc);
+        let Ok(tip) = CreateWindowExW(
+            WS_EX_TOPMOST,
+            TOOLTIPS_CLASSW,
+            None,
+            WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            Some(top),
+            None,
+            module_instance(),
+            None,
+        ) else {
+            return HWND::default();
+        };
+        let info = TTTOOLINFOW {
+            cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_SUBCLASS,
+            hwnd: header,
+            uId: 1,
+            lpszText: PWSTR(f.tip_text.borrow_mut().as_mut_ptr()),
+            ..Default::default()
+        };
+        SendMessageW(tip, TTM_ADDTOOLW, None, Some(LPARAM(&info as *const TTTOOLINFOW as isize)));
+        SendMessageW(tip, TTM_ACTIVATE, Some(WPARAM(1)), None);
+        tip
+    }
+}
+
+/// Puts the tooltip's area on the scale button after a header resize.
+fn place_tooltip(header: HWND, f: &Frame, scale: header::Rect) {
+    let tip = f.tooltip.get();
+    if tip.0.is_null() {
+        return;
+    }
+    let info = TTTOOLINFOW {
+        cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+        hwnd: header,
+        uId: 1,
+        rect: RECT { left: scale.left, top: scale.top, right: scale.right, bottom: scale.bottom },
+        ..Default::default()
+    };
+    // SAFETY: our live tooltip; `info` lives for the call.
+    unsafe { SendMessageW(tip, TTM_NEWTOOLRECTW, None, Some(LPARAM(&info as *const TTTOOLINFOW as isize))) };
 }
 
 fn client_rect(hwnd: HWND) -> RECT {
@@ -269,6 +364,8 @@ impl HostWindow {
             native: Cell::new((0.0, 0.0)),
             dragged: Cell::new(false),
             programmatic: Cell::new(false),
+            tooltip: Cell::new(HWND::default()),
+            tip_text: RefCell::new(NO_SCALING.encode_utf16().chain(Some(0)).collect()),
         }));
         // SAFETY: `top` is our live window; the pointer stays valid until `Drop` clears it.
         unsafe { SetWindowLongPtrW(top, GWLP_USERDATA, frame as isize) };
@@ -298,6 +395,7 @@ impl HostWindow {
         if let Some(f) = this.fr() {
             f.header.set(header);
             f.body.set(body_hwnd);
+            f.tooltip.set(create_tooltip(top, header, f));
         }
         // No Minimize/Maximize/Restore in the system menu either (the frame has no such boxes).
         // SAFETY: our live frame's own system menu; missing items are ignored.
@@ -352,15 +450,24 @@ impl HostWindow {
         drop(self);
     }
 
-    /// What the header shows (repaints when it changed).
+    /// What the header shows (repaints when it changed). The frame gets a sizing border only
+    /// while `native_scaling` says the plugin can scale itself.
     pub fn set_header(&self, state: EditorHeaderState) {
         let Some(f) = self.fr() else { return };
-        if f.state.replace(state) != state {
+        let old = f.state.replace(state);
+        if old != state {
             // SAFETY: our live header window.
             unsafe {
                 let _ = InvalidateRect(Some(f.header.get()), None, false);
             }
         }
+        set_resizable(self.top, f, state.native_scaling);
+    }
+
+    /// Whether the frame has a sizing border.
+    pub fn is_resizable(&self) -> bool {
+        // SAFETY: a plain query on our window.
+        mine(self.top) && unsafe { GetWindowLongPtrW(self.top, GWL_STYLE) } as u32 & WS_THICKFRAME.0 != 0
     }
 
     /// The header clicks and frame drags since the last call, oldest first.
@@ -436,7 +543,7 @@ pub fn resize(window: *mut c_void, w: f64, h: f64) {
     let top = HWND(window);
     let Some(f) = frame_of(top) else { return };
     let dpi = dpi_of(top);
-    let (dx, dy) = nonclient(dpi);
+    let (dx, dy) = nonclient(top, dpi);
     let ow = (w.round() as i32).clamp(1, 16_384) + dx;
     let oh = (h.round() as i32).clamp(1, 16_384) + header::height(dpi) + dy;
     f.programmatic.set(true);
@@ -464,6 +571,7 @@ fn layout_children(top: HWND, f: &Frame) {
     // SAFETY: our live child windows.
     unsafe {
         let _ = MoveWindow(f.header.get(), 0, 0, cw, hh, true);
+        place_tooltip(f.header.get(), f, header::layout(cw, dpi_of(top)).scale);
         let _ = MoveWindow(f.body.get(), 0, hh, cw, (ch - hh).max(1), true);
     }
 }
@@ -492,7 +600,7 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
 fn frame_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
     let f = frame_of(hwnd)?;
     let dpi = dpi_of(hwnd);
-    let (dx, dy) = nonclient(dpi);
+    let (dx, dy) = nonclient(hwnd, dpi);
     let hh = header::height(dpi);
     let native = f.native.get();
     let has_native = native.0 >= 1.0 && native.1 >= 1.0;
@@ -627,7 +735,7 @@ fn draw_header(hwnd: HWND, hdc: HDC, s: &EditorHeaderState) {
     let idle = rgb(0x3C, 0x3C, 0x3C);
     let delta_on = s.delta && header::delta_enabled(s);
     let buttons = [
-        (l.scale, header::scale_label(s.scale), idle, text),
+        (l.scale, header::scale_label(s.scale), idle, if s.native_scaling { text } else { dim }),
         (l.bypass, "Bypass".to_string(), if s.bypass { rgb(0xE6, 0xA0, 0x1E) } else { idle }, if s.bypass { rgb(0x10, 0x10, 0x10) } else { text }),
         (
             l.delta,
@@ -686,7 +794,7 @@ fn click_header(hwnd: HWND, x: i32, y: i32) {
     let l = header::layout(r.right - r.left, dpi_of(hwnd));
     let mut s = f.state.get();
     let action = match header::hit(&l, x, y) {
-        Some(Button::Scale) => {
+        Some(Button::Scale) if s.native_scaling => {
             let Some(c) = scale_menu(hwnd, &s, POINT { x: l.scale.left, y: l.scale.bottom }) else { return };
             // The menu ran a modal loop: start from the state as it is now.
             s = f.state.get();
@@ -766,12 +874,19 @@ mod tests {
 
     #[test]
     fn the_frame_has_only_a_close_button() {
-        use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX};
-        let win = HostWindow::new("frame test", 100.0, 100.0).expect("frame");
+        use windows::Win32::UI::WindowsAndMessaging::{WS_MAXIMIZEBOX, WS_MINIMIZEBOX};
+        let win = HostWindow::new("frame test", 300.0, 200.0).expect("frame");
         // SAFETY: a plain query on our window.
         let style = unsafe { GetWindowLongPtrW(HWND(win.raw()), GWL_STYLE) } as u32;
         assert_eq!(style & (WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0), 0);
-        assert_ne!(style & WS_THICKFRAME.0, 0, "drag-resizable");
+        assert_eq!(style & WS_THICKFRAME.0, 0, "fixed until the plugin is known to scale");
+        assert!(!win.is_resizable());
+        win.set_header(EditorHeaderState { native_scaling: true, ..Default::default() });
+        assert!(win.is_resizable(), "a plugin that scales itself can be dragged");
+        assert_eq!(win.body_size(), Some((300.0, 200.0)), "the body keeps its size");
+        win.set_header(EditorHeaderState::default());
+        assert!(!win.is_resizable());
+        assert_eq!(win.body_size(), Some((300.0, 200.0)));
     }
 
     #[test]
@@ -787,5 +902,8 @@ mod tests {
         win.set_header(EditorHeaderState { is_instrument: true, ..Default::default() });
         click_header(header, (l.delta.left + l.delta.right) / 2, l.height / 2);
         assert!(win.take_actions().is_empty(), "no delta on an instrument");
+        // Without native scaling the scale button is greyed out: a click opens no menu.
+        click_header(header, (l.scale.left + l.scale.right) / 2, l.height / 2);
+        assert!(win.take_actions().is_empty());
     }
 }

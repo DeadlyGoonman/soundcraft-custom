@@ -28,18 +28,11 @@ pub enum Choice {
 }
 
 /// Decides how an editor is shown. `factor` is the clamped scale (1.0 = the plugin's own size) and
-/// `native` says whether the plugin can draw itself at another size. `Auto` uses the plugin's own
-/// scaling when it has it and FSR 1 otherwise; `Native` on a fixed-size plugin is upscaled with
-/// FSR 1 too, so a scale never fails (the result is `Ok` for every input).
-pub fn plan(mode: EditorScaleMode, factor: f32, native: bool) -> Result<Choice, &'static str> {
-    let unit = factor == 1.0;
-    match mode {
-        EditorScaleMode::Auto | EditorScaleMode::Native if unit => Ok(Choice::Plain),
-        EditorScaleMode::Auto | EditorScaleMode::Native if native => Ok(Choice::Native),
-        EditorScaleMode::Auto | EditorScaleMode::Native => Ok(Choice::Upscale(UpscaleFilter::Fsr1)),
-        EditorScaleMode::Upscale(_) if unit => Ok(Choice::Plain),
-        EditorScaleMode::Upscale(filter) => Ok(Choice::Upscale(filter)),
-    }
+/// `native` says whether the plugin can draw itself at another size. Scaling is native only: a
+/// plugin that can't scale itself opens at its own size, whatever the mode (the host-side
+/// upscaler is no longer used, so [`Choice::Upscale`] is never chosen). Always `Ok`.
+pub fn plan(_mode: EditorScaleMode, factor: f32, native: bool) -> Result<Choice, &'static str> {
+    Ok(if factor != 1.0 && native { Choice::Native } else { Choice::Plain })
 }
 
 #[cfg(test)]
@@ -47,31 +40,13 @@ mod plan_tests {
     use super::*;
 
     #[test]
-    fn factor_one_is_always_the_plain_window() {
-        assert_eq!(plan(EditorScaleMode::Auto, 1.0, false), Ok(Choice::Plain));
-        assert_eq!(plan(EditorScaleMode::Auto, 1.0, true), Ok(Choice::Plain));
-        assert_eq!(plan(EditorScaleMode::Native, 1.0, true), Ok(Choice::Plain));
-        assert_eq!(plan(EditorScaleMode::Native, 1.0, false), Ok(Choice::Plain));
-        assert_eq!(plan(EditorScaleMode::Upscale(UpscaleFilter::Fsr1), 1.0, false), Ok(Choice::Plain));
-    }
-
-    #[test]
-    fn auto_prefers_native_then_fsr1() {
-        assert_eq!(plan(EditorScaleMode::Auto, 1.5, true), Ok(Choice::Native));
-        assert_eq!(plan(EditorScaleMode::Auto, 2.0, false), Ok(Choice::Upscale(UpscaleFilter::Fsr1)));
-        assert_eq!(plan(EditorScaleMode::Auto, 0.5, false), Ok(Choice::Upscale(UpscaleFilter::Fsr1)));
-    }
-
-    #[test]
-    fn native_on_a_fixed_size_plugin_is_upscaled() {
-        assert_eq!(plan(EditorScaleMode::Native, 2.0, true), Ok(Choice::Native));
-        assert_eq!(plan(EditorScaleMode::Native, 2.0, false), Ok(Choice::Upscale(UpscaleFilter::Fsr1)));
-    }
-
-    #[test]
-    fn upscale_uses_the_chosen_filter() {
-        assert_eq!(plan(EditorScaleMode::Upscale(UpscaleFilter::Bilinear), 1.25, true), Ok(Choice::Upscale(UpscaleFilter::Bilinear)));
-        assert_eq!(plan(EditorScaleMode::Upscale(UpscaleFilter::Fsr1), 3.0, false), Ok(Choice::Upscale(UpscaleFilter::Fsr1)));
+    fn scaling_is_native_or_nothing() {
+        for mode in [EditorScaleMode::Auto, EditorScaleMode::Native, EditorScaleMode::Upscale(UpscaleFilter::Fsr1)] {
+            assert_eq!(plan(mode, 1.0, true), Ok(Choice::Plain));
+            assert_eq!(plan(mode, 1.0, false), Ok(Choice::Plain));
+            assert_eq!(plan(mode, 1.5, true), Ok(Choice::Native));
+            assert_eq!(plan(mode, 2.0, false), Ok(Choice::Plain), "never upscaled");
+        }
     }
 }
 

@@ -676,7 +676,7 @@ impl SoundApp {
         // The default is sent too: another instance of the plugin may have been scaled since this
         // one last opened. Only a remembered scale's refusal is worth a status line.
         // Only the size is the user's: older prefs may name a mode, but every editor now scales
-        // natively when it can and is upscaled with FSR 1 otherwise.
+        // natively when it can and opens at its own size otherwise.
         let scale = remembered.map(|s| soundcraft_dsp::EditorScale { mode: soundcraft_dsp::EditorScaleMode::Auto, ..s }).unwrap_or_default();
         if let Err(e) = p.set_editor_scale(track, slot, scale)
             && remembered.is_some()

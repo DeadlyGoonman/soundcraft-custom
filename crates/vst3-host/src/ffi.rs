@@ -2134,7 +2134,8 @@ impl EditorLink {
         }
         let native = EditorLink::supports_native(&view);
         g.native = Some(native);
-        let factor = g.scale.clamped_factor();
+        // Scaling is native only: a plugin that can't scale itself opens at its own size.
+        let factor = if native { g.scale.clamped_factor() } else { 1.0 };
         let choice = plan(g.scale.mode, factor, native).map_err(str::to_string)?;
         let upscale = match choice {
             Choice::Upscale(filter) => Some(filter),
@@ -2292,7 +2293,9 @@ impl EditorLink {
             drop(g);
             return self.open(&title);
         }
-        EditorLink::apply_live(&mut g);
+        if native {
+            EditorLink::apply_live(&mut g);
+        }
         Ok(())
     }
 
@@ -2339,7 +2342,9 @@ impl EditorLink {
         }
         let fitted = EditorLink::fit_view(view, cur);
         window::resize(win.raw(), fitted.0, fitted.1);
-        frame.set_size(fitted);
+        // Remember the size the window really got (Windows may keep it above a minimum), so the
+        // next idle sees no change instead of resizing the view again every frame.
+        frame.set_size(window::client_size(win.raw()).unwrap_or(fitted));
     }
 
     fn teardown(g: &mut EditorInner) {
