@@ -158,6 +158,9 @@ impl Dialogs {
             "file.import_audio" => Dialog::PathPrompt { cmd: id.into(), title: "Import Audio".into(), path: home, key: "path".into() },
             "file.import_midi" => Dialog::PathPrompt { cmd: id.into(), title: "Import MIDI".into(), path: home, key: "path".into() },
             "session.open" => Dialog::PathPrompt { cmd: id.into(), title: "Open Session".into(), path: home, key: "path".into() },
+            "session.new_from_template" => {
+                Dialog::PathPrompt { cmd: id.into(), title: "New Session from Template".into(), path: home, key: "path".into() }
+            }
             "session.save" if e.path.is_some() => return false,
             "session.save" | "session.save_as" | "session.save_copy" => Dialog::PathPrompt {
                 cmd: if id == "session.save_copy" { id } else { "session.save_as" }.into(),
@@ -209,7 +212,7 @@ impl Dialogs {
 /// When `id` would close a session with unsaved changes, ask first; true when the question is
 /// open instead. A take in progress is stopped first, so it counts as a change.
 pub fn ask_to_save(app: &mut SoundApp, id: &str, params: &Value) -> bool {
-    if !matches!(id, "session.new" | "session.open" | "session.close" | "session.revert" | "app.quit" | OPEN_PENDING)
+    if !matches!(id, "session.new" | "session.new_from_template" | "session.open" | "session.close" | "session.revert" | "app.quit" | OPEN_PENDING)
         || soundcraft_engine::find_command(id).is_some_and(|c| (c.enabled)(&app.engine).is_err())
     {
         return false;
@@ -610,7 +613,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                 }
                 Dialog::PathPrompt { cmd, path, key, .. } => {
                     let folder = key == "dir";
-                    let opening = !folder && (cmd.contains("import") || cmd.contains("open"));
+                    let opening = !folder && (cmd.contains("import") || cmd.contains("open") || cmd == "session.new_from_template");
                     let (mut dir, mut name, ext) = split_save_path(path);
                     let (old_dir, old_name) = (dir.clone(), name.clone());
                     let mut picked = None;

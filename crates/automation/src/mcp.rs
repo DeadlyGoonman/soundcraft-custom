@@ -56,6 +56,12 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool("open_session", "Open a .scraft session file.", json!({"path": {"type": "string"}}), &["path"]),
         tool(
+            "new_session_from_template",
+            "Start a new, unsaved session copied from a .scraft session file (the file is left untouched; save needs a path).",
+            json!({"path": {"type": "string"}}),
+            &["path"],
+        ),
+        tool(
             "save_session",
             "Save the session (path required the first time; replace: true to save over another existing file).",
             json!({"path": {"type": "string"}, "replace": {"type": "boolean"}}),
@@ -169,6 +175,7 @@ impl<B: Backend> Server<B> {
             "inspect_session" => self.backend.call("session.inspect", json!({"detail": a("detail")})),
             "new_session" => self.exec("session.new", args.clone()),
             "open_session" => self.exec("session.open", args.clone()),
+            "new_session_from_template" => self.exec("session.new_from_template", args.clone()),
             "save_session" => self.exec("session.save", args.clone()),
             "import_audio" => self.exec("file.import_audio", args.clone()),
             "bounce_mix" => self.exec("file.bounce_mix", args.clone()),

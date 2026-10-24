@@ -32,6 +32,7 @@ The two flags (VectorCraft and the other Craft apps take the same ones, so one c
 works across the suite) keep the agent to the folders you give it:
 
 - Every file a command reads must lie inside the **read root**: `open_session`, `session.open`,
+  `new_session_from_template`, `session.new_from_template`,
   `import_audio` and `file.import_audio`, `file.import_midi`, `file.import_video`,
   `file.import_clip_groups`, `file.import_session_data`, `track.load_preset` and
   `mix.sampler_load`. The media a session file names is read too, so an opened session whose
@@ -92,7 +93,7 @@ files it was given rather than guarding against other software on the computer.
 | `execute` | Run one command with JSON params. |
 | `batch` | Run up to 1000 commands in order (`keep_going` optional). Larger batches return `isError: true` before executing any command. Any failed call makes the tool result `isError: true`; with `keep_going` the remaining calls still run and every result is listed. |
 | `inspect_session` | Verify work: tracks, clips, mixer, plugins, sends, automation, markers, selection; each `sources[]` entry includes `loaded` (decoded audio in the pool). |
-| `new_session`, `open_session`, `save_session` | Session files (`.scraft`, audio in `Audio Files/`). `open_session` returns `missing`: the media files that could not be loaded (empty when all are found). `save_session` won't save over another existing file unless `replace` is true. |
+| `new_session`, `open_session`, `new_session_from_template`, `save_session` | Session files (`.scraft`, audio in `Audio Files/`). `open_session` returns `missing`: the media files that could not be loaded (empty when all are found). `new_session_from_template` opens a file as a new, unsaved copy (no path; the file is never written). `save_session` won't save over another existing file unless `replace` is true. |
 | `import_audio` | WAV, AIFF, FLAC, MP3, OGG, AAC/M4A, ALAC, CAF onto a new or existing track. |
 | `bounce_mix` | Render to WAV/AIFF/FLAC; returns peak dBFS and integrated LUFS. |
 | `parity` | Feature-parity report. |

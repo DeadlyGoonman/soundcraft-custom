@@ -293,7 +293,8 @@ impl Engine {
     /// Whether command `id` must wait for the take being recorded: nothing may replace the
     /// session or quit under it.
     pub fn blocked_while_recording(&self, id: &str) -> bool {
-        self.transport.recording && matches!(id, "session.new" | "session.open" | "session.close" | "session.revert" | "app.quit")
+        self.transport.recording
+            && matches!(id, "session.new" | "session.new_from_template" | "session.open" | "session.close" | "session.revert" | "app.quit")
     }
 
     /// Run a command by id. Never panics: escaped panics become `EngineError::Internal` and the

@@ -1265,6 +1265,29 @@ pub(crate) fn open_session_linked(e: &mut Engine, path: &str, links: &Path) -> R
     Ok(missing)
 }
 
+/// File › New › Open from Template: a new, unsaved session copied from the session file at `path`
+/// (tracks, clips, inserts and their state, tempo, routing, markers). The file is only read: the
+/// copy has no path, so Save asks where to put it, and its name is "<file name> copy". Media is
+/// referenced where the template keeps it (relative paths are made absolute against the
+/// template's folder), so the copy plays without copying anything; the first Save writes the audio
+/// it plays into the new session's own `Audio Files/`, as Save As does for a moved session.
+pub fn open_template(e: &mut Engine, path: &str) -> Result<Vec<String>> {
+    let missing = open_session(e, path)?;
+    let file = Path::new(path);
+    let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+    let name = file.file_stem().and_then(|x| x.to_str()).map_or_else(|| "Untitled".to_string(), |n| format!("{n} copy"));
+    let s = e.session_mut();
+    for src in &mut s.sources {
+        if Path::new(&src.path).is_relative() {
+            src.path = dir.join(&src.path).to_string_lossy().into_owned();
+        }
+    }
+    s.folder = None;
+    s.name = name;
+    e.path = None;
+    Ok(missing)
+}
+
 /// Decode one source's audio file at the session rate.
 fn decode_source(bytes: &[u8], ext: Option<&str>, rate: u32) -> std::result::Result<Arc<SourceAudio>, String> {
     let (_, buf) = soundcraft_audio_io::decode(bytes, ext).map_err(|err| err.to_string())?;

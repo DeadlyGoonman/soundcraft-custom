@@ -14,6 +14,11 @@ pub fn specs() -> Vec<CommandSpec> {
             let missing = crate::io::open_session(e, &path)?;
             Ok(json!({"name": e.session().name, "tracks": e.session().tracks.len(), "missing": missing}))
         }),
+        cmd!(noundo "session.new_from_template", "Open from Template...", ["File", "New"], None, "{path} — a new, unsaved copy of the .scraft session at `path`; the file is left untouched and Save asks for a location", always, |e, p| {
+            let path = str_param(p, "path").ok_or_else(|| bad("session.new_from_template", "`path` required"))?.to_string();
+            let missing = crate::io::open_template(e, &path)?;
+            Ok(json!({"name": e.session().name, "tracks": e.session().tracks.len(), "missing": missing}))
+        }),
         cmd!(noundo "session.close", "Close Session", ["File"], Some("Cmd+Shift+W"), "{}", always, |e, _| { e.replace_session(Session::default()); e.path = None; Ok(json!({})) }),
         cmd!(noundo "session.save", "Save Session", ["File"], Some("Cmd+S"), "{path?, replace?: false}", always, |e, p| {
             let path = str_param(p, "path").map(str::to_string).or_else(|| e.path.clone()).ok_or_else(|| bad("session.save", "no path yet: pass `path` (Save As)"))?;
@@ -794,6 +799,42 @@ mod tests {
         from_copy.execute("session.open", &json!({"path": copy.to_string_lossy()})).unwrap();
         assert_eq!(from_copy.session().tracks.len(), 2);
         assert!(from_copy.session().track_by_name("Extra").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_from_a_template_is_an_unsaved_copy_that_leaves_the_template_alone() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-from-template-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let template = dir.join("Tpl").join("Tpl.scraft");
+        let mut original = crate::demo::demo_engine();
+        original.execute("markers.add", &json!({"at": 48_000, "name": "Verse"})).unwrap();
+        original.execute("session.save_as", &json!({"path": template.to_string_lossy()})).unwrap();
+        let bytes = std::fs::read(&template).unwrap();
+
+        let mut e = Engine::default();
+        let res = e.execute("session.new_from_template", &json!({"path": template.to_string_lossy()})).unwrap();
+        assert!(res["missing"].as_array().is_some_and(Vec::is_empty), "{res}");
+        let (a, b) = (original.session(), e.session());
+        assert_eq!(b.tracks, a.tracks, "same tracks, clips, inserts and routing");
+        assert_eq!((&b.tempo, &b.markers, b.sample_rate), (&a.tempo, &a.markers, a.sample_rate));
+        assert_eq!(e.path, None, "Save asks where to put it");
+        assert_eq!(b.name, "Tpl copy");
+        assert!(b.sources.iter().all(|s| std::path::Path::new(&s.path).is_absolute()), "media still found from anywhere");
+        assert!(e.is_dirty());
+        assert!(!e.can_undo());
+
+        let copy = dir.join("Mine").join("Mine.scraft");
+        e.execute("track.new", &json!({})).unwrap();
+        e.execute("session.save", &json!({"path": copy.to_string_lossy()})).unwrap();
+        assert_eq!(std::fs::read(&template).unwrap(), bytes, "the template file is never written");
+        // The copy carries its own audio: it opens with the template gone.
+        std::fs::remove_dir_all(dir.join("Tpl")).unwrap();
+        let mut reopened = Engine::default();
+        let res = reopened.execute("session.open", &json!({"path": copy.to_string_lossy()})).unwrap();
+        assert!(res["missing"].as_array().is_some_and(Vec::is_empty), "{res}");
+        assert_eq!(reopened.session().tracks.len(), a.tracks.len() + 1);
+        assert!(Engine::default().execute("session.new_from_template", &json!({})).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
