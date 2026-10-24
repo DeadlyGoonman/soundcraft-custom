@@ -104,6 +104,8 @@ struct State {
     /// Black pixels in `frame`, and captures held back in a row by [`flash_guard`].
     black: usize,
     held: u32,
+    /// Captures in a row each tile was patched from the last frame (see [`patch_blank_tiles`]).
+    tile_held: Vec<u8>,
     /// Child that receives keyboard messages: the last one the mouse went down on.
     focus: HWND,
     /// Child that owns the button press in progress (mouse capture).
@@ -148,6 +150,7 @@ impl ScaledWindow {
             shot: Vec::new(),
             black: 0,
             held: 0,
+            tile_held: Vec::new(),
             focus: source,
             drag: None,
         });
@@ -235,6 +238,9 @@ impl ScaledWindow {
                 return;
             }
         } else {
+            if st.have_frame {
+                patch_blank_tiles(&st.frame, &mut st.shot, st.native, &mut st.tile_held);
+            }
             let black = black_pixels(&st.shot);
             if !flash_guard(st.have_frame.then_some(st.black), black, st.shot.len(), st.held) {
                 st.held += 1;
@@ -375,6 +381,8 @@ impl State {
         self.shot.resize((nw as usize) * (nh as usize), 0);
         self.have_frame = false;
         self.held = 0;
+        self.tile_held.clear();
+        self.tile_held.resize(tile_count(self.native), 0);
         self.gpu = None;
         if !self.gpu_disabled {
             match Gpu::new(self.canvas, self.native, (sw, sh), self.filter) {
@@ -939,6 +947,52 @@ fn view_uav(device: &ID3D11Device, tex: &ID3D11Texture2D) -> Result<ID3D11Unorde
 }
 
 /// Pure-black pixels (colour 0, any alpha) in a captured frame.
+/// Side of the square tiles a capture is checked in, in native pixels.
+const TILE: usize = 16;
+
+fn tile_count(native: (u32, u32)) -> usize {
+    (native.0 as usize).div_ceil(TILE) * (native.1 as usize).div_ceil(TILE)
+}
+
+/// Whether every pixel of one tile has the same colour (alpha ignored).
+fn tile_uniform(px: &[u32], w: usize, h: usize, tx: usize, ty: usize) -> bool {
+    let (x0, y0) = (tx * TILE, ty * TILE);
+    let (x1, y1) = ((x0 + TILE).min(w), (y0 + TILE).min(h));
+    let Some(&first) = px.get(y0 * w + x0) else { return true };
+    (y0..y1).all(|y| px.get(y * w + x0..y * w + x1).is_some_and(|row| row.iter().all(|&p| (p ^ first) & 0x00FF_FFFF == 0)))
+}
+
+/// Per-region dropout filter. Some plugins draw a part of their editor (UAD/Softube's header
+/// strip, say) through its own child window or surface, and a capture now and then catches that
+/// part blank, mid-repaint. A tile that turns a single flat colour while it had detail in the last
+/// shown frame keeps its last pixels, for up to [`HOLD_FRAMES`] captures in a row (a region that
+/// really went flat gets through after that). `held` has one counter per tile.
+fn patch_blank_tiles(prev: &[u32], shot: &mut [u32], native: (u32, u32), held: &mut [u8]) {
+    let (w, h) = (native.0 as usize, native.1 as usize);
+    if prev.len() != w * h || shot.len() != w * h {
+        return;
+    }
+    let tiles_x = w.div_ceil(TILE);
+    for ty in 0..h.div_ceil(TILE) {
+        for tx in 0..tiles_x {
+            let Some(count) = held.get_mut(ty * tiles_x + tx) else { continue };
+            let dropout = tile_uniform(shot, w, h, tx, ty) && !tile_uniform(prev, w, h, tx, ty);
+            if !dropout || u32::from(*count) >= HOLD_FRAMES {
+                *count = 0;
+                continue;
+            }
+            *count += 1;
+            let (x0, x1) = (tx * TILE, (tx * TILE + TILE).min(w));
+            for y in ty * TILE..(ty * TILE + TILE).min(h) {
+                let row = y * w;
+                if let (Some(dst), Some(src)) = (shot.get_mut(row + x0..row + x1), prev.get(row + x0..row + x1)) {
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
+    }
+}
+
 fn black_pixels(px: &[u32]) -> usize {
     px.iter().filter(|&&p| p & 0x00FF_FFFF == 0).count()
 }
@@ -1282,6 +1336,98 @@ mod tests {
         assert_eq!(sw.gpu_builds(), builds, "the swapchain is not rebuilt while the window is steady");
         let first_red = seen.iter().position(|&p| p == 0x00FF_0000).expect("red reaches the swapchain");
         assert!(seen[first_red..].iter().all(|&p| p == 0x00FF_0000), "never black once shown: {seen:x?}");
+    }
+
+    #[test]
+    fn a_region_that_drops_out_keeps_its_last_pixels() {
+        let native = (32u32, 16u32);
+        let n = 32 * 16;
+        // Detail everywhere: a gradient.
+        let prev: Vec<u32> = (0..n as u32).map(|i| 0xFF00_0000 | i).collect();
+        let mut held = vec![0u8; tile_count(native)];
+        assert_eq!(held.len(), 2);
+        // The left tile drops out to flat black; the right one changes for real.
+        let mut shot: Vec<u32> = (0..n as u32).map(|i| 0xFF00_0000 | (i + 7)).collect();
+        for y in 0..16 {
+            for x in 0..16 {
+                shot[y * 32 + x] = 0xFF00_0000;
+            }
+        }
+        let fresh = shot.clone();
+        patch_blank_tiles(&prev, &mut shot, native, &mut held);
+        assert_eq!(shot[5 * 32 + 3], prev[5 * 32 + 3], "the blank tile shows its last pixels");
+        assert_eq!(shot[5 * 32 + 20], fresh[5 * 32 + 20], "a real change elsewhere goes through");
+        assert_eq!(held, vec![1, 0]);
+        // A region that stays flat is accepted after HOLD_FRAMES captures.
+        for _ in 1..HOLD_FRAMES {
+            let mut again = fresh.clone();
+            patch_blank_tiles(&prev, &mut again, native, &mut held);
+            assert_eq!(again[3], prev[3]);
+        }
+        let mut last = fresh.clone();
+        patch_blank_tiles(&prev, &mut last, native, &mut held);
+        assert_eq!(last[3], 0xFF00_0000, "really flat now");
+        assert_eq!(held[0], 0);
+    }
+
+    #[test]
+    fn a_second_child_window_is_captured() {
+        // Plugins draw parts of their editor in their own child windows: those must be in the
+        // captured frame too, not just the first child.
+        let mut sw = ScaledWindow::new("editor-scale children test", 64, 48, 2.0, UpscaleFilter::Fsr1).expect("create");
+        let parent = HWND(sw.parent());
+        let _red = red_child(parent, 64, 48);
+        let blue = coloured_child(parent, 0x00FF_0000, (0, 0, 64, 12));
+        let _nested = coloured_child(blue, 0x0000_FF00, (40, 2, 8, 8));
+        sw.raise();
+        let mut got = (None, None, None);
+        for _ in 0..40 {
+            sw.pump();
+            got = (sw.last_frame_pixel(10, 30), sw.last_frame_pixel(10, 5), sw.last_frame_pixel(43, 5));
+            if got.0.map(|p| p & 0x00FF_FFFF) == Some(0x00FF_0000) && got.1.map(|p| p & 0x00FF_FFFF) == Some(0x0000_00FF) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(got.0.map(|p| p & 0x00FF_FFFF), Some(0x00FF_0000), "the main child (red)");
+        assert_eq!(got.1.map(|p| p & 0x00FF_FFFF), Some(0x0000_00FF), "the header-strip child (blue)");
+        assert_eq!(got.2.map(|p| p & 0x00FF_FFFF), Some(0x0000_FF00), "a grandchild (green)");
+    }
+
+    /// A child at `(x, y, w, h)` filled with `bgr` (a COLORREF) by its class brush.
+    fn coloured_child(parent: HWND, bgr: u32, (x, y, w, h): (i32, i32, i32, i32)) -> HWND {
+        let name: Vec<u16> = format!("SoundCraftEditorScaleTestChild{bgr:06x}").encode_utf16().chain(Some(0)).collect();
+        // SAFETY: a brush owned by the class for the process lifetime.
+        let brush = unsafe { windows::Win32::Graphics::Gdi::CreateSolidBrush(COLORREF(bgr)) };
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(child_proc),
+            hInstance: module_instance().expect("module"),
+            lpszClassName: PCWSTR(name.as_ptr()),
+            hbrBackground: brush,
+            ..Default::default()
+        };
+        // SAFETY: the class and its name live for the call; a duplicate is ignored.
+        unsafe {
+            let _ = RegisterClassW(&class);
+        }
+        // SAFETY: the parent is a live window of ours.
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(name.as_ptr()),
+                w!(""),
+                WS_CHILD | WS_VISIBLE,
+                x,
+                y,
+                w,
+                h,
+                Some(parent),
+                None,
+                Some(module_instance().expect("module")),
+                None,
+            )
+        }
+        .expect("child window")
     }
 
     #[test]
