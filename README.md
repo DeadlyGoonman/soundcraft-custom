@@ -51,7 +51,7 @@ was written by **Claude** (Anthropic's Claude Code). **This fork's changes are 1
   also be dragged (aspect-locked, snapping to 100/125/150/200%); the size is remembered per plugin. Fixed-size
   plugins can opt into a host-side upscaler (FSR 1 or bilinear) in the insert's right-click › Editor Scale ›
   Scaling mode; native is the default.
-- **Plugin window header** — a strip on top of every VST3/CLAP editor window with **Bypass**, and **Δ Delta** (hear only what the plugin changes: wet minus the
+- **Plugin window header** — a strip on top of every VST3/CLAP editor window with **Bypass** and **Δ Delta** (hear only what the plugin changes: wet minus the
   latency-aligned dry signal; a listening aid that is never saved). Closing a plugin window no longer pulls the main
   window to the front.
 - **Custom themes** — an OLED Black theme (pure-black surfaces) and a Custom theme shaded from any colour you pick,
