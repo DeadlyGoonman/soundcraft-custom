@@ -48,9 +48,11 @@ was written by **Claude** (Anthropic's Claude Code). **This fork's changes are 1
   data to their own editor, and keeps the editor in sync with presets, automation and undo.
 - **Plugin editor scaling** — 50–400% for plugins that can draw themselves at another size (VST3 content scale or
   resizable views, CLAP `set_scale`/resizing), so small GUIs aren't stuck tiny on a high-DPI display. Such windows can
-  also be dragged (aspect-locked, snapping to 100/125/150/200%); the size is remembered per plugin.
+  also be dragged (aspect-locked, snapping to 100/125/150/200%); the size is remembered per plugin. Fixed-size
+  plugins can opt into a host-side upscaler (FSR 1 or bilinear) in the insert's right-click › Editor Scale ›
+  Scaling mode; native is the default.
 - **Plugin window header** — a strip on top of every VST3/CLAP editor window: a `Scale ▾` menu (greyed out for
-  plugins that don't support scaling), **Bypass**, and **Δ Delta** (hear only what the plugin changes: wet minus the
+  plugins that can't scale, unless an upscale mode is chosen), **Bypass**, and **Δ Delta** (hear only what the plugin changes: wet minus the
   latency-aligned dry signal; a listening aid that is never saved). Closing a plugin window no longer pulls the main
   window to the front.
 - **Custom themes** — an OLED Black theme (pure-black surfaces) and a Custom theme shaded from any colour you pick,

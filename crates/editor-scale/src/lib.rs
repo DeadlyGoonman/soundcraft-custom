@@ -28,11 +28,17 @@ pub enum Choice {
 }
 
 /// Decides how an editor is shown. `factor` is the clamped scale (1.0 = the plugin's own size) and
-/// `native` says whether the plugin can draw itself at another size. Scaling is native only: a
-/// plugin that can't scale itself opens at its own size, whatever the mode (the host-side
-/// upscaler is no longer used, so [`Choice::Upscale`] is never chosen). Always `Ok`.
-pub fn plan(_mode: EditorScaleMode, factor: f32, native: bool) -> Result<Choice, &'static str> {
-    Ok(if factor != 1.0 && native { Choice::Native } else { Choice::Plain })
+/// `native` says whether the plugin can draw itself at another size. `Auto`/`Native` (the
+/// default) scale natively only: a plugin that can't scale itself opens at its own size. The
+/// upscaler is used only when the user opted into an `Upscale` mode, then also for fixed-size
+/// plugins. The mode never changes by itself. Always `Ok`.
+pub fn plan(mode: EditorScaleMode, factor: f32, native: bool) -> Result<Choice, &'static str> {
+    Ok(match mode {
+        _ if factor == 1.0 => Choice::Plain,
+        EditorScaleMode::Upscale(filter) => Choice::Upscale(filter),
+        EditorScaleMode::Auto | EditorScaleMode::Native if native => Choice::Native,
+        EditorScaleMode::Auto | EditorScaleMode::Native => Choice::Plain,
+    })
 }
 
 #[cfg(test)]
@@ -40,13 +46,20 @@ mod plan_tests {
     use super::*;
 
     #[test]
-    fn scaling_is_native_or_nothing() {
-        for mode in [EditorScaleMode::Auto, EditorScaleMode::Native, EditorScaleMode::Upscale(UpscaleFilter::Fsr1)] {
+    fn the_default_is_native_only() {
+        for mode in [EditorScaleMode::Auto, EditorScaleMode::Native] {
             assert_eq!(plan(mode, 1.0, true), Ok(Choice::Plain));
-            assert_eq!(plan(mode, 1.0, false), Ok(Choice::Plain));
             assert_eq!(plan(mode, 1.5, true), Ok(Choice::Native));
-            assert_eq!(plan(mode, 2.0, false), Ok(Choice::Plain), "never upscaled");
+            assert_eq!(plan(mode, 2.0, false), Ok(Choice::Plain), "never upscaled unless asked");
         }
+    }
+
+    #[test]
+    fn upscale_modes_are_opt_in_and_work_for_fixed_size_plugins() {
+        let fsr = EditorScaleMode::Upscale(UpscaleFilter::Fsr1);
+        assert_eq!(plan(fsr, 1.0, false), Ok(Choice::Plain));
+        assert_eq!(plan(fsr, 2.0, false), Ok(Choice::Upscale(UpscaleFilter::Fsr1)));
+        assert_eq!(plan(EditorScaleMode::Upscale(UpscaleFilter::Bilinear), 1.5, true), Ok(Choice::Upscale(UpscaleFilter::Bilinear)));
     }
 }
 

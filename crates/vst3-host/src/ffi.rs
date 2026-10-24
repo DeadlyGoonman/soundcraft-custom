@@ -2134,8 +2134,10 @@ impl EditorLink {
         }
         let native = EditorLink::supports_native(&view);
         g.native = Some(native);
-        // Scaling is native only: a plugin that can't scale itself opens at its own size.
-        let factor = if native { g.scale.clamped_factor() } else { 1.0 };
+        // Native scaling unless the user opted into an upscaler: a plugin that can't scale itself
+        // then opens at its own size.
+        let upscale_mode = matches!(g.scale.mode, soundcraft_dsp::EditorScaleMode::Upscale(_));
+        let factor = if native || upscale_mode { g.scale.clamped_factor() } else { 1.0 };
         let choice = plan(g.scale.mode, factor, native).map_err(str::to_string)?;
         let upscale = match choice {
             Choice::Upscale(filter) => Some(filter),

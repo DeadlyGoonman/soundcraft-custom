@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
-use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorScale, EditorScaleMode};
+use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorScale};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
@@ -451,7 +451,7 @@ impl HostWindow {
     }
 
     /// What the header shows (repaints when it changed). The frame gets a sizing border only
-    /// while `native_scaling` says the plugin can scale itself.
+    /// while the editor can be scaled ([`header::scalable`]: natively, or in an upscale mode).
     pub fn set_header(&self, state: EditorHeaderState) {
         let Some(f) = self.fr() else { return };
         let old = f.state.replace(state);
@@ -461,7 +461,7 @@ impl HostWindow {
                 let _ = InvalidateRect(Some(f.header.get()), None, false);
             }
         }
-        set_resizable(self.top, f, state.native_scaling);
+        set_resizable(self.top, f, header::scalable(&state));
     }
 
     /// Whether the frame has a sizing border.
@@ -655,7 +655,7 @@ fn frame_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT
             let body = client_size(hwnd.0)?;
             let factor = header::snap_factor((body.0 / native.0) as f32);
             let mut s = f.state.get();
-            let new = EditorScale { factor, mode: EditorScaleMode::Auto };
+            let new = EditorScale { factor, mode: s.scale.mode };
             resize(hwnd.0, (native.0 * f64::from(factor)).round(), (native.1 * f64::from(factor)).round());
             if new != s.scale {
                 s.scale = new;
@@ -735,7 +735,7 @@ fn draw_header(hwnd: HWND, hdc: HDC, s: &EditorHeaderState) {
     let idle = rgb(0x3C, 0x3C, 0x3C);
     let delta_on = s.delta && header::delta_enabled(s);
     let buttons = [
-        (l.scale, header::scale_label(s.scale), idle, if s.native_scaling { text } else { dim }),
+        (l.scale, header::scale_label(s.scale), idle, if header::scalable(s) { text } else { dim }),
         (l.bypass, "Bypass".to_string(), if s.bypass { rgb(0xE6, 0xA0, 0x1E) } else { idle }, if s.bypass { rgb(0x10, 0x10, 0x10) } else { text }),
         (
             l.delta,
@@ -794,11 +794,11 @@ fn click_header(hwnd: HWND, x: i32, y: i32) {
     let l = header::layout(r.right - r.left, dpi_of(hwnd));
     let mut s = f.state.get();
     let action = match header::hit(&l, x, y) {
-        Some(Button::Scale) if s.native_scaling => {
+        Some(Button::Scale) if header::scalable(&s) => {
             let Some(c) = scale_menu(hwnd, &s, POINT { x: l.scale.left, y: l.scale.bottom }) else { return };
             // The menu ran a modal loop: start from the state as it is now.
             s = f.state.get();
-            let new = header::apply_choice(c);
+            let new = header::apply_choice(s.scale, c);
             if new == s.scale {
                 return;
             }
@@ -847,6 +847,7 @@ fn scale_menu(hwnd: HWND, s: &EditorHeaderState, at: POINT) -> Option<header::Me
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use soundcraft_dsp::EditorScaleMode;
 
     #[test]
     fn the_body_sits_under_the_header_and_resizes() {
@@ -886,6 +887,11 @@ mod tests {
         assert_eq!(win.body_size(), Some((300.0, 200.0)), "the body keeps its size");
         win.set_header(EditorHeaderState::default());
         assert!(!win.is_resizable());
+        // A fixed-size plugin the user switched to an upscale mode can be dragged too.
+        let upscale = EditorScale { factor: 1.0, mode: EditorScaleMode::Upscale(soundcraft_dsp::UpscaleFilter::Fsr1) };
+        win.set_header(EditorHeaderState { scale: upscale, ..Default::default() });
+        assert!(win.is_resizable());
+        win.set_header(EditorHeaderState::default());
         assert_eq!(win.body_size(), Some((300.0, 200.0)));
     }
 

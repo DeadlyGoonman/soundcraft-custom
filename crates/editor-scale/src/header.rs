@@ -122,11 +122,18 @@ pub fn menu_items(s: &EditorHeaderState) -> Vec<MenuItem> {
     PRESETS.iter().map(|&p| MenuItem { id: menu_id(MenuChoice::Percent(p)), label: format!("{p}%"), checked: p == cur }).collect()
 }
 
-/// The scale after picking `c`: always `Auto` (native first, else FSR 1).
-pub fn apply_choice(c: MenuChoice) -> EditorScale {
+/// The scale after picking `c` with `cur` in effect: the size changes, the mode (native, or the
+/// upscaler the user opted into in the insert menu) stays.
+pub fn apply_choice(cur: EditorScale, c: MenuChoice) -> EditorScale {
     match c {
-        MenuChoice::Percent(p) => EditorScale { factor: p as f32 / 100.0, mode: EditorScaleMode::Auto },
+        MenuChoice::Percent(p) => EditorScale { factor: p as f32 / 100.0, mode: cur.mode },
     }
+}
+
+/// Whether the editor can be scaled: the plugin draws itself at another size, or its saved mode
+/// is one of the upscalers. Otherwise the Scale menu is greyed out and the frame is fixed.
+pub fn scalable(s: &EditorHeaderState) -> bool {
+    s.native_scaling || matches!(s.scale.mode, EditorScaleMode::Upscale(_))
 }
 
 /// A dragged factor: snapped to 100/125/150/200% within 2%, otherwise rounded to whole percent,
@@ -236,8 +243,18 @@ mod tests {
     }
 
     #[test]
-    fn a_picked_size_is_always_auto() {
-        assert_eq!(apply_choice(MenuChoice::Percent(200)), EditorScale { factor: 2.0, mode: EditorScaleMode::Auto });
+    fn a_picked_size_keeps_the_mode() {
+        assert_eq!(apply_choice(EditorScale::default(), MenuChoice::Percent(200)), EditorScale { factor: 2.0, mode: EditorScaleMode::Auto });
+        let fsr = EditorScale { factor: 1.0, mode: EditorScaleMode::Upscale(UpscaleFilter::Fsr1) };
+        assert_eq!(apply_choice(fsr, MenuChoice::Percent(150)), EditorScale { factor: 1.5, ..fsr });
+    }
+
+    #[test]
+    fn fixed_size_plugins_scale_only_in_an_upscale_mode() {
+        assert!(!scalable(&EditorHeaderState::default()), "default: native only");
+        assert!(scalable(&EditorHeaderState { native_scaling: true, ..Default::default() }));
+        let upscale = EditorScale { factor: 1.0, mode: EditorScaleMode::Upscale(UpscaleFilter::Bilinear) };
+        assert!(scalable(&EditorHeaderState { scale: upscale, ..Default::default() }));
     }
 
     #[test]

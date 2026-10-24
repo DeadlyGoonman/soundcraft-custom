@@ -675,9 +675,7 @@ impl SoundApp {
         let Some(p) = self.player.as_ref() else { return Err("no audio engine".into()) };
         // The default is sent too: another instance of the plugin may have been scaled since this
         // one last opened. Only a remembered scale's refusal is worth a status line.
-        // Only the size is the user's: older prefs may name a mode, but every editor now scales
-        // natively when it can and opens at its own size otherwise.
-        let scale = remembered.map(|s| soundcraft_dsp::EditorScale { mode: soundcraft_dsp::EditorScaleMode::Auto, ..s }).unwrap_or_default();
+        let scale = remembered.unwrap_or_default();
         if let Err(e) = p.set_editor_scale(track, slot, scale)
             && remembered.is_some()
         {
@@ -689,7 +687,6 @@ impl SoundApp {
     /// Sets a slot's plugin editor scale (applied live to an open editor) and remembers it for the
     /// plugin. A scale the editor refuses is not remembered.
     pub fn set_slot_editor_scale(&mut self, track: TrackId, slot: usize, scale: soundcraft_dsp::EditorScale) -> Result<(), String> {
-        let scale = soundcraft_dsp::EditorScale { mode: soundcraft_dsp::EditorScaleMode::Auto, ..scale };
         let Some(plugin) = self.slot_plugin_id(track, slot) else { return Err("no plugin in this slot".into()) };
         if let Some(p) = self.player.as_ref()
             && p.has_editor(track, slot)
