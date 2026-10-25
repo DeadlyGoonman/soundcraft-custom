@@ -199,6 +199,8 @@ fn move_song_start(e: &mut Engine, p: &Value) -> Result<Value> {
     let old = s.tempo.clone();
     let mut map = TempoMap::new(old.tempo_at_tick(0), old.meter_at_tick(0).numerator, old.meter_at_tick(0).denominator)
         .map_err(|err| bad(id, err.to_string()))?;
+    // Bar 1 stays where it was; only the events after the start move.
+    map.set_origin(old.origin());
     for t in old.tempos().iter().filter(|t| t.tick > 0) {
         map.set_tempo((t.tick + dticks).max(1), t.bpm).map_err(|err| bad(id, err.to_string()))?;
     }

@@ -215,6 +215,23 @@ mod tests {
     }
 
     #[test]
+    fn bar_grid_lines_start_at_the_origin() {
+        let (sr, rate) = (SampleRate::HZ_48000, FrameRate::Fps30);
+        let bar = GridValue::Note { value: NoteValue::Bar, dotted: false, triplet: false };
+        let mut map = TempoMap::default();
+        map.set_origin(10_000);
+        // Bars are 96000 samples at 120 bpm 4/4: lines at the origin and every bar from it, back
+        // past sample 0 too.
+        assert_eq!(bar.lines(0, 300_000, sr, &map, rate, 10), vec![10_000, 106_000, 202_000, 298_000]);
+        assert_eq!(bar.line_at_or_before(10_000, sr, &map, rate), 10_000);
+        assert_eq!(bar.line_at_or_before(9_999, sr, &map, rate), 10_000 - 96_000);
+        assert_eq!(bar.snap(40_000, sr, &map, rate), 10_000);
+        assert_eq!(GridValue::default().snap(13_100, sr, &map, rate), 16_000);
+        // Absolute grids ignore the origin.
+        assert_eq!(GridValue::Seconds(1.0).snap(70_000, sr, &map, rate), 48_000);
+    }
+
+    #[test]
     fn absolute_grids() {
         let (sr, map, rate) = (SampleRate::HZ_48000, TempoMap::default(), FrameRate::Fps25);
         assert_eq!(GridValue::Seconds(1.0).snap(70_000, sr, &map, rate), 48_000);

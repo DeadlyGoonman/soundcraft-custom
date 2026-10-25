@@ -39,15 +39,30 @@ pub struct BarBeat {
 }
 
 /// Tempo and meter changes for a session. Always has at least one of each, at tick 0.
+///
+/// Tick 0 is bar 1 beat 1, and it sits at the sample [`TempoMap::origin`] (the song start; 0 by
+/// default). Positions stay absolute samples: timeline sample 0 is still sample 0, and with a
+/// non-zero origin the stretch before it counts in bars before bar 1 (bar 0, -1, ...) under the
+/// first tempo and meter. Every sample <-> tick conversion goes through [`TempoMap::tick_to_samples`]
+/// and [`TempoMap::samples_to_ticks_f`], which add and subtract the origin; the bar <-> sample
+/// conversions and the grid build on those, so they all follow it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TempoMap {
     tempos: Vec<TempoEvent>,
     meters: Vec<MeterEvent>,
+    /// Sample position of bar 1 beat 1 (tick 0), within `0..=MAX_POSITION`. Maps saved before
+    /// it existed read as 0.
+    #[serde(default)]
+    origin: Samples,
 }
 
 impl Default for TempoMap {
     fn default() -> Self {
-        TempoMap { tempos: vec![TempoEvent { tick: 0, bpm: 120.0 }], meters: vec![MeterEvent { tick: 0, numerator: 4, denominator: 4 }] }
+        TempoMap {
+            tempos: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meters: vec![MeterEvent { tick: 0, numerator: 4, denominator: 4 }],
+            origin: 0,
+        }
     }
 }
 
@@ -74,9 +89,21 @@ impl TempoMap {
         &self.meters
     }
 
+    /// Sample position of bar 1 beat 1 (the song start).
+    pub fn origin(&self) -> Samples {
+        self.origin
+    }
+
+    /// Put bar 1 beat 1 at sample `at` (clamped to `0..=MAX_POSITION`). Tempo and meter events
+    /// keep their ticks, so they move with bar 1.
+    pub fn set_origin(&mut self, at: Samples) {
+        self.origin = at.clamp(0, MAX_POSITION);
+    }
+
     /// Repair a map read from a file: only valid tempos and meters within `0..=MAX_POSITION` ticks, in
     /// tick order, with one of each at tick 0.
     pub fn sanitize(&mut self) {
+        self.origin = self.origin.clamp(0, MAX_POSITION);
         self.tempos.retain(|e| (0..=MAX_POSITION).contains(&e.tick) && valid_bpm(e.bpm).is_ok());
         self.tempos.sort_by_key(|e| e.tick);
         self.tempos.dedup_by_key(|e| e.tick);
@@ -198,7 +225,7 @@ impl TempoMap {
         sr.as_f64() * 60.0 / (bpm * TICKS_PER_QUARTER as f64)
     }
 
-    /// Ticks → samples (exact for constant-tempo segments).
+    /// Ticks → samples (exact for constant-tempo segments). Tick 0 is at [`TempoMap::origin`].
     pub fn tick_to_samples(&self, tick: i64, sr: SampleRate) -> Samples {
         to_samples(self.tick_to_samples_f(tick, sr))
     }
@@ -215,12 +242,12 @@ impl TempoMap {
             seg_tick = e.tick;
             bpm = e.bpm;
         }
-        acc + (tick - seg_tick) as f64 * Self::samples_per_tick(bpm, sr)
+        self.origin as f64 + acc + (tick - seg_tick) as f64 * Self::samples_per_tick(bpm, sr)
     }
 
-    /// Samples → ticks (fractional).
+    /// Samples → ticks (fractional), counted from [`TempoMap::origin`].
     pub fn samples_to_ticks_f(&self, s: Samples, sr: SampleRate) -> f64 {
-        let s = s as f64;
+        let s = s.saturating_sub(self.origin) as f64;
         let mut acc = 0.0;
         let mut seg_tick = 0i64;
         let mut bpm = self.tempos.first().map_or(120.0, |e| e.bpm);
@@ -389,11 +416,13 @@ mod tests {
         let mut m = TempoMap {
             tempos: vec![tempo(960, 4e9), tempo(3840, 90.0), tempo(-5, 100.0), tempo(1920, 60.0), tempo(1920, 70.0)],
             meters: vec![meter(0, 0, 4), meter(3840, 3, 4)],
+            origin: -7,
         };
         m.sanitize();
         assert_eq!(m.tempos(), [tempo(0, 60.0), tempo(1920, 60.0), tempo(3840, 90.0)]);
         assert_eq!(m.meters(), [meter(0, 3, 4), meter(3840, 3, 4)]);
-        let mut empty = TempoMap { tempos: Vec::new(), meters: Vec::new() };
+        assert_eq!(m.origin(), 0, "a negative origin clamps to 0");
+        let mut empty = TempoMap { tempos: Vec::new(), meters: Vec::new(), origin: 0 };
         empty.sanitize();
         assert_eq!(empty, TempoMap::default());
     }
@@ -403,6 +432,7 @@ mod tests {
         let mut m = TempoMap {
             tempos: vec![TempoEvent { tick: 0, bpm: 120.0 }, TempoEvent { tick: i64::MAX, bpm: 90.0 }],
             meters: vec![MeterEvent { tick: 0, numerator: 4, denominator: 4 }, MeterEvent { tick: i64::MAX, numerator: 3, denominator: 4 }],
+            origin: 0,
         };
         m.sanitize();
         assert_eq!(m, TempoMap::default());
@@ -417,6 +447,82 @@ mod tests {
         assert!(m.set_meter(0, 0, 4).is_err());
         assert!(m.set_meter(0, 4, 3).is_err());
         assert!(!m.remove_tempo(0));
+    }
+
+    #[test]
+    fn origin_zero_is_unchanged() {
+        let sr = SampleRate::HZ_48000;
+        let mut m = TempoMap::default();
+        m.set_tempo(TICKS_PER_QUARTER * 4, 60.0).unwrap();
+        let mut z = m.clone();
+        z.set_origin(0);
+        assert_eq!(z, m);
+        for s in [-96_000, -1, 0, 1, 24_000, 96_000, 200_000, 288_000] {
+            assert_eq!(z.bar_beat_at(s, sr), m.bar_beat_at(s, sr));
+        }
+        assert_eq!(z.tick_to_samples(TICKS_PER_QUARTER * 8, sr), 96_000 + 192_000);
+        assert_eq!(z.samples_at_bar_beat(BarBeat { bar: 1, beat: 1, tick: 0 }, sr), 0);
+    }
+
+    #[test]
+    fn origin_moves_bar_one() {
+        let sr = SampleRate::HZ_48000;
+        let mut m = TempoMap::default();
+        m.set_origin(10_000);
+        // Bar 1 starts at the origin; bars count from there at 96000 samples per 4/4 bar.
+        assert_eq!(m.samples_at_bar_beat(BarBeat { bar: 1, beat: 1, tick: 0 }, sr), 10_000);
+        assert_eq!(m.bar_beat_at(10_000, sr), BarBeat { bar: 1, beat: 1, tick: 0 });
+        assert_eq!(m.bar_beat_at(9_900, sr).bar, 0, "four ticks before bar 1");
+        assert_eq!(m.bar_beat_at(106_000, sr), BarBeat { bar: 2, beat: 1, tick: 0 });
+        assert_eq!(m.bar_beat_at(105_900, sr).bar, 1);
+        assert_eq!(m.bar_beat_at(34_000, sr), BarBeat { bar: 1, beat: 2, tick: 0 });
+        // Before the origin: bar 0 under the first meter; sample 0 is still sample 0.
+        assert_eq!(m.samples_at_bar_beat(BarBeat { bar: 0, beat: 1, tick: 0 }, sr), 10_000 - 96_000);
+        assert_eq!(m.bar_beat_at(0, sr), BarBeat { bar: 0, beat: 4, tick: 560 });
+        assert_eq!(m.samples_to_ticks(10_000, sr), 0);
+        assert_eq!(m.tick_to_samples(0, sr), 10_000);
+    }
+
+    #[test]
+    fn origin_round_trips_with_tempo_and_meter_changes() {
+        let sr = SampleRate::HZ_44100;
+        let mut m = TempoMap::new(163.0, 4, 4).unwrap();
+        m.set_tempo(TICKS_PER_QUARTER * 16, 90.0).unwrap();
+        m.set_meter(TICKS_PER_QUARTER * 32, 3, 4).unwrap();
+        let plain = m.clone();
+        m.set_origin(566_102);
+        for tick in [-TICKS_PER_QUARTER * 9, -1, 0, 1, 959, TICKS_PER_QUARTER * 16, TICKS_PER_QUARTER * 33 + 17] {
+            assert_eq!(m.samples_to_ticks(m.tick_to_samples(tick, sr), sr), tick, "tick {tick}");
+            // The whole map shifts by the origin, nothing else changes.
+            assert_eq!(m.tick_to_samples(tick, sr), plain.tick_to_samples(tick, sr) + 566_102);
+        }
+        for bb in [BarBeat { bar: 1, beat: 1, tick: 0 }, BarBeat { bar: 5, beat: 3, tick: 10 }, BarBeat { bar: 9, beat: 2, tick: 0 }, BarBeat { bar: 0, beat: 2, tick: 0 }] {
+            assert_eq!(m.bar_beat_at(m.samples_at_bar_beat(bb, sr), sr), bb);
+        }
+        for s in [0, 1, 566_101, 566_102, 1_000_000, 5_000_000] {
+            let back = m.tick_to_samples(m.samples_to_ticks(s, sr), sr);
+            assert!((back - s).abs() <= 20, "sample {s} came back as {back}");
+            assert_eq!(m.bar_beat_at(s, sr), plain.bar_beat_at(s - 566_102, sr));
+        }
+    }
+
+    #[test]
+    fn origin_clamps() {
+        let mut m = TempoMap::default();
+        m.set_origin(-5);
+        assert_eq!(m.origin(), 0);
+        m.set_origin(i64::MAX);
+        assert_eq!(m.origin(), MAX_POSITION);
+    }
+
+    #[test]
+    fn maps_saved_without_an_origin_read_as_zero() {
+        let json = r#"{"tempos":[{"tick":0,"bpm":120.0}],"meters":[{"tick":0,"numerator":4,"denominator":4}]}"#;
+        assert_eq!(serde_json::from_str::<TempoMap>(json).unwrap(), TempoMap::default());
+        let mut m = TempoMap::default();
+        m.set_origin(6165);
+        let back: TempoMap = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.origin(), 6165);
     }
 
     #[test]

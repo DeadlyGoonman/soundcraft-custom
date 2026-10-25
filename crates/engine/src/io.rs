@@ -60,6 +60,14 @@ pub fn file_found(path: impl AsRef<Path>) -> bool {
     crate::file_access::check_read(path).is_ok() && path.is_file()
 }
 
+/// The names in a folder the automation read root lets us see; empty when it can't be read.
+pub(crate) fn list_dir(dir: &Path) -> Vec<String> {
+    if crate::file_access::check_read(dir).is_err() {
+        return Vec::new();
+    }
+    std::fs::read_dir(dir).map(|r| r.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default()
+}
+
 /// The file a path stored in the session file `session` refers to, or why it is not opened.
 ///
 /// Every path a session names (audio sources, movies) goes through here before it reaches the
