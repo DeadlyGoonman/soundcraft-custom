@@ -2579,9 +2579,10 @@ fn automation_id(p: &AutoParam) -> String {
     }
 }
 
-/// Grid snapping while dragging; holding Cmd/Ctrl swaps Grid and Slip.
+/// Grid snapping while dragging (Grid modes or Snap to Grid, see `ops::drag_snaps`); holding
+/// Cmd/Ctrl swaps snapping on and off.
 pub(crate) fn drag_snap(s: &Session, at: Samples, flip: bool) -> Samples {
-    if s.edit.edit_mode.is_grid() != flip { s.edit.grid.snap(at, s.sample_rate, &s.tempo, s.frame_rate) } else { at }
+    if ops::drag_snaps(s, flip) { s.edit.grid.snap(at, s.sample_rate, &s.tempo, s.frame_rate) } else { at }
 }
 
 /// What a clip drag works out once per target track rather than every frame: where the tracks go
@@ -2624,7 +2625,7 @@ fn drag_plan(ctx: &egui::Context, s: &Session, revision: u64, clips: &[ClipId], 
 
 /// How far a Grabber drag by `raw` from track `from` takes the clips in the current Edit mode.
 /// Shuffle lands the earliest clip bound for the target track on a slot there, as
-/// `edit.move_clips` does; Grid snaps the grabbed clip.
+/// `edit.move_clips` does; Grid and Snap to Grid snap the grabbed clip.
 fn move_delta(plan: &DragPlan, s: &Session, from: TrackId, raw: Samples, flip: bool) -> Samples {
     let mode = s.edit.edit_mode;
     if mode == EditMode::Shuffle {
@@ -2633,10 +2634,9 @@ fn move_delta(plan: &DragPlan, s: &Session, from: TrackId, raw: Samples, flip: b
             .iter()
             .find(|g| g.0 == to)
             .map_or(raw, |(_, first, slots)| ops::nearest_slot(slots, first.saturating_add(raw)).saturating_sub(*first))
-    } else if mode.is_grid() != flip
-        && let Some(c) = &plan.grabbed
-    {
-        ops::grid_delta(s, c, raw, mode == EditMode::GridRelative)
+    } else if let Some(c) = &plan.grabbed {
+        // The whole group moves by the grabbed clip's snapped offset (see `ops::group_delta`).
+        ops::group_delta(s, c, raw, flip)
     } else {
         raw
     }

@@ -179,7 +179,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Move Clips",
             [],
             None,
-            "{clips?: [id], by?: samples, to?: position for the first clip that can move (Grid modes snap its sync point), track?: where the first clip's track goes; the others keep their distance, copy?: bool (copies go there, the originals stay)}",
+            "{clips?: [id], by?: samples, to?: position for the first clip that can move (Grid modes and Snap to Grid snap its sync point), track?: where the first clip's track goes; the others keep their distance, copy?: bool (copies go there, the originals stay)}",
             has_selection,
             move_clips
         ),
@@ -1028,8 +1028,9 @@ fn move_clips(e: &mut Engine, p: &Value) -> Result<Value> {
         _ => 0,
     };
     let mode = s.edit.edit_mode;
+    // `to` in Grid modes or with Snap to Grid: the first clip snaps, the others keep their distance.
     let delta = match first {
-        Some(c) if mode.is_grid() && p.get("to").is_some() => ops::grid_delta(s, c, delta, mode == EditMode::GridRelative),
+        Some(c) if mode != EditMode::Shuffle && p.get("to").is_some() => ops::group_delta(s, c, delta, false),
         _ => delta,
     };
     let s = e.session_mut();
@@ -1435,6 +1436,38 @@ mod tests {
         assert!(e.execute("clip.move_to_adjacent_track", &json!({"clips": [m.0], "direction": "down"})).is_err());
         e.execute("clip.move_to_adjacent_track", &json!({"clips": [m.0], "direction": "up"})).unwrap();
         assert_eq!(on(&e, m), (t[1], 2_000));
+    }
+
+    #[test]
+    fn a_snapped_group_move_keeps_its_spacing_overwrites_and_is_one_undo() {
+        let (mut e, t, [a, b, _]) = lanes();
+        let s = e.session();
+        let step = s.edit.grid.step_samples(0, s.sample_rate, &s.tempo, s.frame_rate);
+        assert!(step >= 2_000, "the test wants a grid step longer than b");
+        // Slip with Snap to Grid: the first clip (a) snaps, b on another track moves by the same.
+        e.execute("edit.mode", &json!({"mode": "slip", "snap_to_grid": true})).unwrap();
+        let shift = step - 1_000;
+        // A clip where b lands, overlapping b's last 1000 samples: overwritten, as drags do.
+        let x = e.session_mut().new_clip_id();
+        let src = e.session().find_clip(b).unwrap().1.clone();
+        let mut cx = src.clone();
+        (cx.id, cx.start, cx.length) = (x, 9_000 + shift + 1_000, 5_000);
+        ops::place_clip(e.session_mut(), t[2], cx);
+        let before = e.session().clone();
+        let undo_len = e.undo_history().len();
+        let r = e.execute("edit.move_clips", &json!({"clips": [a.0, b.0], "to": step + 200})).unwrap();
+        assert_eq!(r["by"], shift);
+        assert_eq!((on(&e, a), on(&e, b)), ((t[0], step), (t[2], 9_000 + shift)), "same offset on both tracks");
+        assert_eq!(on(&e, b).1 - on(&e, a).1, 8_000, "relative positions kept");
+        let lane: Vec<(Samples, Samples)> = e.session().track(t[2]).unwrap().clips().iter().map(|c| (c.start, c.length)).collect();
+        assert_eq!(lane, vec![(9_000 + shift, 2_000), (9_000 + shift + 2_000, 4_000)], "the part of x under b is overwritten");
+        assert_eq!(e.undo_history().len(), undo_len + 1, "one undo step");
+        assert!(e.undo());
+        assert_eq!(e.session(), &before);
+        // Snap to Grid off: `to` moves exactly.
+        e.execute("edit.mode", &json!({"mode": "slip"})).unwrap();
+        e.execute("edit.move_clips", &json!({"clips": [a.0, b.0], "to": step + 200})).unwrap();
+        assert_eq!((on(&e, a).1, on(&e, b).1), (step + 200, 9_000 + step - 800));
     }
 
     #[test]

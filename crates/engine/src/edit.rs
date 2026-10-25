@@ -730,6 +730,19 @@ pub fn grid_delta(s: &Session, clip: &Clip, raw: Samples, relative: bool) -> Sam
     g.snap(from.saturating_add(raw), sr, map, rate).saturating_sub(from)
 }
 
+/// Whether drags snap to the grid: in the Grid modes, or with Snap to Grid on (the rule the
+/// ruler and the Selector use). `flip` (Cmd/Ctrl held) swaps snapping on and off.
+pub fn drag_snaps(s: &Session, flip: bool) -> bool {
+    (s.edit.edit_mode.is_grid() || s.edit.flag(SNAP_TO_GRID)) != flip
+}
+
+/// How far a Grabber drag by `raw` moves a group of clips, outside Shuffle: when drags snap,
+/// `anchor` (the grabbed clip, else the earliest) lands on the grid as [`grid_delta`] puts it and
+/// every clip moves by that same offset, so the group keeps its spacing.
+pub fn group_delta(s: &Session, anchor: &Clip, raw: Samples, flip: bool) -> Samples {
+    if drag_snaps(s, flip) { grid_delta(s, anchor, raw, s.edit.edit_mode == soundcraft_model::EditMode::GridRelative) } else { raw }
+}
+
 /// Trim a clip's edges to `start` and/or `end` like the Trim tool, never past its file. In
 /// Shuffle mode the start stays put (the material slides under it) and later clips follow the
 /// change, up to a locked clip; otherwise a trim stops at the neighbouring clips.
@@ -1062,6 +1075,27 @@ mod tests {
         assert_eq!(c.start + grid_delta(&s, &c, step + 200, false), step);
         assert_eq!(c.start + grid_delta(&s, &c, step + 200, true), step + 1000);
         assert_eq!(grid_delta(&s, &c, step / 3, true), 0);
+    }
+
+    #[test]
+    fn drags_snap_in_grid_mode_or_with_snap_to_grid() {
+        use soundcraft_model::EditMode;
+        let (mut s, t) = session_with_clip();
+        let step = s.edit.grid.step_samples(0, s.sample_rate, &s.tempo, s.frame_rate);
+        let c = s.track(t).unwrap().clips()[0].clone();
+        s.edit.edit_mode = EditMode::Slip;
+        s.edit.set_flag(SNAP_TO_GRID, false);
+        assert!(!drag_snaps(&s, false) && drag_snaps(&s, true), "Slip: Cmd/Ctrl snaps");
+        assert_eq!(group_delta(&s, &c, step + 200, false), step + 200);
+        s.edit.set_flag(SNAP_TO_GRID, true);
+        assert!(drag_snaps(&s, false) && !drag_snaps(&s, true), "Snap to Grid: Cmd/Ctrl frees");
+        assert_eq!(c.start + group_delta(&s, &c, step + 200, false), step, "the start lands on a line");
+        assert_eq!(group_delta(&s, &c, step + 200, true), step + 200);
+        s.edit.set_flag(SNAP_TO_GRID, false);
+        s.edit.edit_mode = EditMode::Grid;
+        assert_eq!(c.start + group_delta(&s, &c, step + 200, false), step);
+        s.edit.edit_mode = EditMode::GridRelative;
+        assert_eq!(group_delta(&s, &c, step + 200, false), step, "relative: whole steps");
     }
 
     #[test]
