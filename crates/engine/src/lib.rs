@@ -14,6 +14,7 @@ pub mod demo;
 pub mod device_rate;
 pub mod edit;
 pub mod file_access;
+pub mod flp;
 pub mod inspect;
 pub mod io;
 pub mod mp3;

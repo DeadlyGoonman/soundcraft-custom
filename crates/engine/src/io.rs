@@ -1444,6 +1444,9 @@ pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     if Path::new(path).extension().is_some_and(|x| x.eq_ignore_ascii_case("ptx")) {
         return crate::ptx::open_ptx(e, path);
     }
+    if Path::new(path).extension().is_some_and(|x| x.eq_ignore_ascii_case("flp")) {
+        return crate::flp::open_flp(e, path);
+    }
     open_session_linked(e, path, Path::new(path))
 }
 

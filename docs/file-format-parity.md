@@ -1,6 +1,6 @@
 # File-format parity
 
-> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-23 · **Change:** minor (MP3 bounce through a system ffmpeg) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-25 · **Change:** minor (FL Studio `.flp` import: arrangement audio, tempo) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every format Pro Tools reads or writes, and ours. The Pro Tools list comes from the document types
 its bundle declares (`CFBundleDocumentTypes` in Info.plist: names only, nothing else read) and its
@@ -19,6 +19,7 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 |---|---|---|---|---|
 | Pro Tools session `.ptx` (and `.ptf` from 7–9) | native | ❌ | ❌ | Proprietary, undocumented. Owner decision needed on black-box format study (G-03) |
 | Session templates `.ptxt` | read/write | ❌ | ❌ | We have no templates at all (G-16) |
+| FL Studio project `.flp` | n/a (other DAW) | partial | ❌ | `crates/engine/src/flp.rs`. Reads FL 21–26 arrangement audio clips, their tracks and positions, sample files (found beside the project in `Samples/` or `Audio/`), and tempo. Not read yet: volume, pan, clip trims, patterns, MIDI, automation, plugins. Layout from easyflp's FORMAT.md (MIT, reference only); checked on one FL 26.1.7 project |
 | AAF (Advanced Authoring Format) | import/export | ❌ | ❌ | #40. The post-production handoff from picture editors (G-03) |
 | OMF | import/export | ❌ | ❌ | Legacy, still delivered by some editors |
 | Media Composer–compatible session | export | ❌ | ❌ | AAF variant |
