@@ -49,6 +49,15 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             engine_settings(e, p)
         }),
+        cmd!(
+            noundo "setup.device_rate",
+            "Set Device Sample Rate",
+            [],
+            None,
+            "{rate: Hz} — reopens the audio device at this rate (asks the host); errors when the device does not support it",
+            has_device,
+            device_rate
+        ),
         cmd!(noundo "setup.disk_allocation", "Disk Allocation...", ["Setup"], None, "{path?, track?} — the record folder for the session, or for one track", always, disk_allocation),
         cmd!(noundo "setup.peripherals", "Peripherals...", ["Setup"], None, "{settings?: {name: number|bool|string}} — control surface / sync device settings", always, peripherals),
         cmd!(
@@ -172,6 +181,28 @@ fn engine_settings(e: &mut Engine, p: &Value) -> Result<Value> {
         "bit_depth": s.bit_depth,
         "delay_compensation": s.edit.delay_compensation,
     }))
+}
+
+fn has_device(e: &Engine) -> std::result::Result<(), String> {
+    if e.device.rate.is_some() { Ok(()) } else { Err("there is no audio device".into()) }
+}
+
+/// `setup.device_rate`: checks the rate against what the device reported and asks the host to
+/// reopen the device at it. The engine never touches the device itself.
+fn device_rate(e: &mut Engine, p: &Value) -> Result<Value> {
+    let id = "setup.device_rate";
+    let rate = p
+        .get("rate")
+        .and_then(Value::as_u64)
+        .filter(|r| (8_000..=768_000).contains(r))
+        .and_then(|r| u32::try_from(r).ok())
+        .ok_or_else(|| bad(id, "`rate` must be a sample rate in Hz (8000..=768000)"))?;
+    crate::device_rate::check_rate(&e.device, rate).map_err(EngineError::Unsupported)?;
+    let changed = e.device.rate != Some(rate);
+    if changed {
+        e.device_requests.push(crate::device_rate::DeviceRequest::SetRate(rate));
+    }
+    Ok(json!({"rate": rate, "changed": changed}))
 }
 
 fn disk_allocation(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -503,6 +534,37 @@ fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_rate_asks_the_host_for_a_supported_rate() {
+        use crate::device_rate::{DeviceRequest, DeviceStatus};
+        let mut e = Engine::default();
+        assert!(e.execute("setup.device_rate", &json!({"rate": 44_100})).is_err(), "no device: disabled");
+        e.device = DeviceStatus { rate: Some(48_000), rates: Some(vec![44_100, 48_000]) };
+        let r = e.execute("setup.device_rate", &json!({"rate": 44_100})).unwrap();
+        assert_eq!(r["changed"], true);
+        assert_eq!(e.device_requests, vec![DeviceRequest::SetRate(44_100)]);
+        e.device_requests.clear();
+        let r = e.execute("setup.device_rate", &json!({"rate": 48_000})).unwrap();
+        assert_eq!(r["changed"], false, "already there");
+        assert!(e.device_requests.is_empty());
+        assert!(!e.is_dirty(), "a device change is not a document change");
+    }
+
+    #[test]
+    fn device_rate_refuses_what_the_device_cannot_do() {
+        use crate::device_rate::DeviceStatus;
+        let mut e = Engine::default();
+        e.device.clone_from(&DeviceStatus { rate: Some(48_000), rates: Some(vec![48_000, 96_000]) });
+        let err = e.execute("setup.device_rate", &json!({"rate": 44_100})).unwrap_err().to_string();
+        assert!(err.contains("does not support 44100 Hz"), "{err}");
+        for bad in [json!({}), json!({"rate": "fast"}), json!({"rate": -1}), json!({"rate": 1u64 << 40}), json!({"rate": 44_100.5})] {
+            assert!(e.execute("setup.device_rate", &bad).is_err(), "{bad}");
+        }
+        e.device.rates = None;
+        assert!(e.execute("setup.device_rate", &json!({"rate": 48_000})).is_err(), "rates not known yet");
+        assert!(e.device_requests.is_empty());
+    }
 
     #[test]
     fn option_flags_toggle() {

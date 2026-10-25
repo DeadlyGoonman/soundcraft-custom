@@ -102,6 +102,8 @@ pub struct UiState {
     pub show_playback_engine: bool,
     /// The audio device choice (Setup › Playback Engine), kept with the preferences: per machine.
     pub audio: soundcraft_playback::AudioConfig,
+    /// "Always" in the 44.1 kHz session on a 48 kHz device prompt (see `extra_windows::device_rate`).
+    pub device_rate_policy: soundcraft_engine::device_rate::RatePolicy,
     /// The Mix window lives in its own native window (Window › Mix in Separate Window); the main
     /// window then always shows Edit.
     pub mix_separate: bool,
@@ -182,6 +184,7 @@ impl Default for UiState {
             show_configurations: false,
             show_playback_engine: false,
             audio: soundcraft_playback::AudioConfig::default(),
+            device_rate_policy: soundcraft_engine::device_rate::RatePolicy::default(),
             mix_separate: false,
             show_io_setup: false,
             show_shortcuts: false,
@@ -1335,6 +1338,8 @@ impl SoundApp {
         for r in reqs {
             match r {
                 TransportRequest::ResetSession => {
+                    // The device rate answer was for the old session only.
+                    self.extra.device_rate.answer = None;
                     if let Some(p) = &self.player {
                         p.stop();
                         p.set_recording(false);

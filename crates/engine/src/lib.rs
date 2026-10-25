@@ -11,6 +11,7 @@ pub mod catalog_more;
 pub mod clip_group_file;
 pub mod cmd;
 pub mod demo;
+pub mod device_rate;
 pub mod edit;
 pub mod file_access;
 pub mod inspect;
@@ -148,6 +149,10 @@ pub struct Engine {
     /// Plugins an imported Pro Tools session uses that are not installed here, for the UI to
     /// offer substitutes (see `ptx`).
     pub missing_plugins: Vec<ptx::MissingPlugin>,
+    /// The open audio device, reported by the host each frame (see `device_rate`).
+    pub device: device_rate::DeviceStatus,
+    /// Device changes for the host to apply, drained each frame (`setup.device_rate`).
+    pub device_requests: Vec<device_rate::DeviceRequest>,
 }
 
 impl Default for Engine {
@@ -179,6 +184,8 @@ impl Engine {
             messages: Vec::new(),
             last_selection: None,
             missing_plugins: Vec::new(),
+            device: device_rate::DeviceStatus::default(),
+            device_requests: Vec::new(),
         }
     }
 

@@ -509,6 +509,24 @@ fn start_asio_panel(ctx: &egui::Context, panel: &PanelSlot, driver: String) {
     }
 }
 
+/// The rates the open output device `open` accepts, from the device scan: `None` until a scan
+/// has landed (one starts when `start`), or when the scan does not list the device's rates.
+pub(crate) fn open_device_rates(ctx: &egui::Context, cfg: &AudioConfig, open: &str, start: bool) -> Option<Vec<u32>> {
+    let systems = if start {
+        audio_systems(ctx, false)?
+    } else {
+        let slot = ctx.data(|d| d.get_temp::<ScanSlot>(egui::Id::new("audio_systems")))?;
+        let state = lock(&slot);
+        let Scan::Done(systems) = &*state else { return None };
+        Arc::clone(systems)
+    };
+    // The chosen system first, then any other: an ASIO driver is open while no system is chosen.
+    let chosen = chosen_system(&systems, cfg);
+    let named = |s: &AudioSystem| s.outputs.iter().find(|d| d.name == open).cloned();
+    let dev = chosen.and_then(named).or_else(|| systems.iter().find_map(named))?;
+    Some(dev.sample_rates).filter(|r| !r.is_empty())
+}
+
 /// The system a config means (its own, else the default one) in an enumeration.
 fn chosen_system<'a>(systems: &'a [AudioSystem], cfg: &AudioConfig) -> Option<&'a AudioSystem> {
     cfg.system

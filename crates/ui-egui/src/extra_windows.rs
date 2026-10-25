@@ -7,6 +7,7 @@ use egui::{Align2, Color32, Sense, Stroke, pos2, vec2};
 use serde_json::{Value, json};
 use soundcraft_model::{Speaker, TrackKind};
 
+pub mod device_rate;
 pub mod missing_plugins;
 pub mod plugin_scanner;
 pub mod update;
@@ -33,6 +34,8 @@ pub struct ExtraState {
     pub update: update::UpdateChecker,
     /// Substitutes picked for an imported session's missing plugins.
     pub missing_plugins: missing_plugins::MissingPluginsState,
+    /// The 44.1 kHz session on a 48 kHz device prompt.
+    pub device_rate: device_rate::DeviceRatePrompt,
 }
 
 impl Default for ExtraState {
@@ -51,6 +54,7 @@ impl Default for ExtraState {
             plugin_scanner: plugin_scanner::PluginScanner::default(),
             update: update::UpdateChecker::default(),
             missing_plugins: missing_plugins::MissingPluginsState::default(),
+            device_rate: device_rate::DeviceRatePrompt::default(),
         }
     }
 }
@@ -79,6 +83,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     plugin_scanner::window(app, ctx);
     update::window(app, ctx);
     missing_plugins::window(app, ctx);
+    device_rate::window(app, ctx);
 }
 
 fn apply_customization(app: &mut SoundApp, ctx: &egui::Context) {

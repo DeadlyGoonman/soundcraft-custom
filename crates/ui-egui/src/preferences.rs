@@ -251,6 +251,21 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
                 });
             });
             note(ui, "Recordings are WAV files. 32-bit float keeps every level above full scale; 16 and 24-bit are smaller but clip above full scale.");
+            ui.horizontal(|ui| {
+                use soundcraft_engine::device_rate::RatePolicy;
+                let label = |p: RatePolicy| match p {
+                    RatePolicy::Ask => "Ask",
+                    RatePolicy::AlwaysSwitch => "Switch the device to 44.1 kHz",
+                    RatePolicy::AlwaysKeep => "Keep 48 kHz",
+                };
+                ui.label("44.1 kHz session on a 48 kHz device");
+                let policy = &mut app.ui.device_rate_policy;
+                egui::ComboBox::from_id_salt("prefs_device_rate").selected_text(label(*policy)).show_ui(ui, |ui| {
+                    for p in [RatePolicy::Ask, RatePolicy::AlwaysSwitch, RatePolicy::AlwaysKeep] {
+                        ui.selectable_value(policy, p, label(p));
+                    }
+                });
+            });
             open_button(app, ui, "Open Playback Engine…", "window.playback_engine");
             open_button(app, ui, "Open I/O Setup…", "window.io_setup");
         }
