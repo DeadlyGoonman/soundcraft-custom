@@ -1071,8 +1071,15 @@ fn move_to_adjacent_track(e: &mut Engine, p: &Value) -> Result<Value> {
     for t in from {
         let at = rows.iter().position(|r| r.id == t.id).unwrap_or(0);
         let fits = |d: &&&soundcraft_model::Track| d.kind.has_playlist() && (d.kind == t.kind || d.kind.is_midi() && t.kind.is_midi());
-        let to = if down { rows.iter().skip(at + 1).find(fits) } else { rows.iter().take(at).rev().find(fits) };
-        let to = to.ok_or_else(|| bad(ID, format!("no track {} “{}” that can hold its clips", if down { "below" } else { "above" }, t.name)))?;
+        // Moving never covers another clip: a track with a clip where the moved ones would land
+        // is passed over for the next one with room.
+        let moving: Vec<(Samples, Samples)> = t.clips().iter().filter(|c| ids.contains(&c.id)).map(|c| (c.start, c.end())).collect();
+        let room =
+            |d: &&&soundcraft_model::Track| !d.clips().iter().any(|c| !ids.contains(&c.id) && moving.iter().any(|&(a, b)| c.start < b && a < c.end()));
+        let to = if down { rows.iter().skip(at + 1).filter(fits).find(room) } else { rows.iter().take(at).rev().filter(fits).find(room) };
+        let to = to.ok_or_else(|| {
+            bad(ID, format!("no track {} “{}” with room for its clips (moving never covers another clip)", if down { "below" } else { "above" }, t.name))
+        })?;
         dest.push((t.id, to.id));
     }
     let shuffle = s.edit.edit_mode == EditMode::Shuffle;
@@ -1392,6 +1399,22 @@ mod tests {
         assert_eq!((moved.length, moved.gain_db, moved.fade_in), (clip.length, clip.gain_db, clip.fade_in));
         assert_eq!(e.session().edit.selected_clips, vec![a]);
         assert!(e.undo());
+        assert_eq!(e.session(), &before);
+    }
+
+    #[test]
+    fn shift_down_never_covers_a_clip_and_skips_to_a_track_with_room() {
+        let (mut e, t, [a, ..]) = lanes();
+        let s = e.session_mut();
+        let src = s.sources.first().map(|x| x.id).unwrap();
+        let c = s.new_clip_id();
+        ops::place_clip(s, t[2], Clip::audio(c, "c", src, 0, 2_000, 2_000));
+        e.execute("clip.move_to_adjacent_track", &json!({"clips": [a.0], "direction": "down"})).unwrap();
+        assert_eq!(on(&e, a), (t[3], 1_000), "Audio 2 has a clip under it: lands on Audio 3");
+        assert_eq!(on(&e, c), (t[2], 2_000), "the clip on Audio 2 is untouched");
+        assert_eq!(e.session().find_clip(c).unwrap().1.length, 2_000);
+        let before = e.session().clone();
+        assert!(e.execute("clip.move_to_adjacent_track", &json!({"clips": [a.0], "direction": "down"})).is_err());
         assert_eq!(e.session(), &before);
     }
 
