@@ -1,6 +1,6 @@
-//! FL Studio project (`.flp`) import: the audio clips on the playlist (their track, where they sit,
-//! and their sample), the sample files, and the project tempo. Volume, pan, clip trims, patterns,
-//! automation and plugins are not read yet.
+//! FL Studio project (`.flp`) import: the audio clips on the playlist (their sample and where they
+//! sit), the mixer strips they route to with their plugin chains, the sample files, and the project
+//! tempo. Volume, pan, clip trims, patterns, automation and plugin settings are not read yet.
 //!
 //! The file is an `FLhd` header (format, channel count, PPQ) then an `FLdt` chunk: a stream of
 //! events. Ids `0x00-0x3F` carry a u8, `0x40-0x7F` a u16, `0x80-0xBF` a u32, and `0xC0-0xFF` a
@@ -9,10 +9,16 @@
 //! The record layout follows easyflp's `FORMAT.md` (MIT, mjkzy/easyflp), checked against an FL
 //! Studio 26.1.7 project. Clip records are 88 bytes in FL 26, 80 in FL 25, and 60 in FL 21-24; their
 //! first 16 bytes are the same in each. Tracks are stored reversed: lane 499 is track 1.
+//!
+//! Mixer: each strip's name comes before its insert block (`0xEC`), then up to ten slots, each a
+//! plugin name (`0xC9`), its state (`0xD5`), and a slot index (`0x62`). A hosted plugin shows as
+//! "Fruity Wrapper"; its state holds the plugin's own name, path and id as chunks. Strip 0 is the
+//! master. A channel's route (`0x68`) is the strip its audio goes to.
 
 use crate::io::{add_source, read_file};
+use crate::ptx::{MissingPlugin, installed_match, installed_plugins};
 use crate::{Engine, EngineError, Result};
-use soundcraft_model::{ChannelFormat, Clip, Session, SourceId, TrackId, TrackKind};
+use soundcraft_model::{ChannelFormat, Clip, Insert, Session, SourceId, TrackId, TrackKind};
 use soundcraft_time::{SampleRate, TICKS_PER_QUARTER};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -20,20 +26,31 @@ use std::path::{Path, PathBuf};
 /// Events read here (see `FORMAT.md` for the rest).
 const VERSION: u8 = 199;
 const CHANNEL: u8 = 64;
+const ROUTE: u8 = 104;
 const SAMPLE_PATH: u8 = 196;
 const CHANNEL_NAME: u8 = 203;
 const TEMPO: u8 = 156;
 const PLAYLIST: u8 = 233;
+const STRIP_NAME: u8 = 204;
+const STRIP: u8 = 236;
+const PLUGIN: u8 = 201;
+const PLUGIN_STATE: u8 = 213;
+const SLOT: u8 = 98;
+
+/// The name a hosted plugin's state is filed under.
+const WRAPPER: &str = "Fruity Wrapper";
 
 /// Lanes are stored as `LANES - track`.
 const LANES: u16 = 500;
 
 /// One channel of the channel rack, in the order the file lists them (its index is what playlist
 /// items name). A sampler channel has a sample path; other kinds (plugins, layers) have none.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Channel {
     pub name: String,
     pub path: String,
+    /// The mixer strip its audio routes to.
+    pub strip: Option<u16>,
 }
 
 /// An audio clip on the playlist. Positions and lengths are in project ticks (at the file's PPQ).
@@ -47,6 +64,22 @@ pub struct FlpClip {
     pub channel: usize,
 }
 
+/// A mixer insert slot's plugin: its name (for a hosted plugin, the plugin's own) and, when the
+/// state gives one, its id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plugin {
+    pub slot: usize,
+    pub name: String,
+    pub id: Option<String>,
+}
+
+/// A mixer strip: its name and the plugins in its insert slots, in slot order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Strip {
+    pub name: String,
+    pub plugins: Vec<Plugin>,
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct Flp {
     pub version: String,
@@ -54,6 +87,8 @@ pub struct Flp {
     /// BPM, when the file stores one.
     pub tempo: Option<f64>,
     pub channels: Vec<Channel>,
+    /// Mixer strips, in the order the file lists them (strip 0 is the master).
+    pub strips: Vec<Strip>,
     pub clips: Vec<FlpClip>,
     /// Playlist items that are not audio clips (patterns, automation), left out.
     pub other_items: usize,
@@ -134,17 +169,62 @@ fn envelope(b: &[u8]) -> std::result::Result<(u16, Vec<(u8, &[u8])>), String> {
     Ok((ppq, events))
 }
 
-/// Reads an FL Studio project's channels, tempo and playlist clips.
+/// The name a file path names, without its extension.
+fn stem(path: &str) -> &str {
+    let name = file_name(path);
+    name.rsplit_once('.').map_or(name, |(s, _)| s)
+}
+
+/// A hosted plugin's identity from its state chunks: its path's name (else its short name), and
+/// its id as the plugin scan lists it (`clap:<id>` from chunk 58, or `vst3:<class id in hex>` from
+/// chunk 52, the 16-byte VST3 class id). Chunk 54 is the short name, 55 the path. `None` when the
+/// state has no name.
+fn wrapped(b: &[u8]) -> Option<(String, Option<String>)> {
+    let (mut short, mut path, mut clap, mut class) = (None, None, None, None);
+    let mut at: usize = 4;
+    while let Some(head) = b.get(at..at.checked_add(12)?) {
+        let chunk = le_u32(head)?;
+        let len = usize::try_from(u64::from_le_bytes(head.get(4..12)?.try_into().ok()?)).ok()?;
+        let start = at + 12;
+        let data = b.get(start..start.checked_add(len)?)?;
+        match chunk {
+            52 => class = Some(data),
+            54 => short = Some(ascii(data)),
+            55 => path = Some(ascii(data)),
+            58 => clap = Some(ascii(data)),
+            _ => {}
+        }
+        at = start + len;
+    }
+    let name = path.as_deref().map(stem).filter(|s| !s.is_empty()).map(str::to_string).or(short)?;
+    let id = match (clap, class) {
+        (Some(c), _) if !c.is_empty() => Some(format!("clap:{c}")),
+        (_, Some(c)) if c.len() == 16 => Some(format!("vst3:{}", c.iter().map(|b| format!("{b:02X}")).collect::<String>())),
+        _ => None,
+    };
+    Some((name, id))
+}
+
+/// Reads an FL Studio project's channels, mixer strips, tempo and playlist clips.
 pub fn parse(b: &[u8]) -> std::result::Result<Flp, String> {
     let (ppq, events) = envelope(b)?;
     let mut flp = Flp { ppq, ..Flp::default() };
     let mut channels: Vec<Channel> = Vec::new();
+    let mut strips: Vec<Strip> = Vec::new();
+    let mut strip_name: Option<String> = None;
+    let mut pending: Option<Plugin> = None;
+    let mut slot = 0usize;
     let mut playlist: Option<&[u8]> = None;
     for (id, data) in events {
         match id {
             VERSION => flp.version = ascii(data),
             TEMPO => flp.tempo = le_u32(data).map(|t| f64::from(t) / 1000.0),
-            CHANNEL => channels.push(Channel { name: String::new(), path: String::new() }),
+            CHANNEL => channels.push(Channel::default()),
+            ROUTE => {
+                if let Some(c) = channels.last_mut() {
+                    c.strip = le_u16(data);
+                }
+            }
             SAMPLE_PATH => {
                 if let Some(c) = channels.last_mut().filter(|c| c.path.is_empty()) {
                     c.path = text(data);
@@ -155,11 +235,32 @@ pub fn parse(b: &[u8]) -> std::result::Result<Flp, String> {
                     c.name = text(data);
                 }
             }
+            STRIP_NAME => strip_name = Some(text(data)),
+            STRIP => {
+                strips.push(Strip { name: strip_name.take().unwrap_or_default(), plugins: Vec::new() });
+                slot = 0;
+            }
+            PLUGIN if !strips.is_empty() => pending = Some(Plugin { slot, name: text(data), id: None }),
+            PLUGIN_STATE => {
+                if let Some(p) = pending.as_mut().filter(|p| p.name == WRAPPER)
+                    && let Some((name, plugin_id)) = wrapped(data)
+                {
+                    p.name = name;
+                    p.id = plugin_id;
+                }
+            }
+            SLOT if !strips.is_empty() => {
+                if let (Some(p), Some(strip)) = (pending.take(), strips.last_mut()) {
+                    strip.plugins.push(p);
+                }
+                slot += 1;
+            }
             PLAYLIST => playlist = playlist.or(Some(data)),
             _ => {}
         }
     }
     flp.channels = channels;
+    flp.strips = strips;
     let Some(items) = playlist else { return Ok(flp) };
     let size = record_size(&flp.version)?;
     if items.len() % size != 0 {
@@ -183,11 +284,11 @@ pub fn parse(b: &[u8]) -> std::result::Result<Flp, String> {
 /// in the project's folder and its `Audio` and `Samples` folders (FL Studio stores paths that moved).
 fn find_sample(folder: &Path, sample: &str) -> Option<PathBuf> {
     let absolute = Path::new(sample);
-    if absolute.is_absolute() && absolute.is_file() && crate::file_access::check_read(absolute).is_ok() {
+    if absolute.is_absolute() && crate::io::file_found(absolute) {
         return Some(absolute.to_path_buf());
     }
     let base = file_name(sample);
-    [folder.to_path_buf(), folder.join("Audio"), folder.join("Samples")].into_iter().map(|d| d.join(base)).find(|p| p.is_file())
+    [folder.to_path_buf(), folder.join("Audio"), folder.join("Samples")].into_iter().map(|d| d.join(base)).find(|p| crate::io::file_found(p))
 }
 
 fn file_name(path: &str) -> &str {
@@ -210,9 +311,50 @@ fn load_sample(s: &mut Session, folder: &Path, sample: &str, rate_set: &mut bool
     Some(add_source(s, &stem, buf, Some(&file.to_string_lossy()), info.format))
 }
 
-/// Opens an FL Studio project as a new, unsaved session: one audio track per FL track that holds a
-/// clip, each clip placed where the playlist has it, and the project tempo. Returns the samples
-/// it could not find.
+/// Lane for each span (sorted by start): the first lane free at its start, so clips that overlap
+/// go on different lanes and none is cut.
+fn assign_lanes(spans: &[(i64, i64)]) -> Vec<usize> {
+    let mut ends: Vec<i64> = Vec::new();
+    spans
+        .iter()
+        .map(|&(start, end)| match ends.iter().position(|&e| e <= start) {
+            Some(lane) => {
+                ends[lane] = end;
+                lane
+            }
+            None => {
+                ends.push(end);
+                ends.len() - 1
+            }
+        })
+        .collect()
+}
+
+/// Puts a strip's plugins in its track's insert slots, matched to installed plugins by id, then by
+/// name. A plugin with no installed match is listed as missing, with its slot.
+fn place_chain(s: &mut Session, track: TrackId, plugins: &[Plugin], installed: &[(String, String)], missing: &mut Vec<MissingPlugin>) {
+    for p in plugins {
+        let matched =
+            p.id.as_ref().filter(|id| installed.iter().any(|(i, _)| i == *id)).cloned().or_else(|| installed_match(&p.name, installed, true));
+        match matched {
+            Some(id) => {
+                if let Some(cell) = s.track_mut(track).and_then(|t| t.mixer.inserts.get_mut(p.slot))
+                    && cell.is_none()
+                {
+                    *cell = Some(Insert::new(id));
+                }
+            }
+            None => match missing.iter_mut().find(|m| m.name == p.name) {
+                Some(m) => m.targets.push((track, Some(p.slot))),
+                None => missing.push(MissingPlugin { name: p.name.clone(), targets: vec![(track, Some(p.slot))] }),
+            },
+        }
+    }
+}
+
+/// Opens an FL Studio project as a new, unsaved session: one audio track per mixer strip (more
+/// where clips overlap, as lanes), each strip's plugin chain on its tracks, the clips where the
+/// playlist has them, and the project tempo. Returns the samples it could not find.
 pub fn open_flp(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     let flp = parse(&read_file(path)?).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
     if flp.clips.is_empty() {
@@ -221,7 +363,8 @@ pub fn open_flp(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     let folder = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
     let name = Path::new(path).file_stem().map_or_else(|| "FL Studio Project".into(), |n| n.to_string_lossy().into_owned());
     let mut s = Session { name, ..Session::default() };
-    let mut missing = Vec::new();
+    let mut missing_media: Vec<String> = Vec::new();
+    let mut missing_plugins: Vec<MissingPlugin> = Vec::new();
     let mut rate_set = false;
     let mut sources: HashMap<usize, Option<SourceId>> = HashMap::new();
     let mut used: Vec<usize> = flp.clips.iter().map(|c| c.channel).collect();
@@ -231,7 +374,7 @@ pub fn open_flp(e: &mut Engine, path: &str) -> Result<Vec<String>> {
         let Some(sample) = flp.channels.get(ch).map(|c| c.path.clone()) else { continue };
         let loaded = load_sample(&mut s, &folder, &sample, &mut rate_set);
         if loaded.is_none() {
-            missing.push(format!("{} (channel {ch})", file_name(&sample)));
+            missing_media.push(format!("{} (channel {ch})", file_name(&sample)));
         }
         sources.insert(ch, loaded);
     }
@@ -242,35 +385,90 @@ pub fn open_flp(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     }
     let sr = s.sample_rate;
     let ppq = i64::from(flp.ppq.max(1));
-    let mut tracks: BTreeMap<u16, TrackId> = BTreeMap::new();
-    let mut placed = 0usize;
-    for clip in &flp.clips {
-        let Some(Some(src)) = sources.get(&clip.channel).copied() else { continue };
-        let Some(channel) = flp.channels.get(clip.channel) else { continue };
-        let label = if channel.name.is_empty() { file_name(&channel.path).to_string() } else { channel.name.clone() };
-        let track = *tracks
-            .entry(clip.track)
-            .or_insert_with(|| s.add_track(TrackKind::Audio, ChannelFormat::for_channels(1), Some(&format!("Track {}", clip.track))));
-        let tick = |t: i64| t.saturating_mul(TICKS_PER_QUARTER) / ppq;
+    let tick = |t: i64| t.saturating_mul(TICKS_PER_QUARTER) / ppq;
+
+    // Clips by strip, in time order: (start, end, clip index). A clip with no sample or no strip
+    // is left out.
+    let mut by_strip: BTreeMap<usize, Vec<(i64, i64, usize)>> = BTreeMap::new();
+    let mut unrouted = 0usize;
+    for (i, clip) in flp.clips.iter().enumerate() {
+        if !sources.get(&clip.channel).is_some_and(Option::is_some) {
+            continue;
+        }
+        let Some(strip) = flp.channels.get(clip.channel).and_then(|c| c.strip) else {
+            unrouted += 1;
+            continue;
+        };
         let start = s.tempo.tick_to_samples(tick(clip.position), sr);
         let end = s.tempo.tick_to_samples(tick(clip.position.saturating_add(clip.length)), sr);
-        let id = s.new_clip_id();
-        crate::edit::place_clip(&mut s, track, Clip::audio(id, label, src, 0, start, end.saturating_sub(start).max(1)));
-        placed += 1;
+        by_strip.entry(usize::from(strip)).or_default().push((start, end, i));
+    }
+    let installed = installed_plugins();
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut placed = 0usize;
+    let mut track_count = 0usize;
+    let mut master_clips = false;
+    for (strip_index, mut clips) in by_strip {
+        clips.sort_unstable();
+        let spans: Vec<(i64, i64)> = clips.iter().map(|&(start, end, _)| (start, end)).collect();
+        let lanes = assign_lanes(&spans);
+        let lane_count = lanes.iter().copied().max().map_or(0, |m| m + 1);
+        let base = match flp.strips.get(strip_index) {
+            Some(st) if st.name.is_empty() => format!("Strip {strip_index}"),
+            Some(st) => st.name.clone(),
+            None => format!("Strip {strip_index}"),
+        };
+        let mut lane_tracks: Vec<TrackId> = Vec::with_capacity(lane_count);
+        for lane in 0..lane_count {
+            let mut label = if lane == 0 { base.clone() } else { format!("{base} {}", lane + 1) };
+            // Strips can share a name ("lib rec" twice): the later one says which strip it is.
+            if !names.insert(label.clone()) {
+                label = format!("{label} (strip {strip_index})");
+                names.insert(label.clone());
+            }
+            let id = s.add_track(TrackKind::Audio, ChannelFormat::for_channels(1), Some(&label));
+            track_count += 1;
+            // The master's chain is the session's own; FL's master plugins are not moved over.
+            if strip_index == 0 {
+                master_clips = true;
+            } else if let Some(st) = flp.strips.get(strip_index) {
+                place_chain(&mut s, id, &st.plugins, &installed, &mut missing_plugins);
+            }
+            lane_tracks.push(id);
+        }
+        for ((start, end, clip_index), lane) in clips.into_iter().zip(lanes) {
+            let Some(clip) = flp.clips.get(clip_index) else { continue };
+            let Some(Some(src)) = sources.get(&clip.channel).copied() else { continue };
+            let Some(channel) = flp.channels.get(clip.channel) else { continue };
+            let label = if channel.name.is_empty() { file_name(&channel.path).to_string() } else { channel.name.clone() };
+            let Some(&track) = lane_tracks.get(lane) else { continue };
+            let id = s.new_clip_id();
+            crate::edit::place_clip(&mut s, track, Clip::audio(id, label, src, 0, start, end.saturating_sub(start).max(1)));
+            placed += 1;
+        }
     }
     s.folder = Some(folder);
     e.replace_session(s);
     e.path = None;
-    e.missing_plugins = Vec::new();
+    e.missing_plugins = missing_plugins.clone();
     let tempo = flp.tempo.map_or_else(|| "no tempo in the file".to_string(), |bpm| format!("tempo {bpm} BPM"));
-    e.message(format!("FL Studio {} project: {placed} clips on {} tracks, {tempo}", flp.version, tracks.len()));
+    e.message(format!("FL Studio {} project: {placed} clips on {track_count} tracks, {tempo}", flp.version));
+    if master_clips {
+        e.message("clips routed to the FL master: their plugins are not imported (the session master is used)".to_string());
+    }
     if flp.other_items > 0 {
         e.message(format!("{} playlist items are patterns or automation and were not imported", flp.other_items));
     }
-    for m in &missing {
+    if unrouted > 0 {
+        e.message(format!("{unrouted} clips have no mixer route and were not imported"));
+    }
+    for m in &missing_plugins {
+        e.message(format!("plugin not installed: {}", m.name));
+    }
+    for m in &missing_media {
         e.message(format!("missing media: {m}"));
     }
-    Ok(missing)
+    Ok(missing_media)
 }
 
 #[cfg(test)]
@@ -337,6 +535,36 @@ mod tests {
         project("26.1.7.5653", &body)
     }
 
+    /// A hosted plugin's state: version 12, then chunks (id u32, length u64, data).
+    fn wrapper_state(chunks: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut out = 12u32.to_le_bytes().to_vec();
+        for (id, data) in chunks {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    /// A mixer strip with a native plugin in slot 0 and a hosted FabFilter Pro-Q 4 in slot 1.
+    fn strip_body(name: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        event(&mut body, STRIP_NAME, &utf16(name));
+        event(&mut body, STRIP, &[]);
+        event(&mut body, PLUGIN, &utf16("Fruity Soft Clipper"));
+        event(&mut body, PLUGIN_STATE, &[8, 0, 0, 0, 0, 0, 0, 0]);
+        event(&mut body, SLOT, &0u16.to_le_bytes());
+        event(&mut body, PLUGIN, &utf16(WRAPPER));
+        let state = wrapper_state(&[
+            (54, b"Pro-Q 4"),
+            (55, b"C:\\Program Files\\Common Files\\CLAP\\FabFilter\\FabFilter Pro-Q 4.clap"),
+            (58, b"com.FabFilter.Pro-Q.4"),
+        ]);
+        event(&mut body, PLUGIN_STATE, &state);
+        event(&mut body, SLOT, &1u16.to_le_bytes());
+        body
+    }
+
     #[test]
     fn reads_tempo_channels_and_clips() {
         let flp = parse(&sample_project("C:\\Samples\\kick.wav")).unwrap();
@@ -344,7 +572,7 @@ mod tests {
         assert_eq!(flp.ppq, 96);
         assert_eq!(flp.tempo, Some(134.0));
         assert_eq!(flp.channels.len(), 2);
-        assert_eq!(flp.channels[0], Channel { name: "Kick".into(), path: "C:\\Samples\\kick.wav".into() });
+        assert_eq!(flp.channels[0], Channel { name: "Kick".into(), path: "C:\\Samples\\kick.wav".into(), strip: None });
         // Channel 1 has no sample, so its item is counted, not imported.
         assert_eq!(flp.other_items, 1);
         assert_eq!(
@@ -359,6 +587,57 @@ mod tests {
         let flp = parse(&sample_project(&long)).unwrap();
         assert_eq!(flp.channels[0].path, long);
         assert_eq!(flp.clips.len(), 2);
+    }
+
+    #[test]
+    fn reads_strips_plugins_and_routes() {
+        let mut body = Vec::new();
+        event(&mut body, CHANNEL, &0u16.to_le_bytes());
+        event(&mut body, ROUTE, &1u16.to_le_bytes());
+        event(&mut body, CHANNEL_NAME, &utf16("Vox"));
+        event(&mut body, SAMPLE_PATH, &utf16("C:\\Samples\\vox.wav"));
+        event(&mut body, PLAYLIST, &clip_record(0, 0, 96, 499));
+        body.extend(strip_body("Master"));
+        body.extend(strip_body("Vox 1"));
+        let flp = parse(&project("26.1.7.5653", &body)).unwrap();
+        assert_eq!(flp.channels[0].strip, Some(1));
+        assert_eq!(flp.strips.len(), 2);
+        assert_eq!(flp.strips[1].name, "Vox 1");
+        assert_eq!(flp.strips[1].plugins[0], Plugin { slot: 0, name: "Fruity Soft Clipper".into(), id: None });
+        assert_eq!(flp.strips[1].plugins[1], Plugin { slot: 1, name: "FabFilter Pro-Q 4".into(), id: Some("clap:com.FabFilter.Pro-Q.4".into()) });
+    }
+
+    #[test]
+    fn a_vst3_plugin_is_named_by_its_class_id() {
+        let state = wrapper_state(&[(52, b"NTSVHSsS1 imager"), (54, b"WaveShell1-VST3 17.1_x64"), (55, b"C:\\VST3\\WaveShell1-VST3 17.1_x64.vst3")]);
+        assert_eq!(wrapped(&state), Some(("WaveShell1-VST3 17.1_x64".into(), Some("vst3:4E545356485373533120696D61676572".into()))));
+        // A state with no chunks, or one cut short, gives no identity.
+        assert_eq!(wrapped(&12u32.to_le_bytes()), None);
+        assert_eq!(wrapped(&state[..state.len() - 5]), None);
+    }
+
+    #[test]
+    fn plugins_are_placed_by_id_and_unmatched_ones_listed() {
+        let mut s = Session::default();
+        let track = s.add_track(TrackKind::Audio, ChannelFormat::for_channels(1), Some("rec"));
+        let installed = vec![("clap:com.FabFilter.Pro-Q.4".to_string(), "Pro-Q 4".to_string()), ("vst3:AB".to_string(), "Other".to_string())];
+        let plugins = vec![
+            Plugin { slot: 0, name: "Fruity Soft Clipper".into(), id: None },
+            Plugin { slot: 1, name: "FabFilter Pro-Q 4".into(), id: Some("clap:com.FabFilter.Pro-Q.4".into()) },
+        ];
+        let mut missing = Vec::new();
+        place_chain(&mut s, track, &plugins, &installed, &mut missing);
+        let inserts = &s.track(track).unwrap().mixer.inserts;
+        assert!(inserts[0].is_none());
+        assert_eq!(inserts[1].as_ref().map(|i| i.plugin.as_str()), Some("clap:com.FabFilter.Pro-Q.4"));
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].name, "Fruity Soft Clipper");
+        assert_eq!(missing[0].targets, vec![(track, Some(0))]);
+    }
+
+    #[test]
+    fn overlapping_clips_go_on_separate_lanes() {
+        assert_eq!(assign_lanes(&[(0, 10), (5, 15), (10, 20), (12, 14)]), vec![0, 1, 0, 2]);
     }
 
     #[test]
@@ -385,6 +664,11 @@ mod tests {
     fn reads_a_project_from_the_environment() {
         let Ok(path) = std::env::var("SOUNDCRAFT_FLP") else { return };
         let flp = parse(&std::fs::read(path).unwrap()).unwrap();
-        println!("{} clips, {} channels, tempo {:?}", flp.clips.len(), flp.channels.len(), flp.tempo);
+        println!("{} clips, {} channels, {} strips, tempo {:?}", flp.clips.len(), flp.channels.len(), flp.strips.len(), flp.tempo);
+        for (i, strip) in flp.strips.iter().enumerate() {
+            for p in &strip.plugins {
+                println!("strip {i} {:?} slot {} {} {:?}", strip.name, p.slot, p.name, p.id);
+            }
+        }
     }
 }

@@ -19,7 +19,7 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 |---|---|---|---|---|
 | Pro Tools session `.ptx` (and `.ptf` from 7–9) | native | ❌ | ❌ | Proprietary, undocumented. Owner decision needed on black-box format study (G-03) |
 | Session templates `.ptxt` | read/write | ❌ | ❌ | We have no templates at all (G-16) |
-| FL Studio project `.flp` | n/a (other DAW) | partial | ❌ | `crates/engine/src/flp.rs`. Reads FL 21–26 arrangement audio clips, their tracks and positions, sample files (found beside the project in `Samples/` or `Audio/`), and tempo. Not read yet: volume, pan, clip trims, patterns, MIDI, automation, plugins. Layout from easyflp's FORMAT.md (MIT, reference only); checked on one FL 26.1.7 project |
+| FL Studio project `.flp` | n/a (other DAW) | partial | ❌ | `crates/engine/src/flp.rs`. Reads FL 21–26 arrangement audio clips, sample files (found beside the project in `Samples/` or `Audio/`), tempo, and the mixer: one track per mixer strip the clips route to (extra lanes where clips overlap), each carrying the strip's plugin chain matched to installed plugins by CLAP or VST3 id, at default settings. Not read yet: plugin settings, native Fruity plugins (listed as missing), volume, pan, clip trims, patterns, MIDI, automation. Layout from easyflp's FORMAT.md (MIT, reference only); checked on one FL 26.1.7 project |
 | AAF (Advanced Authoring Format) | import/export | ❌ | ❌ | #40. The post-production handoff from picture editors (G-03) |
 | OMF | import/export | ❌ | ❌ | Legacy, still delivered by some editors |
 | Media Composer–compatible session | export | ❌ | ❌ | AAF variant |
