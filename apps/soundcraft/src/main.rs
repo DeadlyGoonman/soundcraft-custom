@@ -116,7 +116,7 @@ impl eframe::App for App {
 
 fn open_path(app: &mut SoundApp, p: &str) {
     let lower = p.to_ascii_lowercase();
-    let r = if lower.ends_with(".scraft") || lower.ends_with(".ptx") {
+    let r = if lower.ends_with(".scraft") || lower.ends_with(".ptx") || lower.ends_with(".flp") {
         dialogs::run_or_ask(app, "session.open", serde_json::json!({"path": p}))
     } else if lower.ends_with(".mid") || lower.ends_with(".midi") || lower.ends_with(".smf") {
         app.run("file.import_midi", serde_json::json!({"path": p}))
@@ -185,7 +185,7 @@ fn services(ctx: egui::Context) -> Services {
         pick_open: Some(Box::new(|purpose: &str, _exts: &[&str]| {
             let d = rfd::FileDialog::new();
             let d = match purpose {
-                "session.open" => d.add_filter("Sessions", &["scraft", "ptx"]),
+                "session.open" => d.add_filter("Sessions", &["scraft", "ptx", "flp"]),
                 "session.new_from_template" => d.add_filter("SoundCraft Session", &["scraft"]),
                 "file.import_midi" => d.add_filter("MIDI", &["mid", "midi", "smf"]),
                 _ => d.add_filter(

@@ -13,14 +13,16 @@
 //! Mixer: each strip's name comes before its insert block (`0xEC`), then up to ten slots, each a
 //! plugin name (`0xC9`), its state (`0xD5`), and a slot index (`0x62`). A hosted plugin shows as
 //! "Fruity Wrapper"; its state holds the plugin's own name, path and id as chunks. Strip 0 is the
-//! master. A channel's route (`0x68`) is the strip its audio goes to.
+//! master. A channel's route (`0x68`) is the strip its audio goes to. A strip's route table
+//! (`0xEB`, after its slots) has one byte per strip, trimmed after the last one: nonzero means the
+//! strip's audio is sent to that strip (0 is the master). Send levels are not read yet.
 
 use crate::io::{add_source, read_file};
 use crate::ptx::{MissingPlugin, installed_match, installed_plugins};
 use crate::{Engine, EngineError, Result};
-use soundcraft_model::{ChannelFormat, Clip, Insert, Session, SourceId, TrackId, TrackKind};
+use soundcraft_model::{BusId, ChannelFormat, Clip, Insert, Route, SendSlot, Session, SourceId, TrackId, TrackKind};
 use soundcraft_time::{SampleRate, TICKS_PER_QUARTER};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Events read here (see `FORMAT.md` for the rest).
@@ -36,6 +38,7 @@ const STRIP: u8 = 236;
 const PLUGIN: u8 = 201;
 const PLUGIN_STATE: u8 = 213;
 const SLOT: u8 = 98;
+const ROUTES: u8 = 235;
 
 /// The name a hosted plugin's state is filed under.
 const WRAPPER: &str = "Fruity Wrapper";
@@ -78,6 +81,8 @@ pub struct Plugin {
 pub struct Strip {
     pub name: String,
     pub plugins: Vec<Plugin>,
+    /// The strips (0 is the master) this strip's audio is sent to.
+    pub routes: Vec<usize>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -237,7 +242,7 @@ pub fn parse(b: &[u8]) -> std::result::Result<Flp, String> {
             }
             STRIP_NAME => strip_name = Some(text(data)),
             STRIP => {
-                strips.push(Strip { name: strip_name.take().unwrap_or_default(), plugins: Vec::new() });
+                strips.push(Strip { name: strip_name.take().unwrap_or_default(), ..Strip::default() });
                 slot = 0;
             }
             PLUGIN if !strips.is_empty() => pending = Some(Plugin { slot, name: text(data), id: None }),
@@ -254,6 +259,11 @@ pub fn parse(b: &[u8]) -> std::result::Result<Flp, String> {
                     strip.plugins.push(p);
                 }
                 slot += 1;
+            }
+            ROUTES => {
+                if let Some(strip) = strips.last_mut() {
+                    strip.routes = data.iter().enumerate().filter(|(_, b)| **b != 0).map(|(i, _)| i).collect();
+                }
             }
             PLAYLIST => playlist = playlist.or(Some(data)),
             _ => {}
@@ -352,6 +362,66 @@ fn place_chain(s: &mut Session, track: TrackId, plugins: &[Plugin], installed: &
     }
 }
 
+/// The strips that matter: those clips play into and every strip they send on to, with the ones
+/// some strip sends into (the master aside), which need an aux of their own.
+fn reachable(strips: &[Strip], with_clips: &BTreeSet<usize>) -> (BTreeSet<usize>, BTreeSet<usize>) {
+    let mut all: BTreeSet<usize> = with_clips.iter().copied().filter(|&i| i != 0).collect();
+    let mut receivers = BTreeSet::new();
+    let mut todo: Vec<usize> = all.iter().copied().collect();
+    while let Some(i) = todo.pop() {
+        for &t in strips.get(i).map_or(&[][..], |st| &st.routes[..]) {
+            if t != 0 && t != i && t < strips.len() {
+                receivers.insert(t);
+                if all.insert(t) {
+                    todo.push(t);
+                }
+            }
+        }
+    }
+    (all, receivers)
+}
+
+/// A unique name for each strip: its own, or "Strip N"; a repeat gets its number appended.
+fn strip_labels(strips: &[Strip], order: &BTreeSet<usize>) -> HashMap<usize, String> {
+    let mut used = HashSet::new();
+    order
+        .iter()
+        .map(|&i| {
+            let name = strips.get(i).map(|st| st.name.as_str()).filter(|n| !n.is_empty());
+            let base = match (name, i) {
+                (Some(n), _) => n.to_string(),
+                (None, 0) => "Master".to_string(),
+                (None, _) => format!("Strip {i}"),
+            };
+            let label = if used.insert(base.clone()) { base } else { format!("{base} (strip {i})") };
+            used.insert(label.clone());
+            (i, label)
+        })
+        .collect()
+}
+
+/// Sends the tracks carrying a strip where FL sends the strip: to the master it is the main output;
+/// otherwise the first target is the output and any others are sends (at unity). A strip with no
+/// routes plays nowhere, as in FL.
+fn route_out(s: &mut Session, carriers: &[TrackId], routes: &[usize], buses: &HashMap<usize, BusId>) {
+    let others: Vec<Route> = routes.iter().filter(|&&t| t != 0).filter_map(|t| buses.get(t)).map(|&b| Route::Bus(b)).collect();
+    let (output, sends) = if routes.contains(&0) {
+        (Route::Main, others.as_slice())
+    } else {
+        match others.split_first() {
+            Some((first, rest)) => (first.clone(), rest),
+            None => (Route::None, &[][..]),
+        }
+    };
+    for &id in carriers {
+        let Some(t) = s.track_mut(id) else { continue };
+        t.mixer.output = output.clone();
+        for (slot, target) in t.mixer.sends.iter_mut().zip(sends) {
+            *slot = Some(SendSlot::new(target.clone()));
+        }
+    }
+}
+
 /// Opens an FL Studio project as a new, unsaved session: one audio track per mixer strip (more
 /// where clips overlap, as lanes), each strip's plugin chain on its tracks, the clips where the
 /// playlist has them, and the project tempo. Returns the samples it could not find.
@@ -404,35 +474,61 @@ pub fn open_flp(e: &mut Engine, path: &str) -> Result<Vec<String>> {
         by_strip.entry(usize::from(strip)).or_default().push((start, end, i));
     }
     let installed = installed_plugins();
-    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let with_clips: BTreeSet<usize> = by_strip.keys().copied().collect();
+    let (wanted, receivers) = reachable(&flp.strips, &with_clips);
+    // The strips to build, in order; the master (strip 0) only when clips play straight into it.
+    let order: BTreeSet<usize> = wanted.iter().copied().chain(with_clips.contains(&0).then_some(0)).collect();
+    let labels = strip_labels(&flp.strips, &order);
+    let mut buses: HashMap<usize, BusId> = HashMap::new();
+    let mut carriers: HashMap<usize, Vec<TrackId>> = HashMap::new();
     let mut placed = 0usize;
     let mut track_count = 0usize;
     let mut master_clips = false;
-    for (strip_index, mut clips) in by_strip {
+    for &strip_index in &order {
+        let Some(label) = labels.get(&strip_index) else { continue };
+        let mut clips = by_strip.remove(&strip_index).unwrap_or_default();
         clips.sort_unstable();
+        // The master's chain is the session's own; FL's master plugins are not moved over.
+        let chain: &[Plugin] = if strip_index == 0 { &[] } else { flp.strips.get(strip_index).map_or(&[], |st| &st.plugins[..]) };
+        // A strip other strips send into, or one with no clips, is an aux carrying the chain, and
+        // its clips play into it. Any other strip keeps its chain on its clip tracks.
+        let aux = strip_index != 0 && (receivers.contains(&strip_index) || clips.is_empty());
+        let mut bus = None;
+        if aux {
+            let b = s.add_bus(label, ChannelFormat::for_channels(2));
+            buses.insert(strip_index, b);
+            bus = Some(b);
+            let id = s.add_track(TrackKind::Aux, ChannelFormat::for_channels(2), Some(label));
+            if let Some(t) = s.track_mut(id) {
+                t.mixer.input = Route::Bus(b);
+            }
+            track_count += 1;
+            place_chain(&mut s, id, chain, &installed, &mut missing_plugins);
+            carriers.insert(strip_index, vec![id]);
+        }
         let spans: Vec<(i64, i64)> = clips.iter().map(|&(start, end, _)| (start, end)).collect();
         let lanes = assign_lanes(&spans);
         let lane_count = lanes.iter().copied().max().map_or(0, |m| m + 1);
-        let base = match flp.strips.get(strip_index) {
-            Some(st) if st.name.is_empty() => format!("Strip {strip_index}"),
-            Some(st) => st.name.clone(),
-            None => format!("Strip {strip_index}"),
-        };
         let mut lane_tracks: Vec<TrackId> = Vec::with_capacity(lane_count);
         for lane in 0..lane_count {
-            let mut label = if lane == 0 { base.clone() } else { format!("{base} {}", lane + 1) };
-            // Strips can share a name ("lib rec" twice): the later one says which strip it is.
-            if !names.insert(label.clone()) {
-                label = format!("{label} (strip {strip_index})");
-                names.insert(label.clone());
-            }
-            let id = s.add_track(TrackKind::Audio, ChannelFormat::for_channels(1), Some(&label));
+            let name = match (aux, lane) {
+                (false, 0) => label.clone(),
+                (false, n) => format!("{label} {}", n + 1),
+                (true, 0) => format!("{label} clips"),
+                (true, n) => format!("{label} clips {}", n + 1),
+            };
+            let id = s.add_track(TrackKind::Audio, ChannelFormat::for_channels(1), Some(&name));
             track_count += 1;
-            // The master's chain is the session's own; FL's master plugins are not moved over.
             if strip_index == 0 {
                 master_clips = true;
-            } else if let Some(st) = flp.strips.get(strip_index) {
-                place_chain(&mut s, id, &st.plugins, &installed, &mut missing_plugins);
+            }
+            match bus {
+                Some(b) => {
+                    if let Some(t) = s.track_mut(id) {
+                        t.mixer.output = Route::Bus(b);
+                    }
+                }
+                None => place_chain(&mut s, id, chain, &installed, &mut missing_plugins),
             }
             lane_tracks.push(id);
         }
@@ -446,13 +542,22 @@ pub fn open_flp(e: &mut Engine, path: &str) -> Result<Vec<String>> {
             crate::edit::place_clip(&mut s, track, Clip::audio(id, label, src, 0, start, end.saturating_sub(start).max(1)));
             placed += 1;
         }
+        if !aux {
+            carriers.insert(strip_index, lane_tracks);
+        }
+    }
+    let mut routed = 0usize;
+    for (&strip_index, tracks) in &carriers {
+        let routes: &[usize] = if strip_index == 0 { &[0] } else { flp.strips.get(strip_index).map_or(&[], |st| &st.routes[..]) };
+        routed += routes.len();
+        route_out(&mut s, tracks, routes, &buses);
     }
     s.folder = Some(folder);
     e.replace_session(s);
     e.path = None;
     e.missing_plugins = missing_plugins.clone();
     let tempo = flp.tempo.map_or_else(|| "no tempo in the file".to_string(), |bpm| format!("tempo {bpm} BPM"));
-    e.message(format!("FL Studio {} project: {placed} clips on {track_count} tracks, {tempo}", flp.version));
+    e.message(format!("FL Studio {} project: {placed} clips, {track_count} tracks, {routed} mixer routes, {tempo}", flp.version));
     if master_clips {
         e.message("clips routed to the FL master: their plugins are not imported (the session master is used)".to_string());
     }
@@ -562,6 +667,7 @@ mod tests {
         ]);
         event(&mut body, PLUGIN_STATE, &state);
         event(&mut body, SLOT, &1u16.to_le_bytes());
+        event(&mut body, ROUTES, &[0, 0, 1]);
         body
     }
 
@@ -603,6 +709,8 @@ mod tests {
         assert_eq!(flp.channels[0].strip, Some(1));
         assert_eq!(flp.strips.len(), 2);
         assert_eq!(flp.strips[1].name, "Vox 1");
+        // The route table byte at position 2 is set: the strip sends to strip 2.
+        assert_eq!(flp.strips[1].routes, vec![2]);
         assert_eq!(flp.strips[1].plugins[0], Plugin { slot: 0, name: "Fruity Soft Clipper".into(), id: None });
         assert_eq!(flp.strips[1].plugins[1], Plugin { slot: 1, name: "FabFilter Pro-Q 4".into(), id: Some("clap:com.FabFilter.Pro-Q.4".into()) });
     }
@@ -633,6 +741,48 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].name, "Fruity Soft Clipper");
         assert_eq!(missing[0].targets, vec![(track, Some(0))]);
+    }
+
+    #[test]
+    fn reachability_follows_routes_and_finds_receivers() {
+        let routed = |routes: &[usize]| Strip { routes: routes.to_vec(), ..Strip::default() };
+        // 0 is the master; 1 sends to 2; 2 to the master and 3; 3 to the master; 4 is unused.
+        let strips = vec![routed(&[]), routed(&[2]), routed(&[0, 3]), routed(&[0]), routed(&[0])];
+        let (all, receivers) = reachable(&strips, &BTreeSet::from([1]));
+        assert_eq!(all, BTreeSet::from([1, 2, 3]));
+        assert_eq!(receivers, BTreeSet::from([2, 3]));
+        // Clips straight into the master need no other strip.
+        let (all, receivers) = reachable(&strips, &BTreeSet::from([0]));
+        assert!(all.is_empty() && receivers.is_empty());
+    }
+
+    #[test]
+    fn a_strip_sends_to_the_master_and_to_other_strips() {
+        let case = |routes: &[usize]| {
+            let mut s = Session::default();
+            let carrier = s.add_track(TrackKind::Audio, ChannelFormat::for_channels(1), Some("src"));
+            let b2 = s.add_bus("two", ChannelFormat::for_channels(2));
+            let b3 = s.add_bus("three", ChannelFormat::for_channels(2));
+            route_out(&mut s, &[carrier], routes, &HashMap::from([(2, b2), (3, b3)]));
+            let t = s.track(carrier).unwrap();
+            let sends: Vec<Route> = t.mixer.sends.iter().flatten().map(|x| x.target.clone()).collect();
+            (t.mixer.output.clone(), sends, b2, b3)
+        };
+        let (out, sends, b2, b3) = case(&[0, 2, 3]);
+        assert_eq!((out, sends), (Route::Main, vec![Route::Bus(b2), Route::Bus(b3)]));
+        let (out, sends, b2, b3) = case(&[2, 3]);
+        assert_eq!((out, sends), (Route::Bus(b2), vec![Route::Bus(b3)]));
+        let (out, sends, ..) = case(&[]);
+        assert_eq!((out, sends), (Route::None, vec![]));
+    }
+
+    #[test]
+    fn repeated_strip_names_get_their_number() {
+        let named = |n: &str| Strip { name: n.into(), ..Strip::default() };
+        let strips = vec![named(""), named("rec"), named("rec"), named("")];
+        let labels = strip_labels(&strips, &BTreeSet::from([0, 1, 2, 3]));
+        assert_eq!((labels[&0].as_str(), labels[&1].as_str()), ("Master", "rec"));
+        assert_eq!((labels[&2].as_str(), labels[&3].as_str()), ("rec (strip 2)", "Strip 3"));
     }
 
     #[test]
