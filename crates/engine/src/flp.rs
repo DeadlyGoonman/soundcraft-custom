@@ -15,7 +15,10 @@
 //! "Fruity Wrapper"; its state holds the plugin's own name, path and id as chunks. Strip 0 is the
 //! master. A channel's route (`0x68`) is the strip its audio goes to. A strip's route table
 //! (`0xEB`, after its slots) has one byte per strip, trimmed after the last one: nonzero means the
-//! strip's audio is sent to that strip (0 is the master). Send levels are not read yet.
+//! strip's audio is sent to that strip (0 is the master). The mixer parameter table (`0xE1`, 12-byte
+//! records: pid at +4, target at +6, value at +8) holds a strip's volume (pid 192), pan (193) and
+//! the level of each route (pid 64 + the destination strip); a target is the table's base plus
+//! 0x40 per strip, and a value left out is the default.
 
 use crate::io::{add_source, read_file};
 use crate::ptx::{MissingPlugin, installed_match, installed_plugins};
@@ -39,6 +42,10 @@ const PLUGIN: u8 = 201;
 const PLUGIN_STATE: u8 = 213;
 const SLOT: u8 = 98;
 const ROUTES: u8 = 235;
+const PARAMS: u8 = 225;
+
+/// A fader value, or a route level, that is 100% (0 dB).
+const UNITY: u32 = 12800;
 
 /// The name a hosted plugin's state is filed under.
 const WRAPPER: &str = "Fruity Wrapper";
@@ -83,6 +90,12 @@ pub struct Strip {
     pub plugins: Vec<Plugin>,
     /// The strips (0 is the master) this strip's audio is sent to.
     pub routes: Vec<usize>,
+    /// Fader, 0-16000 (12800 is 100%), when the file stores one.
+    pub volume: Option<u32>,
+    /// Pan, -6400 (left) to 6400 (right), when the file stores one.
+    pub pan: Option<i32>,
+    /// Level of each route by destination strip, in fader units; a route not listed is at 100%.
+    pub levels: BTreeMap<usize, u32>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -220,6 +233,7 @@ pub fn parse(b: &[u8]) -> std::result::Result<Flp, String> {
     let mut pending: Option<Plugin> = None;
     let mut slot = 0usize;
     let mut playlist: Option<&[u8]> = None;
+    let mut params: Option<&[u8]> = None;
     for (id, data) in events {
         match id {
             VERSION => flp.version = ascii(data),
@@ -265,12 +279,16 @@ pub fn parse(b: &[u8]) -> std::result::Result<Flp, String> {
                     strip.routes = data.iter().enumerate().filter(|(_, b)| **b != 0).map(|(i, _)| i).collect();
                 }
             }
+            PARAMS => params = params.or(Some(data)),
             PLAYLIST => playlist = playlist.or(Some(data)),
             _ => {}
         }
     }
     flp.channels = channels;
     flp.strips = strips;
+    if let Some(p) = params {
+        read_params(&mut flp.strips, p);
+    }
     let Some(items) = playlist else { return Ok(flp) };
     let size = record_size(&flp.version)?;
     if items.len() % size != 0 {
@@ -362,6 +380,40 @@ fn place_chain(s: &mut Session, track: TrackId, plugins: &[Plugin], installed: &
     }
 }
 
+/// Reads each strip's volume, pan and route levels from the mixer parameter table. The table's
+/// base is the lowest volume target (strip 0's); records for strips the file doesn't have, and the
+/// "current strip" record, are skipped.
+fn read_params(strips: &mut [Strip], table: &[u8]) {
+    let record = |r: &[u8]| Some((*r.get(4)?, le_u16(r.get(6..8)?)?, le_u32(r.get(8..12)?)?));
+    let records: Vec<(u8, u16, u32)> = table.as_chunks::<12>().0.iter().filter_map(|r| record(r)).collect();
+    let Some(base) = records.iter().filter(|r| r.0 == 192).map(|r| r.1).min() else { return };
+    for (pid, target, value) in records {
+        let Some(offset) = target.checked_sub(base).filter(|o| o % 0x40 == 0) else { continue };
+        let Some(strip) = strips.get_mut(usize::from(offset / 0x40)) else { continue };
+        match pid {
+            192 => strip.volume = Some(value),
+            193 => strip.pan = Some(value as i32),
+            64..=191 => {
+                strip.levels.insert(usize::from(pid - 64), value);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A mixer fader value or route level (0-16000; 12800 is 100%, 0 dB) in dB. FL's fader is
+/// logarithmic: nothing at 0, 0 dB at 100% and +5.6 dB at 125% (16000). The curve between is a
+/// power law through those points, which is an approximation.
+fn fader_db(raw: u32) -> f32 {
+    if raw == 0 {
+        return -144.0;
+    }
+    const DB_AT_MAX: f64 = 5.6;
+    let max_ratio = 16000.0_f64 / f64::from(UNITY);
+    let db = DB_AT_MAX * (f64::from(raw) / f64::from(UNITY)).log10() / max_ratio.log10();
+    db.clamp(-144.0, 12.0) as f32
+}
+
 /// The strips that matter: those clips play into and every strip they send on to, with the ones
 /// some strip sends into (the master aside), which need an aux of their own.
 fn reachable(strips: &[Strip], with_clips: &BTreeSet<usize>) -> (BTreeSet<usize>, BTreeSet<usize>) {
@@ -400,24 +452,25 @@ fn strip_labels(strips: &[Strip], order: &BTreeSet<usize>) -> HashMap<usize, Str
         .collect()
 }
 
-/// Sends the tracks carrying a strip where FL sends the strip: to the master it is the main output;
-/// otherwise the first target is the output and any others are sends (at unity). A strip with no
-/// routes plays nowhere, as in FL.
-fn route_out(s: &mut Session, carriers: &[TrackId], routes: &[usize], buses: &HashMap<usize, BusId>) {
-    let others: Vec<Route> = routes.iter().filter(|&&t| t != 0).filter_map(|t| buses.get(t)).map(|&b| Route::Bus(b)).collect();
-    let (output, sends) = if routes.contains(&0) {
-        (Route::Main, others.as_slice())
-    } else {
-        match others.split_first() {
-            Some((first, rest)) => (first.clone(), rest),
-            None => (Route::None, &[][..]),
-        }
-    };
+/// Sends the tracks carrying a strip where FL sends the strip. A route to the master is the main
+/// output; every other route is a send to that strip's bus, at the level the file gives it (100%
+/// when it doesn't). A strip with no routes plays nowhere, as in FL.
+fn route_out(s: &mut Session, carriers: &[TrackId], routes: &[usize], levels: &BTreeMap<usize, u32>, buses: &HashMap<usize, BusId>) {
+    let output = if routes.contains(&0) { Route::Main } else { Route::None };
+    let sends: Vec<SendSlot> = routes
+        .iter()
+        .filter(|&&t| t != 0)
+        .filter_map(|t| {
+            let mut send = SendSlot::new(Route::Bus(*buses.get(t)?));
+            send.level_db = fader_db(levels.get(t).copied().unwrap_or(UNITY));
+            Some(send)
+        })
+        .collect();
     for &id in carriers {
         let Some(t) = s.track_mut(id) else { continue };
         t.mixer.output = output.clone();
-        for (slot, target) in t.mixer.sends.iter_mut().zip(sends) {
-            *slot = Some(SendSlot::new(target.clone()));
+        for (slot, send) in t.mixer.sends.iter_mut().zip(&sends) {
+            *slot = Some(send.clone());
         }
     }
 }
@@ -547,10 +600,28 @@ pub fn open_flp(e: &mut Engine, path: &str) -> Result<Vec<String>> {
         }
     }
     let mut routed = 0usize;
+    let mut skipped_pans = 0usize;
+    let no_levels = BTreeMap::new();
     for (&strip_index, tracks) in &carriers {
-        let routes: &[usize] = if strip_index == 0 { &[0] } else { flp.strips.get(strip_index).map_or(&[], |st| &st.routes[..]) };
+        let strip = flp.strips.get(strip_index).filter(|_| strip_index != 0);
+        let routes: &[usize] = if strip_index == 0 { &[0] } else { strip.map_or(&[], |st| &st.routes[..]) };
         routed += routes.len();
-        route_out(&mut s, tracks, routes, &buses);
+        route_out(&mut s, tracks, routes, strip.map_or(&no_levels, |st| &st.levels), &buses);
+        let Some(st) = strip else { continue };
+        for &id in tracks {
+            let Some(t) = s.track_mut(id) else { continue };
+            if let Some(raw) = st.volume {
+                t.mixer.volume_db = fader_db(raw);
+            }
+            // A stereo track has a panner per channel; only a mono one takes the strip's pan.
+            if let Some(pan) = st.pan.filter(|p| *p != 0) {
+                if t.mixer.pan.len() == 1 {
+                    t.mixer.pan = vec![(pan as f32 / 6400.0).clamp(-1.0, 1.0)];
+                } else {
+                    skipped_pans += 1;
+                }
+            }
+        }
     }
     s.folder = Some(folder);
     e.replace_session(s);
@@ -560,6 +631,9 @@ pub fn open_flp(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     e.message(format!("FL Studio {} project: {placed} clips, {track_count} tracks, {routed} mixer routes, {tempo}", flp.version));
     if master_clips {
         e.message("clips routed to the FL master: their plugins are not imported (the session master is used)".to_string());
+    }
+    if skipped_pans > 0 {
+        e.message(format!("{skipped_pans} stereo tracks have a panned FL strip: their pan was not imported"));
     }
     if flp.other_items > 0 {
         e.message(format!("{} playlist items are patterns or automation and were not imported", flp.other_items));
@@ -705,12 +779,30 @@ mod tests {
         event(&mut body, PLAYLIST, &clip_record(0, 0, 96, 499));
         body.extend(strip_body("Master"));
         body.extend(strip_body("Vox 1"));
+        // The parameter table: strip 0's volume sets the base; strip 1 has a volume, a pan, and a level
+        // for its route to strip 2.
+        let record = |pid: u8, strip: u16, value: u32| {
+            let mut r = vec![0u8; 12];
+            r[4] = pid;
+            r[5] = 31;
+            r[6..8].copy_from_slice(&(0x7000 + 0x40 * strip).to_le_bytes());
+            r[8..12].copy_from_slice(&value.to_le_bytes());
+            r
+        };
+        let mut params = record(192, 0, 12800);
+        params.extend(record(192, 1, 6400));
+        params.extend(record(193, 1, (-3200i32) as u32));
+        params.extend(record(66, 1, 9600));
+        event(&mut body, PARAMS, &params);
         let flp = parse(&project("26.1.7.5653", &body)).unwrap();
         assert_eq!(flp.channels[0].strip, Some(1));
         assert_eq!(flp.strips.len(), 2);
         assert_eq!(flp.strips[1].name, "Vox 1");
         // The route table byte at position 2 is set: the strip sends to strip 2.
         assert_eq!(flp.strips[1].routes, vec![2]);
+        assert_eq!(flp.strips[0].volume, Some(12800));
+        assert_eq!((flp.strips[1].volume, flp.strips[1].pan), (Some(6400), Some(-3200)));
+        assert_eq!(flp.strips[1].levels, BTreeMap::from([(2, 9600)]));
         assert_eq!(flp.strips[1].plugins[0], Plugin { slot: 0, name: "Fruity Soft Clipper".into(), id: None });
         assert_eq!(flp.strips[1].plugins[1], Plugin { slot: 1, name: "FabFilter Pro-Q 4".into(), id: Some("clap:com.FabFilter.Pro-Q.4".into()) });
     }
@@ -763,17 +855,29 @@ mod tests {
             let carrier = s.add_track(TrackKind::Audio, ChannelFormat::for_channels(1), Some("src"));
             let b2 = s.add_bus("two", ChannelFormat::for_channels(2));
             let b3 = s.add_bus("three", ChannelFormat::for_channels(2));
-            route_out(&mut s, &[carrier], routes, &HashMap::from([(2, b2), (3, b3)]));
+            let levels = BTreeMap::from([(2, 6400)]);
+            route_out(&mut s, &[carrier], routes, &levels, &HashMap::from([(2, b2), (3, b3)]));
             let t = s.track(carrier).unwrap();
-            let sends: Vec<Route> = t.mixer.sends.iter().flatten().map(|x| x.target.clone()).collect();
+            let sends: Vec<(Route, f32)> = t.mixer.sends.iter().flatten().map(|x| (x.target.clone(), x.level_db)).collect();
             (t.mixer.output.clone(), sends, b2, b3)
         };
+        // Route 2 is at half, route 3 has no level in the file so it is at 100% (0 dB).
+        let half = fader_db(6400);
         let (out, sends, b2, b3) = case(&[0, 2, 3]);
-        assert_eq!((out, sends), (Route::Main, vec![Route::Bus(b2), Route::Bus(b3)]));
-        let (out, sends, b2, b3) = case(&[2, 3]);
-        assert_eq!((out, sends), (Route::Bus(b2), vec![Route::Bus(b3)]));
+        assert_eq!(out, Route::Main);
+        assert_eq!(sends, vec![(Route::Bus(b2), half), (Route::Bus(b3), 0.0)]);
+        let (out, sends, b2, _) = case(&[2]);
+        assert_eq!((out, sends), (Route::None, vec![(Route::Bus(b2), half)]));
         let (out, sends, ..) = case(&[]);
         assert_eq!((out, sends), (Route::None, vec![]));
+    }
+
+    #[test]
+    fn fader_values_map_to_db() {
+        assert_eq!(fader_db(12800), 0.0);
+        assert!((fader_db(16000) - 5.6).abs() < 0.01);
+        assert_eq!(fader_db(0), -144.0);
+        assert!(fader_db(6400) < fader_db(9600) && fader_db(9600) < 0.0);
     }
 
     #[test]
@@ -808,6 +912,18 @@ mod tests {
         assert!(parse(b"RIFF\x00\x00\x00\x00WAVEfmt ").is_err());
     }
 
+    /// Opens a real project in an engine and lists its tracks; same variable as above.
+    #[test]
+    #[ignore]
+    fn opens_a_project_from_the_environment() {
+        let Ok(path) = std::env::var("SOUNDCRAFT_FLP") else { return };
+        let mut e = Engine::default();
+        open_flp(&mut e, &path).unwrap();
+        for t in &e.session().tracks {
+            println!("track {:?} vol {:.2} out {:?}", t.name, t.mixer.volume_db, t.mixer.output);
+        }
+    }
+
     /// Reads a real project; run with `SOUNDCRAFT_FLP=<path to .flp> cargo test -- --ignored`.
     #[test]
     #[ignore]
@@ -816,6 +932,7 @@ mod tests {
         let flp = parse(&std::fs::read(path).unwrap()).unwrap();
         println!("{} clips, {} channels, {} strips, tempo {:?}", flp.clips.len(), flp.channels.len(), flp.strips.len(), flp.tempo);
         for (i, strip) in flp.strips.iter().enumerate() {
+            println!("strip {i} {:?} vol {:?} pan {:?} routes {:?} levels {:?}", strip.name, strip.volume, strip.pan, strip.routes, strip.levels);
             for p in &strip.plugins {
                 println!("strip {i} {:?} slot {} {} {:?}", strip.name, p.slot, p.name, p.id);
             }
