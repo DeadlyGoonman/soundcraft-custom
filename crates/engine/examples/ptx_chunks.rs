@@ -41,12 +41,15 @@ fn main() {
     let mut sessions = 0;
     // `PTX_DUMP=<plugin name>`: also writes the first few states of that plugin to `<name>-N.bin`.
     let dump = std::env::var("PTX_DUMP").ok();
+    // `PTX_DUMP_MIN=<bytes>`: only states at least that long.
+    let min: usize = std::env::var("PTX_DUMP_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut dumped = 0;
     let mut take = |raw: &[u8], seen: &mut BTreeMap<String, BTreeMap<String, (usize, usize)>>| {
         let p = ptx::parse(&ptx::decode(raw));
         for ins in p.inserts {
             if let (Some(d), Some(s)) = (&dump, &ins.state)
                 && ins.plugin == *d
+                && s.len() >= min
                 && dumped < 3
             {
                 let _ = std::fs::write(format!("{}-{dumped}.bin", d.replace(' ', "_")), s);

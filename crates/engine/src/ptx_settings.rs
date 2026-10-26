@@ -52,6 +52,7 @@ pub fn convert(id: &str, data: &[u8], templates: &mut HashMap<String, Option<Vec
         .entry(id.to_string())
         .or_insert_with(|| soundcraft_mix::create_instance(id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state()));
     let template = template.as_deref()?;
+    let data = juce_state(data).unwrap_or(data);
     if data.starts_with(b"<PresetChunkXMLTree") {
         return waves_state(template, data);
     }
@@ -68,6 +69,14 @@ pub fn convert(id: &str, data: &[u8], templates: &mut HashMap<String, Option<Vec
         return state_loads_in_child(id, &state).then_some(state);
     }
     None
+}
+
+/// JUCE plugins (Auto-Tune Pro) save their chunk under a second Pro Tools-style 56-byte header
+/// (u32 BE length, u32, three ids, chunk id `juce` at 20, a 32-byte name): past it is the
+/// plugin's raw state, which its VST3 version reads as is.
+fn juce_state(data: &[u8]) -> Option<&[u8]> {
+    const HEADER: usize = 56;
+    (data.get(20..24)? == b"juce").then(|| data.get(HEADER..)).flatten().filter(|d| !d.is_empty())
 }
 
 /// The component state inside a SoundCraft VST3 state.
@@ -188,7 +197,8 @@ struct StateJob {
 /// settings other than its defaults, checked in a child process once per plugin and kind of
 /// data. `false` when no child can be run.
 fn state_loads_in_child(id: &str, state: &[u8]) -> bool {
-    let key = (id.to_string(), state.get(12..20).unwrap_or(state).to_vec());
+    // The component's first 4 bytes (its format tag), past the container's magic and length.
+    let key = (id.to_string(), state.get(12..16).unwrap_or(state).to_vec());
     if let Some(&v) = VERDICTS.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(HashMap::new).get(&key) {
         return v;
     }
@@ -310,6 +320,17 @@ mod tests {
         let session = ffbs(&[1.0, 0.0, 8.99], b"FQ3p\x03\0\0\0preset name and more");
         assert_eq!(ffbs_state(&template, &session), Some(container(&ffbs(&[1.0, 0.0, 8.99], b"FFpr\x01\0\0\0\0\0\0\0"))));
         assert_eq!(ffbs_state(&template, &ffbs(&[1.0; 4], b"")), None, "more values than the plugin has");
+    }
+
+    #[test]
+    fn a_juce_chunk_loses_its_inner_header() {
+        let mut d = 18283u32.to_be_bytes().to_vec();
+        d.extend_from_slice(&[0; 4]);
+        d.extend_from_slice(b"JptrATunZTatjuce");
+        d.extend_from_slice(&[0; 32]);
+        d.extend_from_slice(b"VC2!<?xml");
+        assert_eq!(juce_state(&d), Some(&b"VC2!<?xml"[..]));
+        assert_eq!(juce_state(b"FFBS\x01\0\0\0"), None);
     }
 
     #[test]
