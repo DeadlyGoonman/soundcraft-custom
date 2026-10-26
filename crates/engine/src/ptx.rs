@@ -396,6 +396,8 @@ pub struct PtxPath {
 pub struct PtxRoute {
     pub input: Option<String>,
     pub output: Option<String>,
+    /// The level (dB) of the output path: the track's fader.
+    pub fader_db: Option<f32>,
     /// Each send's destination and level (dB), in send order.
     pub sends: Vec<(String, f32)>,
 }
@@ -526,7 +528,10 @@ fn track_route(b: &[u8], track: usize, end: usize) -> PtxRoute {
         let tenths = inner.iter().find(|c| c.2 == LEVEL).and_then(|c| b.get(c.0 + 10..c.0 + 14)?.try_into().ok()).map_or(0, i32::from_le_bytes);
         Some((dest, tenths as f32 / 10.0))
     });
-    let output = paths.next().flatten().map(|(n, _)| n);
+    let (output, fader_db) = match paths.next().flatten() {
+        Some((n, db)) => (Some(n), Some(db)),
+        None => (None, None),
+    };
     let sends = paths.flatten().collect();
     // The input follows the last mixer path; some tracks have two more bytes before it.
     let last = kids.iter().filter(|c| c.2 == MIXER_PATH).map(|c| c.1).max().unwrap_or(track + 9);
@@ -537,7 +542,7 @@ fn track_route(b: &[u8], track: usize, end: usize) -> PtxRoute {
         let n = usize::try_from(uint(b, q + 2, 2)?).ok().filter(|&n| n <= 64)?;
         name_at(b, q + 4 + 4 * n + 9).filter(|(_, e)| *e <= end).map(|(name, _)| name)
     });
-    PtxRoute { input: input.filter(|n| !n.is_empty()), output, sends }
+    PtxRoute { input: input.filter(|n| !n.is_empty()), output, fader_db, sends }
 }
 
 /// Each track's routing, in track order (the tracks that carry an insert container, as
@@ -842,6 +847,9 @@ fn place_routes(s: &mut Session, ptx: &Ptx, tracks: &HashMap<String, (TrackId, S
             }
             if let Some(i) = &input {
                 t.mixer.input = i.clone();
+            }
+            if let Some(db) = route.fader_db {
+                t.mixer.volume_db = db.clamp(-144.0, 12.0);
             }
             for (slot, send) in t.mixer.sends.iter_mut().zip(&sends) {
                 *slot = Some(send.clone());
@@ -1415,7 +1423,7 @@ mod tests {
     #[test]
     fn a_hardware_output_feeds_the_track_that_takes_it_as_input() {
         let paths = [("A 1-2", 2, true), ("Out 3-4", 2, true)].map(|(n, c, h)| PtxPath { name: n.to_string(), channels: c, hardware: h }).to_vec();
-        let route = |input: Option<&str>, output: &str| PtxRoute { input: input.map(str::to_string), output: Some(output.to_string()), sends: Vec::new() };
+        let route = |input: Option<&str>, output: &str| PtxRoute { input: input.map(str::to_string), output: Some(output.to_string()), fader_db: None, sends: Vec::new() };
         let ptx = Ptx {
             active: ["Beat", "Print", "Master 1"].map(str::to_string).to_vec(),
             kinds: vec![0, 0, 5],
