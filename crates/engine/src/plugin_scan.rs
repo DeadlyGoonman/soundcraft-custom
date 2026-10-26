@@ -509,7 +509,7 @@ pub fn child_probe(exe: PathBuf, timeout: Duration) -> ProbeFn {
 
 fn probe_child(exe: &Path, format: Format, path: &Path, timeout: Duration) -> Result<Probed, String> {
     let args = [std::ffi::OsStr::new(PROBE_ARG), std::ffi::OsStr::new(format.arg()), path.as_os_str()];
-    let (text, status) = run_child(exe, &args, timeout)?;
+    let (text, status) = run_child(exe, &args, None, timeout)?;
     match (parse_probe_output(&text), status) {
         (Some(r), _) => r,
         (None, None) => Err(format!("timed out after {} s", timeout.as_secs())),
@@ -517,13 +517,19 @@ fn probe_child(exe: &Path, format: Format, path: &Path, timeout: Duration) -> Re
     }
 }
 
-/// Runs `exe args` with no window, killing it after `timeout`: its standard output, and its exit
-/// status (`None` when it was killed).
-pub(crate) fn run_child(exe: &Path, args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(String, Option<std::process::ExitStatus>), String> {
-    use std::io::Read as _;
+/// Runs `exe args` with no window, `input` (if any) on its standard input, killing it after
+/// `timeout`: its standard output, and its exit status (`None` when it was killed).
+pub(crate) fn run_child(
+    exe: &Path,
+    args: &[&std::ffi::OsStr],
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<(String, Option<std::process::ExitStatus>), String> {
+    use std::io::{Read as _, Write as _};
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(exe);
-    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let stdin = if input.is_some() { Stdio::piped() } else { Stdio::null() };
+    cmd.args(args).stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -531,6 +537,12 @@ pub(crate) fn run_child(exe: &Path, args: &[&std::ffi::OsStr], timeout: Duration
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = cmd.spawn().map_err(|e| format!("cannot start the scanner process: {e}"))?;
+    // Written from a thread of its own, so a child that doesn't read it can't block this one.
+    if let (Some(data), Some(mut pipe)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&data);
+        });
+    }
     let mut stdout = child.stdout.take();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

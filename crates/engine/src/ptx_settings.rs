@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
-/// The command-line switch of the settings check: `--probe-state <job file>`.
+/// The command-line switch of the settings check: `--probe-state`, the job on standard input.
 pub const STATE_PROBE_ARG: &str = "--probe-state";
 /// Prefix of the settings check's result line on standard output (plugins may print too).
 const STATE_PROBE_MARK: &str = "SOUNDCRAFT-STATE ";
@@ -34,7 +34,7 @@ const JUCE_TRAILER: &[u8] = b"JUCEPrivateData";
 /// Newer FabFilter state, the same values in AAX and VST3 ([`ffbs_state`]).
 const FFBS: &[u8] = b"FFBS";
 
-/// The app that runs the settings check (`<exe> --probe-state <job>`); unset, unverified
+/// The app that runs the settings check (`<exe> --probe-state`, job on stdin); unset, unverified
 /// settings are dropped.
 static PROBE_EXE: OnceLock<PathBuf> = OnceLock::new();
 /// Settings checks already run: (plugin id, the data's first bytes) -> loaded.
@@ -259,11 +259,8 @@ fn state_loads_in_child(id: &str, state: &[u8]) -> bool {
             vst3: soundcraft_vst3_host::cached().unwrap_or_default().into_iter().filter(|d| d.id == id).collect(),
             state: soundcraft_model::b64::encode(state),
         };
-        let tag: String = key.1.iter().map(|b| format!("{b:02x}")).collect();
-        let file = std::env::temp_dir().join(format!("sc-state-probe-{}-{tag}.json", std::process::id()));
-        let wrote = serde_json::to_string(&job).ok().is_some_and(|j| std::fs::write(&file, j).is_ok());
-        let ran = wrote.then(|| crate::plugin_scan::run_child(exe, &[STATE_PROBE_ARG.as_ref(), file.as_os_str()], STATE_PROBE_TIMEOUT));
-        let _ = std::fs::remove_file(&file);
+        // The job goes on the child's standard input: no file to write or clean up.
+        let ran = serde_json::to_vec(&job).ok().map(|j| crate::plugin_scan::run_child(exe, &[STATE_PROBE_ARG.as_ref()], Some(j), STATE_PROBE_TIMEOUT));
         let ok = matches!(ran, Some(Ok((ref text, _))) if text.lines().any(|l| l.trim_end() == format!("{STATE_PROBE_MARK}ok")));
         if !ok {
             log::warn!("{id}: the session's settings failed the check in a child process; it starts from its defaults");
@@ -274,14 +271,16 @@ fn state_loads_in_child(id: &str, state: &[u8]) -> bool {
     ok
 }
 
-/// The settings check process: when `args` (without the program name) are `--probe-state
-/// <job file>`, loads the plugin with the job's state, prints the result line and returns the
-/// exit code; otherwise `None`.
+/// The settings check process: when `args` (without the program name) are `--probe-state`,
+/// reads the job from standard input, loads the plugin with the job's state, prints the result
+/// line and returns the exit code; otherwise `None`.
 pub fn state_probe_command_line(args: &[String]) -> Option<i32> {
     if args.first().map(String::as_str) != Some(STATE_PROBE_ARG) {
         return None;
     }
-    let job = args.get(1).and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str::<StateJob>(&t).ok());
+    let mut text = String::new();
+    let read = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).is_ok();
+    let job = read.then(|| serde_json::from_str::<StateJob>(&text).ok()).flatten();
     let ok = job.is_some_and(|job| {
         soundcraft_vst3_host::set_scanned(job.vst3);
         let Some(state) = soundcraft_model::b64::decode(&job.state) else { return false };
