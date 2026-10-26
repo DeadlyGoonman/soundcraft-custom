@@ -238,6 +238,9 @@ struct AudioState {
     /// Device frames of the fade-in at Play still to apply, and its length (0 = none).
     declick: usize,
     declick_len: usize,
+    /// Callback timing since Play: blocks, blocks that took longer than the buffer lasts (each
+    /// one is an audible dropout), the longest block in milliseconds.
+    timing: (u32, u32, f32),
 }
 
 /// The fade-in at Play, in ms: starting mid-waveform is a step from silence, a click. A locate
@@ -281,6 +284,7 @@ impl AudioState {
             dirty: false,
             declick: 0,
             declick_len: declick_frames(device_rate),
+            timing: (0, 0, 0.0),
         }
     }
 
@@ -336,6 +340,10 @@ impl AudioState {
                     self.reset_mix();
                 }
                 Cmd::Stop => {
+                    let (blocks, late, worst) = std::mem::take(&mut self.timing);
+                    if late > 0 {
+                        log::warn!("audio dropouts: {late} of {blocks} blocks took longer than the buffer (longest {worst:.1} ms); a larger buffer or a lighter session avoids them");
+                    }
                     self.playing = false;
                     self.end = None;
                     self.looped = None;
@@ -428,6 +436,7 @@ impl AudioState {
 
     /// Fill an interleaved device buffer.
     fn fill(&mut self, out: &mut [f32], channels: usize) {
+        let started = std::time::Instant::now();
         self.drain();
         let channels = channels.max(1);
         let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
@@ -515,6 +524,11 @@ impl AudioState {
             }
             self.read += step;
         }
+        let took = started.elapsed().as_secs_f32() * 1000.0;
+        let budget = callback_frames as f32 / self.device_rate.max(1.0) as f32 * 1000.0;
+        self.timing.0 += 1;
+        self.timing.1 += u32::from(took > budget);
+        self.timing.2 = self.timing.2.max(took);
     }
 }
 
