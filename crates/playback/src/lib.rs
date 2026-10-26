@@ -204,6 +204,12 @@ struct AudioState {
     fold: [(f32, f32); MAX_CHANNELS],
     pending_len: usize,
     read: f64,
+    /// The last frame of the block before `pending`, per main channel. Resampling reads one
+    /// frame behind: position `read` blends frame `read` and `read + 1` of `last` followed by
+    /// `pending`, so a block's last frame blends into the next block's first, never into
+    /// whatever is left in `pending` past the rendered frames (a step at every block: crackle
+    /// when the session and device rates differ).
+    last: [f32; MAX_CHANNELS],
     device_rate: f64,
     input: Option<Arc<record::InputRing>>,
     recording: bool,
@@ -253,6 +259,7 @@ impl AudioState {
             pending: vec![vec![0.0; BLOCK]; nch],
             pending_len: 0,
             read: 0.0,
+            last: [0.0; MAX_CHANNELS],
             device_rate,
             input: None,
             recording: false,
@@ -309,6 +316,7 @@ impl AudioState {
                     self.playing = true;
                     self.pending_len = 0;
                     self.read = 0.0;
+                    self.last = [0.0; MAX_CHANNELS];
                     self.declick = self.declick_len;
                     self.reset_mix();
                 }
@@ -416,9 +424,16 @@ impl AudioState {
         let step = self.session.sample_rate.as_f64() / self.device_rate.max(1.0) * speed.clamp(0.1, 4.0);
         let callback_frames = out.len() / channels;
         let quantum = ((callback_frames as f64 * step).ceil() as usize).clamp(1, BLOCK);
+        // Same rate, normal speed: each device frame is one rendered frame, nothing to blend.
+        let resampling = step != 1.0;
         for frame in out.chunks_mut(channels) {
             while self.read >= self.pending_len as f64 {
                 self.read -= self.pending_len as f64;
+                if let Some(end) = self.pending_len.checked_sub(1) {
+                    for (l, ch) in self.last.iter_mut().zip(&self.pending) {
+                        *l = ch.get(end).copied().unwrap_or(0.0);
+                    }
+                }
                 if !self.playing && !monitoring {
                     break;
                 }
@@ -433,8 +448,14 @@ impl AudioState {
             let nch = self.pending.len();
             let sample = |c: usize| {
                 let ch = self.pending.get(c);
-                let a = ch.and_then(|v| v.get(i0)).copied().unwrap_or(0.0);
-                let b = ch.and_then(|v| v.get(i0 + 1)).copied().unwrap_or(a);
+                if !resampling {
+                    return ch.and_then(|v| v.get(i0)).copied().unwrap_or(0.0);
+                }
+                let a = match i0.checked_sub(1) {
+                    None => self.last.get(c).copied().unwrap_or(0.0),
+                    Some(i) => ch.and_then(|v| v.get(i)).copied().unwrap_or(0.0),
+                };
+                let b = ch.and_then(|v| v.get(i0)).copied().unwrap_or(a);
                 a + (b - a) * fr
             };
             if channels < nch {
@@ -1613,6 +1634,29 @@ mod tests {
         st.declick_len = 0;
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         st
+    }
+
+    #[test]
+    fn a_44k_session_on_a_48k_device_resamples_without_steps_at_block_edges() {
+        use soundcraft_model::ChannelFormat;
+        // 1 kHz sine at 44.1 kHz: between two 48 kHz frames it moves at most 2*pi*1000/48000.
+        let sine: Vec<f32> = (0..44_100).map(|i| (std::f32::consts::TAU * 1000.0 * i as f32 / 44_100.0).sin() * 0.5).collect();
+        let mut st = audio_output_state(ChannelFormat::Mono, vec![sine]);
+        let mut s = (*st.session).clone();
+        s.sample_rate = soundcraft_time::SampleRate::new(44_100).unwrap();
+        st.session = Arc::new(s);
+        // Odd-sized callbacks, like an ASIO buffer, so blocks end at varying points.
+        let mut heard = Vec::new();
+        let mut out = [0.0f32; 37];
+        for _ in 0..200 {
+            st.fill(&mut out, 1);
+            heard.extend_from_slice(&out);
+        }
+        let limit = 0.5 * std::f32::consts::TAU * 1000.0 / 48_000.0 * 1.05;
+        // Skip the first frames (silence before the sine starts at the clip's own level).
+        let worst = heard.windows(2).skip(200).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst > 0.0, "it plays");
+        assert!(worst <= limit, "a step of {worst} (smooth sine moves at most {limit})");
     }
 
     #[test]
