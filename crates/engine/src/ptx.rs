@@ -652,13 +652,16 @@ fn chunk_inserts(b: &[u8], active: &[String]) -> Vec<PtxInsert> {
                 let key: Vec<u8> = ids.chunks(4).flat_map(|w| w.iter().rev().copied()).collect();
                 plugins.iter().find(|(_, p)| *p == key).map(|(n, _)| n.clone())
             });
+            // Past Pro Tools' 56-byte chunk header (size, version, four ids, a 32-byte name) is the
+            // plugin's own data, which is what its VST3 / CLAP version reads. Only kept when the
+            // chunk's ids name the plugin: the index fallback can be wrong, and another plugin's
+            // settings must never reach it.
+            let state =
+                chunk.filter(|_| by_ids.is_some()).map(|c| c.get(AAX_HEADER..).unwrap_or(c).to_vec()).filter(|c| !c.is_empty());
             let plugin = match by_ids {
                 Some(n) => n,
                 None => plugins.get(usize::try_from(uint(b, s + 18, 2)?).ok()?)?.0.clone(),
             };
-            // Past Pro Tools' 56-byte chunk header (size, version, four ids, a 32-byte name) is the
-            // plugin's own data, which is what its VST3 / CLAP version reads.
-            let state = chunk.map(|c| c.get(AAX_HEADER..).unwrap_or(c).to_vec()).filter(|c| !c.is_empty());
             Some(PtxInsert { playlist: active.get(track)?.clone(), slot, plugin, state })
         })
         .collect()
@@ -718,50 +721,6 @@ pub fn installed_match(name: &str, installed: &[(String, String)], stereo: bool)
     matches.iter().find(|(_, n)| squash(n).ends_with(fits)).or(matches.first()).map(|(id, _)| id.clone())
 }
 
-/// Waves keeps the same preset XML in its AAX and VST3 versions. `template` is a fresh
-/// instance's state in SoundCraft's VST3 container ("SCV3", u32 LE length + component state,
-/// u32 LE length + controller state). Its component state is Waves' 28-byte header (big-endian
-/// lengths at 0 and 20 count what follows), the preset XML, then a trailer: the session's XML
-/// goes in its place. The controller part is left empty, so the editor takes its settings from
-/// the component (`setComponentState`) rather than from a fresh instance's controller.
-fn waves_state(template: &[u8], xml: &[u8]) -> Option<Vec<u8>> {
-    const END: &[u8] = b"</PresetChunkXMLTree>";
-    const HEADER: usize = 28;
-    let end_of = |b: &[u8]| b.windows(END.len()).position(|w| w == END).map(|p| p + END.len());
-    let rest = template.strip_prefix(b"SCV3")?;
-    let n = usize::try_from(u32::from_le_bytes(rest.get(..4)?.try_into().ok()?)).ok()?;
-    let comp = rest.get(4..4usize.checked_add(n)?)?;
-    let (fresh_end, xml_end) = (end_of(comp)?, end_of(xml)?);
-    let delta = i64::try_from(xml_end).ok()? - i64::try_from(fresh_end.checked_sub(HEADER)?).ok()?;
-    let mut c = comp.get(..HEADER)?.to_vec();
-    for at in [0, 20] {
-        let field: [u8; 4] = c.get(at..at + 4)?.try_into().ok()?;
-        let v = u32::try_from(i64::from(u32::from_be_bytes(field)) + delta).ok()?;
-        c.get_mut(at..at + 4)?.copy_from_slice(&v.to_be_bytes());
-    }
-    c.extend_from_slice(xml.get(..xml_end)?);
-    c.extend_from_slice(comp.get(fresh_end..)?);
-    let mut out = b"SCV3".to_vec();
-    out.extend_from_slice(&u32::try_from(c.len()).ok()?.to_le_bytes());
-    out.extend_from_slice(&c);
-    out.extend_from_slice(&0u32.to_le_bytes());
-    Some(out)
-}
-
-/// The settings to give `id` for a Pro Tools chunk: Waves XML rewrapped for VST3 (from a fresh
-/// instance's state, made once per plugin). Other vendors get none and start from their
-/// defaults: handing a plugin data in a format it doesn't expect can crash it (Auto-Tune Pro
-/// does), so only verified conversions are passed on.
-fn plugin_state(id: &str, chunk: &[u8], templates: &mut HashMap<String, Option<Vec<u8>>>) -> Option<Vec<u8>> {
-    if !chunk.starts_with(b"<PresetChunkXMLTree") {
-        return None;
-    }
-    let template = templates
-        .entry(id.to_string())
-        .or_insert_with(|| soundcraft_mix::create_instance(id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state()));
-    template.as_deref().and_then(|t| waves_state(t, chunk))
-}
-
 /// Installed VST3 and CLAP plugins as (id, name), from the hosts' saved scans.
 pub fn installed_plugins() -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = soundcraft_vst3_host::cached().unwrap_or_default().into_iter().map(|d| (d.id, d.name)).collect();
@@ -797,7 +756,7 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
         let stereo = targets.first().and_then(|(t, _)| s.track(*t)).is_some_and(|t| t.format.channels() >= 2);
         match installed_match(&ins.plugin, &installed, stereo) {
             Some(id) => {
-                let state = ins.state.as_deref().and_then(|c| plugin_state(&id, c, &mut templates));
+                let state = ins.state.as_deref().and_then(|c| crate::ptx_settings::convert(&id, c, &mut templates));
                 for (track, slot) in targets {
                     let Some(t) = s.track_mut(track) else { continue };
                     let slots = &mut t.mixer.inserts;

@@ -253,6 +253,13 @@ fn main() -> eframe::Result {
     if let Some(code) = soundcraft_engine::plugin_scan::probe_command_line(&args) {
         std::process::exit(code);
     }
+    // The settings check of a Pro Tools import (see `ptx_settings`), likewise.
+    if let Some(code) = soundcraft_engine::ptx_settings::state_probe_command_line(&args) {
+        std::process::exit(code);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        soundcraft_engine::ptx_settings::set_probe_exe(exe);
+    }
     // First, so every start-up record (and the engine's panic hook, installed with the first
     // Engine) is captured; see `logging`.
     let logger = logging::install();

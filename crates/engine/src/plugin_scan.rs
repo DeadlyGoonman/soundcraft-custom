@@ -508,10 +508,22 @@ pub fn child_probe(exe: PathBuf, timeout: Duration) -> ProbeFn {
 }
 
 fn probe_child(exe: &Path, format: Format, path: &Path, timeout: Duration) -> Result<Probed, String> {
+    let args = [std::ffi::OsStr::new(PROBE_ARG), std::ffi::OsStr::new(format.arg()), path.as_os_str()];
+    let (text, status) = run_child(exe, &args, timeout)?;
+    match (parse_probe_output(&text), status) {
+        (Some(r), _) => r,
+        (None, None) => Err(format!("timed out after {} s", timeout.as_secs())),
+        (None, Some(s)) => Err(format!("crashed while loading ({s})")),
+    }
+}
+
+/// Runs `exe args` with no window, killing it after `timeout`: its standard output, and its exit
+/// status (`None` when it was killed).
+pub(crate) fn run_child(exe: &Path, args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(String, Option<std::process::ExitStatus>), String> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(exe);
-    cmd.arg(PROBE_ARG).arg(format.arg()).arg(path).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -542,12 +554,7 @@ fn probe_child(exe: &Path, format: Format, path: &Path, timeout: Duration) -> Re
         }
     };
     // A plugin that left a process of its own holding the pipe must not hang the scan.
-    let text = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
-    match (parse_probe_output(&text), status) {
-        (Some(r), _) => r,
-        (None, None) => Err(format!("timed out after {} s", timeout.as_secs())),
-        (None, Some(s)) => Err(format!("crashed while loading ({s})")),
-    }
+    Ok((rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default(), status))
 }
 
 #[cfg(test)]
