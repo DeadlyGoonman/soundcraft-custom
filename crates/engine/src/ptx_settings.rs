@@ -195,6 +195,9 @@ pub fn autotune_params(data: &[u8]) -> std::collections::BTreeMap<String, f32> {
     out
 }
 
+/// Index of Pro-Q 2's "Solo Band" in its value list.
+const PRO_Q2_SOLO_BAND: usize = 188;
+
 /// Older FabFilter plugins: the AAX data is Avid's parameter list, one value per parameter in
 /// the VST3 parameter order and units (Pro-Q 2: 24 bands x state, frequency as log2 Hz, gain,
 /// Q, shape, slope, stereo placement, then the globals). The VST3 component state is "FabF",
@@ -203,7 +206,8 @@ pub fn autotune_params(data: &[u8]) -> std::collections::BTreeMap<String, f32> {
 /// (Pro-L 2 has one more) keep their defaults. More values than the plugin has means another
 /// plugin's data: none.
 fn fabfilter_state(template: &[u8], data: &[u8]) -> Option<Vec<u8>> {
-    let mut comp = component(template)?.to_vec();
+    let template_comp = component(template)?;
+    let mut comp = template_comp.to_vec();
     let le = |b: &[u8], at: usize| -> Option<usize> { usize::try_from(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?)).ok() };
     let name_len = le(&comp, 8)?;
     let count = le(&comp, 16usize.checked_add(name_len)?)?;
@@ -216,6 +220,14 @@ fn fabfilter_state(template: &[u8], data: &[u8]) -> Option<Vec<u8>> {
         #[allow(clippy::cast_possible_truncation)]
         let f = *v as f32;
         comp.get_mut(first + 4 * k..first + 4 * k + 4)?.copy_from_slice(&f.to_le_bytes());
+    }
+    // Pro-Q 2's "Solo Band" is -1 when no band is soloed; the session's list holds 0 there, which
+    // the plugin reads as band 1 soloed (its Solo button lit). Keep the fresh "off".
+    if count > PRO_Q2_SOLO_BAND && values.len() > PRO_Q2_SOLO_BAND {
+        let at = first + 4 * PRO_Q2_SOLO_BAND;
+        if template_comp.get(at..at + 4) == Some(&(-1.0f32).to_le_bytes()[..]) {
+            comp.get_mut(at..at + 4)?.copy_from_slice(&(-1.0f32).to_le_bytes());
+        }
     }
     Some(container(&comp))
 }
@@ -350,6 +362,16 @@ mod tests {
         // More values than the plugin has: another plugin's data.
         let five = aax(&[(b"l_", 1.0), (b"l_", 1.0), (b"l_", 1.0), (b"l_", 1.0), (b"l_", 1.0)]);
         assert_eq!(fabfilter_state(&template, &five), None);
+    }
+
+    #[test]
+    fn pro_q2_solo_band_stays_off() {
+        let mut fresh = vec![0.0f32; PRO_Q2_SOLO_BAND + 2];
+        fresh[PRO_Q2_SOLO_BAND] = -1.0;
+        let template = container(&fabf(&fresh));
+        let session = aax(&vec![(b"d_", 0.0); PRO_Q2_SOLO_BAND + 2]);
+        let out = fabfilter_state(&template, &session).unwrap();
+        assert_eq!(out, container(&fabf(&fresh)), "0 would mean band 1 soloed");
     }
 
     /// FabFilter's newer state: `values`, then `tail`.
