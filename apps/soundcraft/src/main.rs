@@ -108,6 +108,16 @@ impl eframe::App for App {
         // The system Quit (⌘Q) ends the process from inside the event loop, so `run_native` never
         // returns: release the player's plugin instances and shut plugin hosting down here.
         let before_plugins = t.elapsed();
+        // Unloading every plugin instance takes tens of seconds and lags the whole PC with a big
+        // session. All is saved: stop the audio, leave the plugins to the OS and end the process.
+        if let Some(p) = self.0.player.take() {
+            p.close_editors();
+            let live = p.take_plugins();
+            drop(p);
+            log::info!("exit: audio closed, plugins left to the OS ({:?})", t.elapsed());
+            std::mem::forget(live);
+            soundcraft_engine::terminate_process_now();
+        }
         self.0.player = None;
         soundcraft_engine::shutdown_plugin_hosts();
         log::info!("exit: autosave+prefs {before_plugins:?}, plugin teardown {:?}", t.elapsed() - before_plugins);

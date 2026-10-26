@@ -320,6 +320,17 @@ fn open_library(bundle: &Path, exe: &Path) -> Result<(libloading::Library, Optio
     }
 }
 
+/// Ends the process now, without unloading plugins or running exit handlers: tearing down
+/// hundreds of plugin instances (Waves shells above all) takes tens of seconds of CPU and disk at
+/// exit. Everything worth keeping must be saved first. Returns on platforms where that isn't done.
+pub(crate) fn terminate_now() {
+    #[cfg(windows)]
+    // SAFETY: ends this process; nothing runs afterwards.
+    unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), 0);
+    }
+}
+
 /// Runs the module exits at process exit, newest module first, each on the thread that ran its
 /// entry. VST3 modules expect their exit before their static destructors run, and some crash in
 /// those destructors without it (seen with Steinberg's HALion Sonic, after a plain scan). A module

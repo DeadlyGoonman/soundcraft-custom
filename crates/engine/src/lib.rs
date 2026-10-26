@@ -39,6 +39,12 @@ pub fn shutdown_plugin_hosts() {
     soundcraft_vst3_host::shutdown();
 }
 
+/// Ends the process at once, skipping plugin unloading (which takes tens of seconds with a big
+/// session). Only after everything is saved. Returns where that isn't supported.
+pub fn terminate_process_now() {
+    soundcraft_vst3_host::terminate_now();
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum EngineError {
     #[error("unknown command `{0}`")]

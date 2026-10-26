@@ -153,6 +153,9 @@ mod api {
     pub fn shutdown() {
         ffi::exit_modules();
     }
+    pub fn terminate_now() {
+        ffi::terminate_now();
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -185,6 +188,7 @@ mod api {
         None
     }
     pub fn shutdown() {}
+    pub fn terminate_now() {}
 }
 
 /// Every plugin in the standard VST3 folders, `VST3_PATH` and folders added with
@@ -233,6 +237,12 @@ pub fn forget_scanned() {
 /// (HALion Sonic crashes in its module exit after it has been used).
 pub fn shutdown() {
     api::shutdown()
+}
+
+/// Ends the process now, without unloading plugins or running exit handlers (Windows only; it
+/// returns elsewhere). Save everything first.
+pub fn terminate_now() {
+    api::terminate_now()
 }
 
 /// The audio module classes in one `.vst3` bundle or file.
