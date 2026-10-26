@@ -124,7 +124,7 @@ fn aax_params(data: &[u8]) -> Vec<f64> {
 }
 
 /// Avid's typed parameter list as (name, value) pairs, in order (see [`aax_params`]).
-fn aax_named(data: &[u8]) -> Vec<(String, f64)> {
+pub(crate) fn aax_named(data: &[u8]) -> Vec<(String, f64)> {
     let mut out = Vec::new();
     let mut i = AAX_PARAMS.len();
     while let Some(kind) = data.get(i..i + 2) {

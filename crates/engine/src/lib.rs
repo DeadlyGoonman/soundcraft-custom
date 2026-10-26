@@ -21,6 +21,7 @@ pub mod mp3;
 pub mod plugin_scan;
 pub mod ptx;
 pub mod ptx_settings;
+pub mod ptx_stock;
 pub mod score;
 
 use serde_json::{Value, json};

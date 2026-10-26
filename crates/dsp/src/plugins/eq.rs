@@ -7,14 +7,16 @@ use crate::{Category, ParamInfo, Plugin, PluginInfo, Unit, db_to_gain};
 
 const SLOPES: &[&str] = &["6 dB/oct", "12 dB/oct", "18 dB/oct", "24 dB/oct"];
 
-static EQ7_PARAMS: [ParamInfo; 23] = [
+const BAND_TYPES: &[&str] = &["Shelf", "Peak"];
+
+static EQ7_PARAMS: [ParamInfo; 25] = [
     lin("input_gain", "Input", -24.0, 24.0, 0.0, Unit::Db),
     toggle("hpf_on", "HPF", false),
     log("hpf_freq", "HPF Freq", 10.0, 2000.0, 80.0, Unit::Hz),
     choice("hpf_slope", "HPF Slope", SLOPES, 1),
     log("low_shelf_freq", "LF Freq", 20.0, 1000.0, 100.0, Unit::Hz),
     lin("low_shelf_gain", "LF Gain", -24.0, 24.0, 0.0, Unit::Db),
-    log("low_shelf_q", "LF Q", 0.3, 2.0, 0.707, Unit::None),
+    log("low_shelf_q", "LF Q", 0.1, 10.0, 0.707, Unit::None),
     log("low_mid_freq", "LMF Freq", 20.0, 2000.0, 250.0, Unit::Hz),
     lin("low_mid_gain", "LMF Gain", -24.0, 24.0, 0.0, Unit::Db),
     log("low_mid_q", "LMF Q", 0.1, 10.0, 1.0, Unit::None),
@@ -26,11 +28,13 @@ static EQ7_PARAMS: [ParamInfo; 23] = [
     log("high_mid_q", "HMF Q", 0.1, 10.0, 1.0, Unit::None),
     log("high_shelf_freq", "HF Freq", 1000.0, 20000.0, 8000.0, Unit::Hz),
     lin("high_shelf_gain", "HF Gain", -24.0, 24.0, 0.0, Unit::Db),
-    log("high_shelf_q", "HF Q", 0.3, 2.0, 0.707, Unit::None),
+    log("high_shelf_q", "HF Q", 0.1, 10.0, 0.707, Unit::None),
     toggle("lpf_on", "LPF", false),
     log("lpf_freq", "LPF Freq", 1000.0, 20000.0, 18000.0, Unit::Hz),
     choice("lpf_slope", "LPF Slope", SLOPES, 1),
     lin("output_gain", "Output", -24.0, 24.0, 0.0, Unit::Db),
+    choice("low_shelf_type", "LF Type", BAND_TYPES, 0),
+    choice("high_shelf_type", "HF Type", BAND_TYPES, 0),
 ];
 
 pub static EQ7_INFO: PluginInfo = PluginInfo {
@@ -91,7 +95,10 @@ fn design_eq7(v: &[f32], sr: f32) -> [Coeffs; 9] {
         c[0] = a;
         c[1] = b;
     }
-    let bands = [(4, FilterType::LowShelf), (7, FilterType::Peak), (10, FilterType::Peak), (13, FilterType::Peak), (16, FilterType::HighShelf)];
+    // Pro Tools' EQ3 lets the low and high bands be bells instead of shelves.
+    let low = if val(v, 23) >= 0.5 { FilterType::Peak } else { FilterType::LowShelf };
+    let high = if val(v, 24) >= 0.5 { FilterType::Peak } else { FilterType::HighShelf };
+    let bands = [(4, low), (7, FilterType::Peak), (10, FilterType::Peak), (13, FilterType::Peak), (16, high)];
     for (k, (i, kind)) in bands.into_iter().enumerate() {
         let g = val(v, i + 1);
         if g.abs() > 1e-4

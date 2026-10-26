@@ -772,6 +772,22 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
         let stereo = targets.first().and_then(|(t, _)| s.track(*t)).is_some_and(|t| t.format.channels() >= 2);
         // Every other Auto-Tune becomes Auto-Tune Pro, with the settings that can be read.
         let variant = crate::ptx_settings::is_autotune_variant(&ins.plugin);
+        // Pro Tools' own EQ3 and Dyn3 become SoundCraft's built-in EQ and dynamics, with the
+        // session's settings.
+        if let Some((builtin, params)) = ins.state.as_deref().and_then(|d| crate::ptx_stock::stock_plugin(&ins.plugin, d)) {
+            for (track, slot) in targets {
+                let Some(t) = s.track_mut(track) else { continue };
+                let slots = &mut t.mixer.inserts;
+                let free = slot.filter(|&i| slots.get(i).is_some_and(Option::is_none)).or_else(|| slots.iter().position(Option::is_none));
+                if let Some(cell) = free.and_then(|i| slots.get_mut(i)) {
+                    let mut insert = soundcraft_model::Insert::new(builtin.to_string());
+                    insert.params.clone_from(&params);
+                    insert.preset = format!("from {}", ins.plugin);
+                    *cell = Some(insert);
+                }
+            }
+            continue;
+        }
         let matched = installed_match(if variant { "Auto-Tune Pro" } else { &ins.plugin }, &installed, stereo);
         match matched {
             Some(id) => {
