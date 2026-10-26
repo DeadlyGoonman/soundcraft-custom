@@ -75,6 +75,21 @@ enum Cmd {
     },
     Stop,
     Locate(Samples),
+    /// Hand every third-party instance back, with its slot (the device is being replaced).
+    TakeInstances(Sender<Vec<PreparedInstance>>),
+}
+
+/// The live third-party plugins of a player and their UI-side handles, moved to the player that
+/// replaces it (see [`Player::take_plugins`]): reopening the device then recreates nothing, and
+/// the plugins keep settings changed since the session was last saved.
+pub struct LivePlugins {
+    instances: Vec<PreparedInstance>,
+    shadow: HashMap<(TrackId, usize), (String, usize, bool)>,
+    rate: f32,
+    editors: HashMap<(TrackId, usize), Box<dyn PluginEditor>>,
+    states: BTreeMap<(TrackId, usize), Box<dyn PluginStateReader>>,
+    refused: HashSet<(TrackId, usize)>,
+    latency: HashMap<(TrackId, usize), usize>,
 }
 
 struct Shared {
@@ -331,6 +346,10 @@ impl AudioState {
                     self.pending_len = 0;
                     self.read = 0.0;
                     self.reset_mix();
+                }
+                Cmd::TakeInstances(tx) => {
+                    self.playing = false;
+                    let _ = tx.send(self.mix.take_instances());
                 }
             }
         }
@@ -628,15 +647,58 @@ impl Player {
     /// Open the output device `cfg` chooses (system, device, rate, buffer size), falling back to the
     /// defaults for whatever is unavailable. Never fails: without a device it runs a silent clock.
     pub fn with_config(session: Arc<Session>, cfg: &AudioConfig) -> Player {
-        // Start the mix's worker threads here, not in the first block of the first playback.
+        Player::with_plugins(session, cfg, None)
+    }
+
+    /// [`Player::with_config`], taking over `plugins` from the player it replaces (when it is
+    /// for the same session rate): only plugins it doesn't hold are created.
+    pub fn with_plugins(session: Arc<Session>, cfg: &AudioConfig, plugins: Option<LivePlugins>) -> Player {
+        // Start the mix's worker threads here, not in the first block of the first playback, as
+        // realtime audio threads: the callback waits on them every block.
+        #[cfg(all(windows, feature = "asio"))]
+        soundcraft_mix::set_worker_start(soundcraft_asio::realtime_thread);
         soundcraft_mix::warm_up_workers();
         let mut note = None;
         let mut p = Player::open(Arc::clone(&session), cfg, &mut note);
         p.fallback_note = note;
         p.side().return_old_sessions(&p.tx);
-        // Hand the initial session's third-party plugins over.
+        let sr = session.sample_rate.as_f64() as f32;
+        if let Some(plugins) = plugins.filter(|l| (l.rate - sr).abs() <= 0.5) {
+            let instances = p.side().install(plugins);
+            let _ = p.tx.send(Cmd::Session(Arc::clone(&session), instances));
+        }
+        // Hand the session's (remaining) third-party plugins over.
         p.update_session(session);
         p
+    }
+
+    /// Takes the live third-party plugins out of this player, for the one that replaces it
+    /// ([`Player::with_plugins`]); this player then plays without them. `None` when the audio
+    /// thread doesn't answer (a stalled device): the next player creates them anew. Close the
+    /// editors first ([`Player::close_editors`]). UI thread.
+    pub fn take_plugins(&self) -> Option<LivePlugins> {
+        let (tx, rx) = channel();
+        self.tx.send(Cmd::TakeInstances(tx)).ok()?;
+        let instances = rx.recv_timeout(std::time::Duration::from_secs(2)).ok()?;
+        let back: HashSet<(TrackId, usize)> = instances.iter().map(|i| (i.track, i.slot)).collect();
+        let mut side = self.side();
+        let mut p = LivePlugins {
+            instances,
+            shadow: std::mem::take(&mut side.shadow),
+            rate: side.rate,
+            editors: std::mem::take(&mut side.editors),
+            states: std::mem::take(&mut side.states),
+            refused: std::mem::take(&mut side.refused),
+            latency: std::mem::take(&mut side.latency),
+        };
+        // A slot whose instance didn't come back is created anew by the next player; its handles
+        // go with the old one.
+        p.shadow.retain(|k, (_, _, made)| !*made || back.contains(k));
+        p.editors.retain(|k, _| back.contains(k));
+        p.states.retain(|k, _| back.contains(k));
+        p.refused.retain(|k| back.contains(k));
+        p.latency.retain(|k, _| back.contains(k));
+        Some(p)
     }
 
     /// What stopped the audio output, once: a bug in the engine, or the device went away or
@@ -1205,6 +1267,16 @@ fn copy_meter_snapshot(source: &MeterSnapshot, out: &mut MeterSnapshot) {
 }
 
 impl Side {
+    /// Takes over another player's live plugins; returns the instances for the audio thread.
+    fn install(&mut self, p: LivePlugins) -> Vec<PreparedInstance> {
+        self.shadow = p.shadow;
+        self.editors = p.editors;
+        self.states = p.states;
+        self.refused = p.refused;
+        self.latency = p.latency;
+        p.instances
+    }
+
     fn capture_states(&mut self) -> PluginStates {
         self.states.iter_mut().filter(|(k, _)| !self.refused.contains(*k)).filter_map(|(&(t, slot), r)| Some((t, slot, r.save_state()?))).collect()
     }
@@ -1836,6 +1908,46 @@ mod tests {
         tx.send(Cmd::Session(Arc::new(s44), Vec::new())).unwrap();
         st.fill(&mut out, 2);
         assert_eq!(grx.try_recv().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn instances_handed_back_for_a_new_device_leave_with_their_slots() {
+        use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+        let mut s = soundcraft_model::Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.fake"));
+        let s = Arc::new(s);
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let (gtx, grx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
+        let plugin = soundcraft_dsp::create("gain").unwrap();
+        tx.send(Cmd::Session(Arc::clone(&s), vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin }])).unwrap();
+        let mut out = vec![0.0f32; 256];
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        st.fill(&mut out, 2);
+        // Placed and playing; the handover takes it out of its slot and stops.
+        let (itx, irx) = channel();
+        tx.send(Cmd::TakeInstances(itx)).unwrap();
+        st.fill(&mut out, 2);
+        let back = irx.try_recv().unwrap();
+        assert_eq!(back.iter().map(|i| (i.track, i.slot, i.id.as_str(), i.ch)).collect::<Vec<_>>(), vec![(t, 1, "clap:test.fake", 2)]);
+        assert!(!st.playing);
+        assert!(grx.try_recv().is_err(), "nothing retired: it was handed over, not dropped");
+        // Another engine adopts it as is.
+        let (tx2, rx2) = channel();
+        let mut st2 = AudioState::new(rx2, shared, Arc::new(soundcraft_model::Session::default()), 44_100.0, channel().0);
+        tx2.send(Cmd::Session(s, back)).unwrap();
+        st2.fill(&mut out, 2);
+        let (itx, irx) = channel();
+        tx2.send(Cmd::TakeInstances(itx)).unwrap();
+        st2.fill(&mut out, 2);
+        assert_eq!(irx.try_recv().unwrap().len(), 1, "the new engine held it");
     }
 
     #[test]

@@ -67,6 +67,18 @@ pub fn drivers() -> Vec<String> {
     Vec::new()
 }
 
+/// Puts the calling thread in Windows' "Pro Audio" scheduling class (MMCSS) at high priority,
+/// once per thread (later calls are a thread-local read). For realtime audio threads: the ASIO
+/// callback does it itself; the mix's worker threads call it as they start.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub fn realtime_thread() {
+    ffi::realtime_thread();
+}
+
+/// No realtime scheduling class on this target.
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+pub fn realtime_thread() {}
+
 /// Successful probes, so a driver that later fails to load still reports its last caps.
 #[cfg(all(windows, target_arch = "x86_64"))]
 static CACHE: Mutex<Option<HashMap<String, DriverCaps>>> = Mutex::new(None);

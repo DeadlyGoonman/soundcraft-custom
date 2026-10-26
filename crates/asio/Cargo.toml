@@ -11,7 +11,7 @@ repository.workspace = true
 log.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 # An isolated unsafe helper crate (craftrules never-crash), like soundcraft-clap-host: this crate
 # opts out of the workspace `unsafe_code = "forbid"` for itself only. It denies unsafe everywhere

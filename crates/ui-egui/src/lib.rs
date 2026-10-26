@@ -1060,18 +1060,31 @@ impl SoundApp {
         }
         self.ui.audio = cfg;
         let at = self.position();
+        let started = std::time::Instant::now();
+        let mut plugins = None;
         if let Some(p) = &self.player {
             p.stop();
-            // The old player's plugin instances go away with it; their editor windows must be
-            // closed here, on the main thread, or they would stay on screen orphaned.
+            // Editor windows are closed here, on the main thread, or they would stay on screen
+            // orphaned if their plugin went away with the old player.
             p.close_editors();
+            // The plugins don't depend on the device: the new player takes them over instead of
+            // creating every one again (slow with many plugins), with their current settings.
+            plugins = p.take_plugins();
         }
         // The input reopens on the next record or monitor with the new choice.
         self.recorder = None;
         self.recorder_failed = false;
         // The old player goes first: an ASIO driver can only be open once.
         self.player = None;
-        let player = soundcraft_playback::Player::with_config(self.engine.session_arc(), &self.ui.audio);
+        let closed = started.elapsed();
+        let kept = plugins.is_some();
+        let player = soundcraft_playback::Player::with_plugins(self.engine.session_arc(), &self.ui.audio, plugins);
+        log::info!(
+            "audio device reopened in {} ms (old device closed in {} ms; plugins {})",
+            started.elapsed().as_millis(),
+            closed.as_millis(),
+            if kept { "kept" } else { "created anew" }
+        );
         player.locate(at);
         self.player = Some(player);
         self.report_fallback();

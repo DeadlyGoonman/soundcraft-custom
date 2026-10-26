@@ -505,6 +505,29 @@ impl MixEngine {
         out
     }
 
+    /// Every third-party instance this engine holds or is waiting to place, with its slot,
+    /// leaving those slots empty: for another engine to adopt when the host reopens its audio
+    /// device (the instances don't depend on it). A waiting instance wins over the one in its
+    /// slot, which is retired, as `sync` would.
+    pub fn take_instances(&mut self) -> Vec<PreparedInstance> {
+        let mut out: HashMap<(TrackId, usize), PreparedInstance> = HashMap::new();
+        for (&track, st) in &mut self.strips {
+            let slots = st.plugins.iter_mut().enumerate().chain(std::iter::once((INSTRUMENT_SLOT, &mut st.instrument)));
+            for (slot, cell) in slots {
+                if let Some(s) = cell.take_if(|s| is_third_party(&s.id)) {
+                    out.insert((track, slot), PreparedInstance { track, slot, id: s.id, ch: s.ch, plugin: s.plugin });
+                }
+            }
+        }
+        for (key, waiting) in self.adopt.drain() {
+            if let Some(old) = out.insert(key, waiting) {
+                self.retired.push(old.plugin);
+            }
+        }
+        self.synced = (usize::MAX, usize::MAX, usize::MAX);
+        out.into_values().collect()
+    }
+
     pub fn max_block(&self) -> usize {
         self.max_block
     }
@@ -1349,26 +1372,66 @@ pub fn set_serial_strips(serial: bool) {
     SERIAL_STRIPS.store(serial, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// What each mix worker runs as it starts (see [`set_worker_start`]).
+#[cfg(not(target_arch = "wasm32"))]
+static WORKER_START: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// The mix's own worker pool: the audio thread waits on these workers every block, so they are
+/// not shared with the rest of the app (waveforms, scans and the like on rayon's global pool
+/// would hold up a block) and run as the host's realtime threads.
+#[cfg(not(target_arch = "wasm32"))]
+static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+
+/// Sets what each mix worker thread runs as it starts: the host's realtime scheduling (MMCSS
+/// "Pro Audio" on Windows). Call before [`warm_up_workers`]; later calls are ignored.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_worker_start(f: fn()) {
+    let _ = WORKER_START.set(f);
+}
+
+/// No worker pool on this target.
+#[cfg(target_arch = "wasm32")]
+pub fn set_worker_start(_f: fn()) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pool() -> Option<&'static rayon::ThreadPool> {
+    POOL.get_or_init(|| {
+        let start = WORKER_START.get().copied();
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("soundcraft-mix-{i}"))
+            .start_handler(move |_| {
+                if let Some(f) = start {
+                    f();
+                }
+            })
+            .build()
+            .map_err(|e| log::warn!("mix worker pool: {e}; tracks are mixed on one core"))
+            .ok()
+    })
+    .as_ref()
+}
+
 /// Process strips, in parallel on native targets when there are enough of them.
 #[cfg(not(target_arch = "wasm32"))]
 fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
     use rayon::prelude::*;
-    if work.len() >= 4 && !SERIAL_STRIPS.load(std::sync::atomic::Ordering::Relaxed) {
-        // The workers render on behalf of this thread: on the audio thread, they are it too.
-        let audio = on_audio_thread();
-        work.par_iter_mut().for_each(|w| as_audio_thread(audio, || f(w)));
-    } else {
-        work.iter_mut().for_each(f);
+    match pool() {
+        Some(pool) if work.len() >= 4 && !SERIAL_STRIPS.load(std::sync::atomic::Ordering::Relaxed) => {
+            // The workers render on behalf of this thread: on the audio thread, they are it too.
+            let audio = on_audio_thread();
+            pool.install(|| work.par_iter_mut().for_each(|w| as_audio_thread(audio, || f(w))));
+        }
+        _ => work.iter_mut().for_each(f),
     }
 }
 
-/// Starts the worker pool [`MixEngine::render`] shares strips out to. Rayon creates it on first
-/// use, which would otherwise be the first block of the first playback, on the audio thread: a
-/// thread per core spawned inside one buffer period (1 ms at 48 frames), a dropout. Call it from
-/// a non-realtime thread before audio starts; later calls are free.
+/// Starts the worker pool [`MixEngine::render`] shares strips out to. It would otherwise start on
+/// first use, the first block of the first playback, on the audio thread: a thread per core
+/// spawned inside one buffer period (1 ms at 48 frames), a dropout. Call it from a non-realtime
+/// thread before audio starts; later calls are free.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn warm_up_workers() {
-    let _ = rayon::current_num_threads();
+    let _ = pool();
 }
 
 /// No worker pool on this target.

@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CLSIDFromString, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows_sys::Win32::System::Registry::{HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW};
+use windows_sys::Win32::System::Threading::{AVRT_PRIORITY_HIGH, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority};
 use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetDesktopWindow, MSG, PM_REMOVE, PeekMessageW, TranslateMessage};
 use windows_sys::core::GUID;
 
@@ -202,8 +203,34 @@ impl Context {
     }
 }
 
+std::thread_local! {
+    static REALTIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// "Pro Audio", NUL-terminated UTF-16: the MMCSS task for audio threads (no allocation).
+const PRO_AUDIO: [u16; 10] = [80, 114, 111, 32, 65, 117, 100, 105, 111, 0];
+
+/// Puts the calling thread in Windows' "Pro Audio" scheduling class (MMCSS) at high priority,
+/// once per thread: the scheduler then runs it ahead of ordinary work, which keeps small buffers
+/// from dropping out. Drivers that already do it for their callback thread are unaffected.
+pub(crate) fn realtime_thread() {
+    if REALTIME.get() {
+        return;
+    }
+    REALTIME.set(true);
+    let mut task = 0u32;
+    // SAFETY: `PRO_AUDIO` is a NUL-terminated wide string and `task` a valid out-pointer.
+    let h = unsafe { AvSetMmThreadCharacteristicsW(PRO_AUDIO.as_ptr(), &mut task) };
+    if h.is_null() {
+        return;
+    }
+    // SAFETY: `h` is the live MMCSS handle just returned for this thread.
+    unsafe { AvSetMmThreadPriority(h, AVRT_PRIORITY_HIGH) };
+}
+
 /// Runs one block for half-buffer `index` on the audio thread, never letting a panic escape.
 fn process_block(index: i32) {
+    realtime_thread();
     let p = ACTIVE.load(Ordering::Acquire);
     let Ok(idx) = usize::try_from(index) else { return };
     if p.is_null() || idx > 1 {
