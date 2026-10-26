@@ -164,6 +164,14 @@ impl Vst3Plugin {
         self.inst.normalized_value(*self.ids.get(i)?)
     }
 
+    /// The controller's own text for a normalized value of a parameter (`getParamStringByValue`),
+    /// for any parameter. For diagnostics and tests; call from the main thread.
+    #[doc(hidden)]
+    pub fn controller_text(&self, id: &str, normalized: f64) -> Option<String> {
+        let i = self.info.params.iter().position(|p| p.id == id)?;
+        self.inst.value_text(*self.ids.get(i)?, normalized)
+    }
+
     /// The editor's size in pixels without opening it (creates and releases a view). For
     /// diagnostics and tests; real plugins expect this on the main thread.
     pub fn editor_size(&self) -> Result<(u32, u32), String> {

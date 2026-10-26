@@ -17,6 +17,15 @@ fn main() {
     for p in info.params {
         println!("{:>6} {:<32} min {:<10} max {:<10} def {:<10} now {:?}", p.id, p.name, p.min, p.max, p.default, n.plugin.param(p.id));
     }
+    // `PARAM_TEXT=<id>,<id>...`: the plugin's text at 41 normalized values of each parameter.
+    if let Ok(ids) = std::env::var("PARAM_TEXT") {
+        let vst = soundcraft_vst3_host::instantiate_plugin(&id).expect("vst3");
+        for pid in ids.split(',') {
+            let texts: Vec<String> =
+                (0..=40).map(|k| f64::from(k) / 40.0).map(|v| format!("{v:.3}={}", vst.controller_text(pid, v).unwrap_or_default())).collect();
+            println!("{pid}: {}", texts.join(" | "));
+        }
+    }
     if let Some(s) = n.plugin.save_state() {
         std::fs::write(out, s).expect("write");
     }

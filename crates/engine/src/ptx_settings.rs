@@ -120,6 +120,11 @@ fn waves_state(template: &[u8], xml: &[u8]) -> Option<Vec<u8>> {
 /// The values of Avid's typed parameter list, in order, up to the first entry that isn't one
 /// (FabFilter follows them with data of its own).
 fn aax_params(data: &[u8]) -> Vec<f64> {
+    aax_named(data).into_iter().map(|(_, v)| v).collect()
+}
+
+/// Avid's typed parameter list as (name, value) pairs, in order (see [`aax_params`]).
+fn aax_named(data: &[u8]) -> Vec<(String, f64)> {
     let mut out = Vec::new();
     let mut i = AAX_PARAMS.len();
     while let Some(kind) = data.get(i..i + 2) {
@@ -133,13 +138,59 @@ fn aax_params(data: &[u8]) -> Vec<f64> {
         let mut at = i + 2 + nul + 1;
         at += (at - i) % 2;
         let Some(v) = data.get(at..at + width) else { break };
-        out.push(match kind {
+        let name = String::from_utf8_lossy(data.get(i + 2..i + 2 + nul).unwrap_or_default()).into_owned();
+        out.push((name, match kind {
             b"l_" => f64::from(i32::from_be_bytes([v[0], v[1], v[2], v[3]])),
             b"f_" => f64::from(f32::from_be_bytes([v[0], v[1], v[2], v[3]])),
             b"s_" => f64::from(i16::from_be_bytes([v[0], v[1]])),
             _ => f64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]),
-        });
+        }));
         i = at + width;
+    }
+    out
+}
+
+/// Auto-Tune plugins other than Auto-Tune Pro (EFX, Artist, Live, Hybrid, Evo, 8.x, the old
+/// AutoTune) import as Auto-Tune Pro, which covers what they do.
+pub fn is_autotune_variant(name: &str) -> bool {
+    let n: String = name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect();
+    n.starts_with("autotune") && n != "autotunepro"
+}
+
+/// Auto-Tune Pro's VST3 parameters an Auto-Tune variant's settings map to.
+const AT_SCALE: &str = "1";
+const AT_KEY: &str = "2";
+const AT_RETUNE: &str = "4";
+const AT_INPUT: &str = "10";
+const AT_HUMANIZE: &str = "61";
+
+/// Auto-Tune Pro parameter values (VST3 id -> plain value) for an Auto-Tune variant's saved
+/// settings, where they can be read: Auto-Tune EFX's Avid parameter list (`kypu` key 0-11 from
+/// C, `scpu` 0 major / 1 minor, `sld1` retune speed in ms, `vrpu` input type, `HumK` humanize
+/// 0-100). Pro's units, read from its own value texts: scale 0 Major, 1 Minor; key 0-11 from C;
+/// input type 0 Soprano, 1 Alto-Tenor, 2 Low Male; humanize 0-1; retune speed 0-1 for 400 ms
+/// down to 0 ms, `ms = 400 (7^(2(1 - x)) - 1) / 48`. Other variants' data (encrypted) gives
+/// none: Pro then starts from its defaults. Their raw data is never handed to Pro, which reads
+/// it as garbage.
+pub fn autotune_params(data: &[u8]) -> std::collections::BTreeMap<String, f32> {
+    let mut out = std::collections::BTreeMap::new();
+    if !data.starts_with(AAX_PARAMS) {
+        return out;
+    }
+    for (name, v) in aax_named(data) {
+        if !v.is_finite() {
+            continue;
+        }
+        let (id, value) = match name.as_str() {
+            "kypu" => (AT_KEY, v.round().clamp(0.0, 11.0)),
+            "scpu" if v == 0.0 || v == 1.0 => (AT_SCALE, v),
+            "sld1" => (AT_RETUNE, 1.0 - (1.0 + 0.12 * v.clamp(0.0, 400.0)).ln() / (2.0 * 7f64.ln())),
+            "vrpu" => (AT_INPUT, v.round().clamp(0.0, 4.0)),
+            "HumK" => (AT_HUMANIZE, (v / 100.0).clamp(0.0, 1.0)),
+            _ => continue,
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        out.insert(id.to_string(), value as f32);
     }
     out
 }
@@ -320,6 +371,46 @@ mod tests {
         let session = ffbs(&[1.0, 0.0, 8.99], b"FQ3p\x03\0\0\0preset name and more");
         assert_eq!(ffbs_state(&template, &session), Some(container(&ffbs(&[1.0, 0.0, 8.99], b"FFpr\x01\0\0\0\0\0\0\0"))));
         assert_eq!(ffbs_state(&template, &ffbs(&[1.0; 4], b"")), None, "more values than the plugin has");
+    }
+
+    #[test]
+    fn auto_tune_variants_are_every_auto_tune_but_pro() {
+        for v in ["Auto-Tune EFX AAX", "Auto-Tune 8.1", "AutoTune", "Auto-Tune Artist", "Auto-Tune Live", "Auto-Tune Hybrid", "Auto-Tune Evo"] {
+            assert!(is_autotune_variant(v), "{v}");
+        }
+        assert!(!is_autotune_variant("Auto-Tune Pro"));
+        assert!(!is_autotune_variant("Auto-Key"));
+    }
+
+    #[test]
+    fn auto_tune_efx_settings_map_to_auto_tune_pro_units() {
+        let mut d = AAX_PARAMS.to_vec();
+        let mut long = |name: &[u8], v: i32| {
+            d.extend_from_slice(b"l_");
+            d.extend_from_slice(name);
+            d.extend_from_slice(&[0, 0]);
+            d.extend_from_slice(&v.to_be_bytes());
+        };
+        long(b"vrpu", 2);
+        long(b"kypu", 10);
+        long(b"scpu", 1);
+        long(b"butc", 1);
+        for (name, v) in [(&b"sld1"[..], 25.0f64), (b"HumK", 32.5)] {
+            d.extend_from_slice(b"d_");
+            d.extend_from_slice(name);
+            d.extend_from_slice(&[0, 0]);
+            d.extend_from_slice(&v.to_be_bytes());
+        }
+        let p = autotune_params(&d);
+        assert_eq!(p.get(AT_KEY), Some(&10.0), "A#");
+        assert_eq!(p.get(AT_SCALE), Some(&1.0), "minor");
+        assert_eq!(p.get(AT_INPUT), Some(&2.0), "low male");
+        assert!((p[AT_HUMANIZE] - 0.325).abs() < 1e-6);
+        // 25 ms on Pro's curve: x with 400 (7^(2(1 - x)) - 1) / 48 = 25.
+        let x = f64::from(p[AT_RETUNE]);
+        assert!((400.0 * (7f64.powf(2.0 * (1.0 - x)) - 1.0) / 48.0 - 25.0).abs() < 0.01);
+        assert_eq!(p.len(), 5, "note buttons are not Pro parameters");
+        assert!(autotune_params(b"\x12\xc5\x88\x93 encrypted").is_empty());
     }
 
     #[test]

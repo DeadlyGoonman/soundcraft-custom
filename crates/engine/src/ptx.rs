@@ -754,9 +754,16 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
             continue;
         }
         let stereo = targets.first().and_then(|(t, _)| s.track(*t)).is_some_and(|t| t.format.channels() >= 2);
-        match installed_match(&ins.plugin, &installed, stereo) {
+        // Every other Auto-Tune becomes Auto-Tune Pro, with the settings that can be read.
+        let variant = crate::ptx_settings::is_autotune_variant(&ins.plugin);
+        let matched = installed_match(if variant { "Auto-Tune Pro" } else { &ins.plugin }, &installed, stereo);
+        match matched {
             Some(id) => {
-                let state = ins.state.as_deref().and_then(|c| crate::ptx_settings::convert(&id, c, &mut templates));
+                let (state, params) = if variant {
+                    (None, ins.state.as_deref().map(crate::ptx_settings::autotune_params).unwrap_or_default())
+                } else {
+                    (ins.state.as_deref().and_then(|c| crate::ptx_settings::convert(&id, c, &mut templates)), Default::default())
+                };
                 for (track, slot) in targets {
                     let Some(t) = s.track_mut(track) else { continue };
                     let slots = &mut t.mixer.inserts;
@@ -764,6 +771,10 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
                     if let Some(cell) = free.and_then(|i| slots.get_mut(i)) {
                         let mut insert = soundcraft_model::Insert::new(id.clone());
                         insert.state = state.as_deref().map(soundcraft_model::b64::encode);
+                        insert.params.clone_from(&params);
+                        if variant {
+                            insert.preset = format!("from {}", ins.plugin);
+                        }
                         *cell = Some(insert);
                     }
                 }
