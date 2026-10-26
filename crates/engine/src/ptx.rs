@@ -702,6 +702,17 @@ fn bare(s: &str) -> String {
 /// versions of a plugin match.
 pub fn installed_match(name: &str, installed: &[(String, String)], stereo: bool) -> Option<String> {
     let want = bare(name);
+    if let Some(found) = match_name(&want, installed, stereo) {
+        return Some(found);
+    }
+    // A UAD-2 plugin (`UAD UA 1176LN Rev E`) stands for its native UADx version (`UADx 1176LN
+    // Rev E Compressor`).
+    let rest = want.strip_prefix("uad").filter(|r| !r.starts_with('x'))?;
+    match_name(&format!("uadx{}", rest.strip_prefix("ua").unwrap_or(rest)), installed, stereo)
+}
+
+fn match_name(want: &str, installed: &[(String, String)], stereo: bool) -> Option<String> {
+    let want = want.to_string();
     if want.is_empty() {
         return None;
     }
@@ -1117,6 +1128,14 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uad_2_plugins_match_their_uadx_versions() {
+        let l = vec![("vst3:A".to_string(), "UADx 1176 Rev A Compressor".to_string()), ("vst3:B".to_string(), "UADx 1176LN Rev E Compressor".to_string())];
+        assert_eq!(installed_match("UAD UA 1176 Rev A", &l, true).as_deref(), Some("vst3:A"));
+        assert_eq!(installed_match("UAD UA 1176LN Rev E", &l, true).as_deref(), Some("vst3:B"));
+        assert_eq!(installed_match("UAD LA3A", &l, true), None);
+    }
 
     #[test]
     fn clip_names_lead_to_their_files() {
