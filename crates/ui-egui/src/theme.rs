@@ -702,7 +702,7 @@ pub fn clip_colors(rgb: [u8; 3], selected: bool) -> (Color32, Color32, Color32) 
         return if selected { (tint(0.2), bar, shade(0.22)) } else { (tint(0.45), bar, shade(0.32)) };
     }
     // A dark body and a light waveform in the clip's own colour; selection inverts them.
-    if selected { (shade(0.7), bar, Color32::from_rgb(16, 16, 18)) } else { (shade(0.34), bar, tint(0.35)) }
+    if selected { (shade(0.7), bar, Color32::from_rgb(16, 16, 18)) } else { (shade(0.5), bar, tint(0.35)) }
 }
 
 pub fn rgb(c: [u8; 3]) -> Color32 {
