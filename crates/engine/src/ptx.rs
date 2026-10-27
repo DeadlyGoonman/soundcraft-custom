@@ -797,7 +797,13 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
         match matched {
             Some(id) => {
                 let (state, params) = if variant {
-                    (None, ins.state.as_deref().map(crate::ptx_settings::autotune_params).unwrap_or_default())
+                    // The older Auto-Tune versions' sound is Auto-Tune Pro's Classic Mode.
+                    let fresh = templates
+                        .entry(id.clone())
+                        .or_insert_with(|| soundcraft_mix::create_instance(&id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state()));
+                    let params = ins.state.as_deref().map(crate::ptx_settings::autotune_params).unwrap_or_default();
+                    // Written into the state too, so the editor opens on them (they are also sent to the plugin).
+                    (fresh.as_deref().and_then(|f| crate::ptx_settings::autotune_state(f, &params)), params)
                 } else {
                     (ins.state.as_deref().and_then(|c| crate::ptx_settings::convert(&id, c, &mut templates)), Default::default())
                 };
@@ -1045,15 +1051,17 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     placements.sort_by_key(|p| order.get(p.playlist.as_str()).copied().unwrap_or(usize::MAX));
     let first = placements.iter().map(|p| p.position).min().unwrap_or(0);
     let side_of = |p: &PtxPlacement| ptx.clips.get(p.clip).and_then(|c| c.name.rsplit_once('.')).map(|(_, s)| s).filter(|s| *s == "L" || *s == "R");
-    // A stereo track's clips all come as .L / .R pairs: those playlists become two mono tracks. A
-    // mono track that holds a few .L or .R pieces stays one track.
+    // A stereo track's clips come as .L / .R pairs: those playlists become two mono tracks (a few
+    // mono clips among them play on both sides). A mono track that holds a few .L or .R pieces
+    // stays one track.
     let stereo: std::collections::HashSet<&str> = ptx
         .placements
         .iter()
         .map(|p| p.playlist.as_str())
         .filter(|pl| {
             let sides: Vec<Option<&str>> = ptx.placements.iter().filter(|p| p.playlist == *pl).map(side_of).collect();
-            sides.iter().all(Option::is_some) && sides.contains(&Some("L")) && sides.contains(&Some("R"))
+            let sided = sides.iter().filter(|s| s.is_some()).count();
+            sided * 2 > sides.len() && sides.contains(&Some("L")) && sides.contains(&Some("R"))
         })
         .collect();
     // Every track the session lists, in order, clips or not (aux and effects returns too); the
@@ -1101,20 +1109,27 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
             }
         };
         let Some(src) = src else { continue };
-        let side = side_of(p).filter(|_| stereo.contains(p.playlist.as_str()));
-        let track_name = side.map_or_else(|| p.playlist.clone(), |side| format!("{} {side}", p.playlist));
-        let track = tracks
-            .entry(track_name.clone())
-            .or_insert_with(|| (s.add_track(TrackKind::Audio, ChannelFormat::for_channels(1), Some(&track_name)), p.playlist.clone()))
-            .0;
-        let origin = timeline_shift(first, s.sample_rate);
-        let frames = s.source(src).map_or(0, |x| x.frames);
-        let length = if clip.length > 0 { clip.length } else { frames.saturating_sub(clip.offset) };
-        let to = |v: u64| Samples::try_from(v).unwrap_or(Samples::MAX);
-        let id = s.new_clip_id();
-        let mut placed = Clip::audio(id, clip.name.clone(), src, to(clip.offset), to(p.position.saturating_sub(origin)), to(length));
-        placed.muted = p.muted;
-        crate::edit::place_clip(&mut s, track, placed);
+        let is_stereo = stereo.contains(p.playlist.as_str());
+        let sides: Vec<Option<&str>> = match side_of(p) {
+            Some(side) if is_stereo => vec![Some(side)],
+            None if is_stereo => vec![Some("L"), Some("R")],
+            _ => vec![None],
+        };
+        for side in sides {
+            let track_name = side.map_or_else(|| p.playlist.clone(), |side| format!("{} {side}", p.playlist));
+            let track = tracks
+                .entry(track_name.clone())
+                .or_insert_with(|| (s.add_track(TrackKind::Audio, ChannelFormat::for_channels(1), Some(&track_name)), p.playlist.clone()))
+                .0;
+            let origin = timeline_shift(first, s.sample_rate);
+            let frames = s.source(src).map_or(0, |x| x.frames);
+            let length = if clip.length > 0 { clip.length } else { frames.saturating_sub(clip.offset) };
+            let to = |v: u64| Samples::try_from(v).unwrap_or(Samples::MAX);
+            let id = s.new_clip_id();
+            let mut placed = Clip::audio(id, clip.name.clone(), src, to(clip.offset), to(p.position.saturating_sub(origin)), to(length));
+            placed.muted = p.muted;
+            crate::edit::place_clip(&mut s, track, placed);
+        }
     }
     s.folder = Some(folder);
     // A stereo track came in as two mono tracks: pan them hard left and right, as its sides were.
