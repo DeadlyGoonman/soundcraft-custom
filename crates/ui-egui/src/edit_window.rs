@@ -1798,13 +1798,15 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
     }
     if !dim && let Some(icon) = clip_gain_icon(s, tl, lane, clip) {
         let col = Color32::from_rgba_unmultiplied(255, 255, 255, 230);
-        let text = if clip.gain_db.abs() < 0.05 { "0 dB".to_string() } else { format!("{:.1} dB", clip.gain_db) };
-        let width = icon.width() + 8.0 + text.len() as f32 * 5.6;
-        let veil = Rect::from_min_size(pos2(icon.min.x - 3.0, icon.min.y - 1.0), vec2(width, icon.height() + 2.0)).intersect(r);
+        let text = clip_gain_text(clip);
+        let editing = painter.ctx().data(|d| d.get_temp::<ClipGainEdit>(clip_gain_edit_id())).is_some_and(|e| e.0 == clip.id);
+        let veil = clip_gain_label(s, tl, lane, clip).map_or(icon, |l| l.intersect(r));
         painter.rect_filled(veil, CornerRadius::same(2), Color32::from_black_alpha(CLIP_LABEL_VEIL));
         painter.line_segment([pos2(icon.center().x, icon.min.y), pos2(icon.center().x, icon.max.y)], Stroke::new(1.0, col));
         painter.rect_filled(Rect::from_center_size(pos2(icon.center().x, icon.center().y + 2.0), vec2(icon.width(), 3.0)), 1.0, col);
-        painter.text(pos2(icon.max.x + 3.0, icon.center().y), Align2::LEFT_CENTER, text, regular(9.5), col);
+        if !editing {
+            painter.text(pos2(icon.max.x + 3.0, icon.center().y), Align2::LEFT_CENTER, text, regular(9.5), col);
+        }
     }
     if !dim && let Some(grip) = clip_gain_handle(s, tl, lane, clip) {
         let active = matches!(app.gesture, Some(Gesture::ClipGain { clip: id, .. }) if id == clip.id);
@@ -2072,6 +2074,30 @@ pub fn clip_gain_icon(s: &Session, tl: Rect, lane: Rect, clip: &Clip) -> Option<
     (shown && x1 - x0 >= 48.0 && lane.height() >= 30.0).then(|| Rect::from_min_size(pos2(x0 + 4.0, lane.max.y - 16.0), vec2(9.0, 13.0)))
 }
 
+/// The clip gain as shown on the clip: "0 dB", "-3.5 dB".
+fn clip_gain_text(clip: &Clip) -> String {
+    if clip.gain_db.abs() < 0.05 { "0 dB".to_string() } else { format!("{:.1} dB", clip.gain_db) }
+}
+
+/// The box behind the gain reading at the bottom left of a clip; double-click it to type a value.
+fn clip_gain_label(s: &Session, tl: Rect, lane: Rect, clip: &Clip) -> Option<Rect> {
+    let icon = clip_gain_icon(s, tl, lane, clip)?;
+    let width = icon.width() + 8.0 + clip_gain_text(clip).len() as f32 * 5.6;
+    Some(Rect::from_min_size(pos2(icon.min.x - 3.0, icon.min.y - 1.0), vec2(width, icon.height() + 2.0)))
+}
+
+/// The clip whose gain is being typed in, with the text so far and whether the box still needs focus.
+type ClipGainEdit = (ClipId, String, bool);
+
+fn clip_gain_edit_id() -> egui::Id {
+    egui::Id::new("clip_gain_edit")
+}
+
+fn parse_gain_db(text: &str) -> Option<f32> {
+    let t = text.trim().trim_end_matches(|c: char| c.eq_ignore_ascii_case(&'b') || c.eq_ignore_ascii_case(&'d')).trim();
+    t.parse::<f32>().ok().filter(|v| v.is_finite()).map(|v| v.clamp(-144.0, 36.0))
+}
+
 /// The grip on the bottom edge of an audio clip: drag it up or down to change the clip gain.
 pub fn clip_gain_handle(s: &Session, tl: Rect, lane: Rect, clip: &Clip) -> Option<Rect> {
     let x0 = x_of(s, tl, clip.start).max(lane.min.x);
@@ -2112,6 +2138,8 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     // The clip may have been removed or moved since the right-click; only use it if it still exists.
     let menu_clip = ui.ctx().data(|d| d.get_temp::<Option<ClipId>>(menu_clip_id)).flatten().filter(|c| track.clips().iter().any(|x| x.id == *c));
     resp.context_menu(|ui| clip_context_menu(app, ui, menu_clip));
+    // Before the pointer-position bail-out below: the box sits over the lane, so the lane is not hovered.
+    gain_text_edit(app, ui, track, lane, tl);
     // Audio files dropped from the Clip List.
     if let Some(src) = resp.dnd_release_payload::<crate::DragSource>()
         && let Some(p) = ui.ctx().pointer_latest_pos()
@@ -2379,6 +2407,46 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
         if eff == Tool::Grabber && matches!(c.content, ClipContent::Midi { .. }) {
             app.ui.show_midi_editor = true;
         }
+    }
+    // Double-click the gain reading at the bottom left of a clip to type the gain in.
+    if resp.double_clicked()
+        && let Some(c) = &hit
+        && let Some(label) = clip_gain_label(&s, tl, lane, c)
+        && resp.interact_pointer_pos().is_some_and(|q| label.contains(q))
+    {
+        let text = format!("{:.1}", c.gain_db);
+        ui.ctx().data_mut(|d| d.insert_temp::<ClipGainEdit>(clip_gain_edit_id(), (c.id, text, true)));
+    }
+}
+
+/// The box for typing a clip gain: Enter applies, Escape (or clicking away) cancels.
+fn gain_text_edit(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, tl: Rect) {
+    let Some((id, mut text, fresh)) = ui.ctx().data(|d| d.get_temp::<ClipGainEdit>(clip_gain_edit_id())) else { return };
+    let s = app.engine.session().clone();
+    let Some(label) = track.clips().iter().find(|c| c.id == id).and_then(|c| clip_gain_label(&s, tl, lane, c)) else { return };
+    let r = Rect::from_min_size(label.min, vec2(label.width().max(64.0), label.height()));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
+    let edit = egui::TextEdit::singleline(&mut text).desired_width(r.width()).font(regular(9.5)).margin(vec2(3.0, 1.0)).id(egui::Id::new("clip_gain_edit_box"));
+    let resp = child.put(r, edit);
+    if fresh {
+        resp.request_focus();
+        child.ctx().data_mut(|d| d.insert_temp::<ClipGainEdit>(clip_gain_edit_id(), (id, text.clone(), false)));
+        // Select the old value so typing replaces it.
+        if let Some(mut state) = egui::TextEdit::load_state(child.ctx(), resp.id) {
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()))));
+            state.store(child.ctx(), resp.id);
+        }
+        return;
+    }
+    let (enter, escape) = child.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+    if enter && let Some(db) = parse_gain_db(&text) {
+        let _ = app.engine.execute("edit.select", &json!({"clips": [id.0]}));
+        let _ = app.run("clip.gain", json!({"clips": [id.0], "db": db}));
+    }
+    if enter || escape || resp.lost_focus() {
+        child.ctx().data_mut(|d| d.remove_temp::<ClipGainEdit>(clip_gain_edit_id()));
+    } else if resp.changed() {
+        child.ctx().data_mut(|d| d.insert_temp::<ClipGainEdit>(clip_gain_edit_id(), (id, text, false)));
     }
 }
 

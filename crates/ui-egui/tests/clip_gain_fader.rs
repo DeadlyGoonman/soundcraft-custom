@@ -79,3 +79,33 @@ fn the_clip_gain_handle_on_the_bottom_edge_drags_the_gain() {
     app.engine.execute("edit.undo", &json!({})).unwrap();
     assert_eq!(gain(&app), 0.0);
 }
+
+#[test]
+fn double_clicking_the_gain_reading_lets_you_type_a_gain() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut app, vec![]);
+    frame(&ctx, &mut app, vec![]);
+    let s = app.engine.session().clone();
+    let kick = s.track_by_name("Kick").unwrap();
+    let clip = kick.clips()[0].clone();
+    let [x0, y0, x1, y1] = app.edit_layout.timeline;
+    let tl = Rect::from_min_max(pos2(x0, y0), pos2(x1, y1));
+    let row = app.edit_layout.rows.iter().find(|(id, _)| *id == kick.id.0).unwrap().1;
+    let lane = Rect::from_min_max(pos2(tl.min.x, row[1]), pos2(tl.max.x, row[1] + kick.height.points()));
+    let at = edit_window::clip_gain_icon(&s, tl, lane, &clip).unwrap().center() + vec2(20.0, 0.0);
+    let gain = |app: &SoundApp| app.engine.session().find_clip(clip.id).unwrap().1.gain_db;
+    let key = |k: egui::Key| Event::Key { key: k, physical_key: Some(k), pressed: true, repeat: false, modifiers: Default::default() };
+
+    frame(&ctx, &mut app, vec![Event::PointerMoved(at)]);
+    for pressed in [true, false, true, false] {
+        frame(&ctx, &mut app, vec![Event::PointerMoved(at), button(at, pressed)]);
+    }
+    for _ in 0..3 {
+        frame(&ctx, &mut app, vec![]);
+    }
+    frame(&ctx, &mut app, vec![Event::Text("-4.5".into())]);
+    frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+    frame(&ctx, &mut app, vec![]);
+    assert!((gain(&app) + 4.5).abs() < 0.01, "typed gain applied: {}", gain(&app));
+}
