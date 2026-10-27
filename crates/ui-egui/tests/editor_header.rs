@@ -65,8 +65,20 @@ fn setup() -> (Harness<'static, SoundApp>, TrackId, Arc<Mutex<Shared>>) {
         },
         app,
     );
-    h.run_steps(3);
+    steps(&mut h, 3);
     (h, id, shared)
+}
+
+/// Frames as the app runs them: each one starts with the raw-input hook, which admits the
+/// editor poll.
+fn steps(h: &mut Harness<'_, SoundApp>, n: usize) {
+    for _ in 0..n {
+        let mut raw = std::mem::take(h.input_mut());
+        let ctx = h.ctx.clone();
+        h.state_mut().raw_input_hook(&ctx, &mut raw);
+        *h.input_mut() = raw;
+        h.step();
+    }
 }
 
 fn insert(h: &Harness<SoundApp>, id: TrackId) -> soundcraft_model::Insert {
@@ -78,10 +90,10 @@ fn header_actions_from_the_editor_change_the_insert() {
     let (mut h, id, shared) = setup();
     assert!(!insert(&h, id).bypass && !insert(&h, id).delta);
     shared.lock().unwrap().queued = vec![EditorHeaderAction::SetBypass(true), EditorHeaderAction::SetDelta(true)];
-    h.run_steps(2);
+    steps(&mut h, 2);
     assert!(insert(&h, id).bypass && insert(&h, id).delta);
     shared.lock().unwrap().queued = vec![EditorHeaderAction::SetBypass(false)];
-    h.run_steps(2);
+    steps(&mut h, 2);
     assert!(!insert(&h, id).bypass && insert(&h, id).delta);
 }
 
@@ -90,11 +102,11 @@ fn a_scale_chosen_in_the_header_is_applied_and_remembered() {
     let (mut h, id, shared) = setup();
     let scale = EditorScale { factor: 1.5, mode: EditorScaleMode::Auto };
     shared.lock().unwrap().queued = vec![EditorHeaderAction::SetScale(scale)];
-    h.run_steps(2);
+    steps(&mut h, 2);
     assert_eq!(shared.lock().unwrap().scales, vec![scale]);
     let plugin = insert(&h, id).plugin;
     assert_eq!(h.state().ui.editor_scales.get(&plugin), Some(&scale));
-    h.run_steps(2);
+    steps(&mut h, 2);
     assert_eq!(shared.lock().unwrap().state.scale, scale, "the editor is shown the remembered scale");
 }
 
@@ -103,7 +115,7 @@ fn a_dragged_upscaled_size_only_rescales_the_editor() {
     let (mut h, id, shared) = setup();
     let fsr = EditorScale { factor: 1.37, mode: EditorScaleMode::Upscale(soundcraft_dsp::UpscaleFilter::Fsr1) };
     shared.lock().unwrap().queued = vec![EditorHeaderAction::SetScale(fsr)];
-    h.run_steps(3);
+    steps(&mut h, 3);
     let s = shared.lock().unwrap();
     assert_eq!(s.scales, vec![fsr], "handed to the editor once, mode kept");
     assert_eq!((s.opens, s.closes), (0, 0), "the app never closes or reopens the editor for it");
@@ -117,7 +129,7 @@ fn keys_toggle_is_remembered_and_shown() {
     let (mut h, _id, shared) = setup();
     assert!(!h.state().ui.editor_keys, "off by default");
     shared.lock().unwrap().queued = vec![EditorHeaderAction::SetKeys(true)];
-    h.run_steps(3);
+    steps(&mut h, 3);
     assert!(h.state().ui.editor_keys);
     assert!(shared.lock().unwrap().state.keys, "the header shows it lit");
 }
@@ -132,7 +144,8 @@ fn a_forwarded_space_plays_and_stops() {
     // Frames as the app runs them: forwarded keys enter through the raw-input hook.
     for _ in 0..4 {
         let mut raw = std::mem::take(h.input_mut());
-        h.state_mut().raw_input_hook(&mut raw);
+        let ctx = h.ctx.clone();
+        h.state_mut().raw_input_hook(&ctx, &mut raw);
         *h.input_mut() = raw;
         h.step();
     }
@@ -176,7 +189,7 @@ fn the_mixers_bypass_reaches_the_editor_next_frame() {
     let (mut h, _id, shared) = setup();
     assert!(!shared.lock().unwrap().state.bypass);
     h.state_mut().engine.execute("mix.insert_bypass", &json!({"track": 1, "slot": 0, "value": true})).unwrap();
-    h.run_steps(2);
+    steps(&mut h, 2);
     let s = shared.lock().unwrap().state;
     assert!(s.bypass && !s.delta && !s.is_instrument);
 }

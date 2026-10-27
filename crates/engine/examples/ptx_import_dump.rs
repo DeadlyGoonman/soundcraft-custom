@@ -19,7 +19,16 @@ fn main() {
                 let frames = c.source().and_then(|id| s.source(id)).map_or(0, |x| x.frames);
                 let end = c.source_offset() + c.length;
                 if frames > 0 && end as u64 >= frames {
-                    println!("{:<28} {:>9}..{:>9} plays {:>7} of {:>7} from {:>7} {}", t.name, c.start, c.start + c.length, c.length, frames, c.source_offset(), c.name);
+                    println!(
+                        "{:<28} {:>9}..{:>9} plays {:>7} of {:>7} from {:>7} {}",
+                        t.name,
+                        c.start,
+                        c.start + c.length,
+                        c.length,
+                        frames,
+                        c.source_offset(),
+                        c.name
+                    );
                 }
             }
         }

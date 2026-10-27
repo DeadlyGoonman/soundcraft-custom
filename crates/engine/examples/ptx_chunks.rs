@@ -120,7 +120,8 @@ fn main() {
         }
     }
     println!("sessions: {sessions}");
-    let mut rows: Vec<(usize, String, &BTreeMap<String, (usize, usize)>)> = seen.iter().map(|(n, s)| (s.values().map(|v| v.0).sum(), n.clone(), s)).collect();
+    let mut rows: Vec<(usize, String, &BTreeMap<String, (usize, usize)>)> =
+        seen.iter().map(|(n, s)| (s.values().map(|v| v.0).sum(), n.clone(), s)).collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.0));
     for (total, name, sigs) in rows {
         println!("{total:5}  {name}");

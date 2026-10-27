@@ -102,7 +102,7 @@ pub enum ClapError {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod api {
-    use super::*;
+    use super::{ClapDescriptor, ClapError, Path, PathBuf, Plugin, PluginInfo, registry};
 
     pub fn cached() -> Option<Vec<ClapDescriptor>> {
         registry::cached()
@@ -138,7 +138,7 @@ mod api {
 
 #[cfg(target_arch = "wasm32")]
 mod api {
-    use super::*;
+    use super::{ClapDescriptor, ClapError, Path, PathBuf, Plugin, PluginInfo};
 
     pub fn cached() -> Option<Vec<ClapDescriptor>> {
         Some(Vec::new())

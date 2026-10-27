@@ -340,7 +340,8 @@ fn session_tempo(b: &[u8]) -> PtxTempo {
         t.conductor = switch(b.get(end + 8));
     }
     if t.conductor.is_none() {
-        t.conductor = blocks(b, TRANSPORT).into_iter().find(|&i| uint(b, i + 9 + 54, 4) == Some(PT_TICKS_PER_QUARTER)).and_then(|i| switch(b.get(i + 9 + 44)));
+        t.conductor =
+            blocks(b, TRANSPORT).into_iter().find(|&i| uint(b, i + 9 + 54, 4) == Some(PT_TICKS_PER_QUARTER)).and_then(|i| switch(b.get(i + 9 + 44)));
     }
     if t.manual.is_none() {
         t.manual = blocks(b, CLICK).into_iter().find_map(|i| float(b, i + 30).and_then(bpm_ok));
@@ -445,7 +446,9 @@ fn uint(b: &[u8], at: usize, width: usize) -> Option<u64> {
 fn blocks(b: &[u8], kind: u16) -> Vec<usize> {
     let tag = kind.to_le_bytes();
     (0..b.len().saturating_sub(9))
-        .filter(|&i| b.get(i) == Some(&0x5a) && b.get(i + 7..i + 9) == Some(&tag[..]) && uint(b, i + 3, 4).is_some_and(|n| n > 0 && n < b.len() as u64))
+        .filter(|&i| {
+            b.get(i) == Some(&0x5a) && b.get(i + 7..i + 9) == Some(&tag[..]) && uint(b, i + 3, 4).is_some_and(|n| n > 0 && n < b.len() as u64)
+        })
         .collect()
 }
 
@@ -574,7 +577,8 @@ fn file_list(b: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = list + 9;
     while i + 8 <= end {
-        let typed = name_at(b, i).filter(|(n, e)| !n.is_empty() && e + 4 <= end && b.get(*e..e + 4).is_some_and(|t| FILE_TYPES.iter().any(|k| &k[..] == t)));
+        let typed =
+            name_at(b, i).filter(|(n, e)| !n.is_empty() && e + 4 <= end && b.get(*e..e + 4).is_some_and(|t| FILE_TYPES.iter().any(|k| &k[..] == t)));
         match typed {
             Some((name, e)) => {
                 out.push(name);
@@ -638,8 +642,10 @@ fn chunk_inserts(b: &[u8], active: &[String]) -> Vec<PtxInsert> {
         })
         .filter(|(n, _)| !n.is_empty())
         .collect();
-    let owners: Vec<(usize, usize)> =
-        blocks(b, TRACK_INSERTS).into_iter().filter_map(|i| Some((i, i.checked_add(7)?.checked_add(usize::try_from(uint(b, i + 3, 4)?).ok()?)?))).collect();
+    let owners: Vec<(usize, usize)> = blocks(b, TRACK_INSERTS)
+        .into_iter()
+        .filter_map(|i| Some((i, i.checked_add(7)?.checked_add(usize::try_from(uint(b, i + 3, 4)?).ok()?)?)))
+        .collect();
     let chunks = blocks(b, CHUNK);
     blocks(b, INSERT)
         .into_iter()
@@ -661,8 +667,7 @@ fn chunk_inserts(b: &[u8], active: &[String]) -> Vec<PtxInsert> {
             // plugin's own data, which is what its VST3 / CLAP version reads. Only kept when the
             // chunk's ids name the plugin: the index fallback can be wrong, and another plugin's
             // settings must never reach it.
-            let state =
-                chunk.filter(|_| by_ids.is_some()).map(|c| c.get(AAX_HEADER..).unwrap_or(c).to_vec()).filter(|c| !c.is_empty());
+            let state = chunk.filter(|_| by_ids.is_some()).map(|c| c.get(AAX_HEADER..).unwrap_or(c).to_vec()).filter(|c| !c.is_empty());
             let plugin = match by_ids {
                 Some(n) => n,
                 None => plugins.get(usize::try_from(uint(b, s + 18, 2)?).ok()?)?.0.clone(),
@@ -954,10 +959,9 @@ fn find_audio(dir: &Path, entries: &[String], stem: &str, listed: Option<&str>) 
         _ => None,
     };
     let names: Vec<&str> = listed.into_iter().chain([stem]).collect();
-    names
-        .iter()
-        .find_map(|n| only(bases.iter().filter(|(_, b)| loose(b) == loose(n)).map(|(e, _)| *e).collect()))
-        .or_else(|| names.iter().find_map(|n| take_tag(n.trim()).and_then(|t| only(bases.iter().filter(|(_, b)| b.ends_with(t)).map(|(e, _)| *e).collect()))))
+    names.iter().find_map(|n| only(bases.iter().filter(|(_, b)| loose(b) == loose(n)).map(|(e, _)| *e).collect())).or_else(|| {
+        names.iter().find_map(|n| take_tag(n.trim()).and_then(|t| only(bases.iter().filter(|(_, b)| b.ends_with(t)).map(|(e, _)| *e).collect())))
+    })
 }
 
 /// How far the import moves every clip back: whole hours of the earliest clip (a session starting
@@ -1134,7 +1138,11 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     e.replace_session(s);
     e.path = None;
     e.missing_plugins = missing_plugins;
-    e.message(format!("Pro Tools {} session, read with the {} profile, {tempo_note}", ptx.version.as_deref().unwrap_or("(version not written)"), ptx.profile.label()));
+    e.message(format!(
+        "Pro Tools {} session, read with the {} profile, {tempo_note}",
+        ptx.version.as_deref().unwrap_or("(version not written)"),
+        ptx.profile.label()
+    ));
     for m in &missing {
         e.message(format!("missing media: {m}"));
     }
@@ -1147,7 +1155,10 @@ mod tests {
 
     #[test]
     fn uad_2_plugins_match_their_uadx_versions() {
-        let l = vec![("vst3:A".to_string(), "UADx 1176 Rev A Compressor".to_string()), ("vst3:B".to_string(), "UADx 1176LN Rev E Compressor".to_string())];
+        let l = vec![
+            ("vst3:A".to_string(), "UADx 1176 Rev A Compressor".to_string()),
+            ("vst3:B".to_string(), "UADx 1176LN Rev E Compressor".to_string()),
+        ];
         assert_eq!(installed_match("UAD UA 1176 Rev A", &l, true).as_deref(), Some("vst3:A"));
         assert_eq!(installed_match("UAD UA 1176LN Rev E", &l, true).as_deref(), Some("vst3:B"));
         assert_eq!(installed_match("UAD LA3A", &l, true), None);
@@ -1175,7 +1186,11 @@ mod tests {
         let both = vec![("vst3:M".to_string(), "H-Delay Mono".to_string()), ("vst3:S".to_string(), "H-Delay Stereo".to_string())];
         assert_eq!(installed_match("H-Delay", &both, true).as_deref(), Some("vst3:S"));
         assert_eq!(installed_match("H-Delay", &both, false).as_deref(), Some("vst3:M"));
-        let ff = vec![("vst3:Q3".to_string(), "Pro-Q 3".to_string()), ("vst3:Q4".to_string(), "Pro-Q 4".to_string()), ("vst3:L2".to_string(), "Pro-L 2".to_string())];
+        let ff = vec![
+            ("vst3:Q3".to_string(), "Pro-Q 3".to_string()),
+            ("vst3:Q4".to_string(), "Pro-Q 4".to_string()),
+            ("vst3:L2".to_string(), "Pro-L 2".to_string()),
+        ];
         assert_eq!(installed_match("FabFilter Pro-Q 2", &ff, true).as_deref(), Some("vst3:Q4"), "newest version, vendor dropped");
         assert_eq!(installed_match("FabFilter Pro-L", &ff, true).as_deref(), Some("vst3:L2"));
         assert_eq!(installed_match("FabFilter Pro-MB", &ff, true), None);
@@ -1215,7 +1230,10 @@ mod tests {
         assert_eq!(Profile::detect(None, false, true), Profile::ClassicUnknown, "no version, track list only");
         assert_eq!(Profile::detect(None, false, false), Profile::Unknown);
         assert_eq!(Profile::detect(Some("12.5.0"), false, false), Profile::Unknown, "a version but no tracks");
-        assert_eq!([Profile::Pt10, Profile::Pt12, Profile::ClassicUnknown, Profile::Modern].map(Profile::label), ["pt10", "pt12", "classic-unknown", "modern"]);
+        assert_eq!(
+            [Profile::Pt10, Profile::Pt12, Profile::ClassicUnknown, Profile::Modern].map(Profile::label),
+            ["pt10", "pt12", "classic-unknown", "modern"]
+        );
     }
 
     #[test]
@@ -1252,7 +1270,9 @@ mod tests {
         }
         match parent {
             None => p.extend_from_slice(&[0xff, 0xff, 1, u8::from(hardware), 0, 0, 0, 0, 0x2a, 0, 0, 0, id, 1, 2, 3, 4, 5, 6, 7]),
-            Some(of) => p.extend_from_slice(&[0x21, 0, 1, 0, 0, 0, 0, 0, 0x2a, 0, 0, 0, id, 1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0x2a, 0, 0, 0, of, 1, 2, 3, 4, 5, 6, 7]),
+            Some(of) => p.extend_from_slice(&[
+                0x21, 0, 1, 0, 0, 0, 0, 0, 0x2a, 0, 0, 0, id, 1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0x2a, 0, 0, 0, of, 1, 2, 3, 4, 5, 6, 7,
+            ]),
         }
         p.extend(block(0x2601, &[0, 0, 0, 0]));
         block(PATH, &p)
@@ -1458,7 +1478,12 @@ mod tests {
     #[test]
     fn a_hardware_output_feeds_the_track_that_takes_it_as_input() {
         let paths = [("A 1-2", 2, true), ("Out 3-4", 2, true)].map(|(n, c, h)| PtxPath { name: n.to_string(), channels: c, hardware: h }).to_vec();
-        let route = |input: Option<&str>, output: &str| PtxRoute { input: input.map(str::to_string), output: Some(output.to_string()), fader_db: None, sends: Vec::new() };
+        let route = |input: Option<&str>, output: &str| PtxRoute {
+            input: input.map(str::to_string),
+            output: Some(output.to_string()),
+            fader_db: None,
+            sends: Vec::new(),
+        };
         let ptx = Ptx {
             active: ["Beat", "Print", "Master 1"].map(str::to_string).to_vec(),
             kinds: vec![0, 0, 5],
@@ -1527,12 +1552,23 @@ mod tests {
     fn renamed_takes_find_their_files() {
         let dir = std::env::temp_dir().join(format!("soundcraft-ptx-files-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let files = ["Beat.L.wav", "Juice_REC.01_162.wav", "Juice_REC_162.wav", "fghfd.391_1893.wav", "Rec.331_1754.wav", "A.1_7.wav", "B.1_7.wav", "notes.txt"];
+        let files = [
+            "Beat.L.wav",
+            "Juice_REC.01_162.wav",
+            "Juice_REC_162.wav",
+            "fghfd.391_1893.wav",
+            "Rec.331_1754.wav",
+            "A.1_7.wav",
+            "B.1_7.wav",
+            "notes.txt",
+        ];
         for f in files {
             std::fs::write(dir.join(f), b"").unwrap();
         }
         let entries: Vec<String> = files.iter().map(|f| f.to_string()).collect();
-        let found = |stem: &str, listed: Option<&str>| find_audio(&dir, &entries, stem, listed).and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+        let found = |stem: &str, listed: Option<&str>| {
+            find_audio(&dir, &entries, stem, listed).and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        };
         assert_eq!(found("Beat.L", Some("Other.wav")).as_deref(), Some("Beat.L.wav"), "the stem comes first");
         assert_eq!(found("Juice REC.01_162", None).as_deref(), Some("Juice_REC.01_162.wav"));
         assert_eq!(found(" fghfd.391_1893", Some(" fghfd.391_1893.wav")).as_deref(), Some("fghfd.391_1893.wav"));
@@ -1611,7 +1647,8 @@ mod tests {
     /// 960000 ticks per quarter become 960), and a tempo counted in eighths becomes quarters.
     #[test]
     fn a_modern_session_with_the_conductor_on_plays_its_tempo_ruler() {
-        let ruler = tempo_ruler(&[(0, 193.0, QUARTER), (96 * u64::from(QUARTER), 170.0, QUARTER), (100 * u64::from(QUARTER), 140.0, QUARTER / 2)], None);
+        let ruler =
+            tempo_ruler(&[(0, 193.0, QUARTER), (96 * u64::from(QUARTER), 170.0, QUARTER), (100 * u64::from(QUARTER), 140.0, QUARTER / 2)], None);
         let ptx = session(None, &[ruler_track(ruler, 120.0, true), pt10_settings(99.0, false), listed(0, "Beat"), two_tracks()]);
         assert_eq!(ptx.profile, Profile::Modern);
         assert_eq!(ptx.tempo.conductor, Some(true), "the switch after the ruler wins over the transport's");
@@ -1625,7 +1662,10 @@ mod tests {
     /// With the conductor off, the manual tempo plays and the ruler (often left at 120) doesn't.
     #[test]
     fn a_pt12_session_with_the_conductor_off_plays_its_manual_tempo() {
-        let ptx = session(Some("12.5.2"), &[ruler_track(tempo_ruler(&[(0, 120.0, QUARTER)], None), 150.0, false), header_list(&[(0, "HK LD1"), (2, "Verb")]), two_tracks()]);
+        let ptx = session(
+            Some("12.5.2"),
+            &[ruler_track(tempo_ruler(&[(0, 120.0, QUARTER)], None), 150.0, false), header_list(&[(0, "HK LD1"), (2, "Verb")]), two_tracks()],
+        );
         assert_eq!(ptx.profile, Profile::Pt12);
         assert_eq!(ptx.tempo.bpm(), Some(150.0));
         let mut s = Session::default();
@@ -1638,7 +1678,15 @@ mod tests {
     /// and click settings; the ruler's first event says where bar 1 sits.
     #[test]
     fn a_pt10_session_reads_its_tempo_from_the_transport_and_click_settings() {
-        let parts = |conductor| vec![tempo_ruler(&[(0, 81.484, QUARTER), (16 * u64::from(QUARTER), 120.0, QUARTER)], Some(566_102)), meter(3, 4), pt10_settings(163.0, conductor), header_list(&[(0, "HK LD1"), (2, "Verb")]), two_tracks()];
+        let parts = |conductor| {
+            vec![
+                tempo_ruler(&[(0, 81.484, QUARTER), (16 * u64::from(QUARTER), 120.0, QUARTER)], Some(566_102)),
+                meter(3, 4),
+                pt10_settings(163.0, conductor),
+                header_list(&[(0, "HK LD1"), (2, "Verb")]),
+                two_tracks(),
+            ]
+        };
         let off = session(Some("10.3.9"), &parts(false));
         assert_eq!(off.profile, Profile::Pt10);
         assert_eq!((off.tempo.conductor, off.tempo.manual, off.tempo.song_start), (Some(false), Some(163.0), Some(566_102)));
@@ -1658,7 +1706,15 @@ mod tests {
     #[test]
     fn a_song_start_puts_bar_one_where_pro_tools_has_it() {
         use soundcraft_time::BarBeat;
-        let parts = |song_start| vec![tempo_ruler(&[(0, 120.0, QUARTER)], song_start), meter(4, 4), pt10_settings(163.0, false), header_list(&[(0, "HK LD1"), (2, "Verb")]), two_tracks()];
+        let parts = |song_start| {
+            vec![
+                tempo_ruler(&[(0, 120.0, QUARTER)], song_start),
+                meter(4, 4),
+                pt10_settings(163.0, false),
+                header_list(&[(0, "HK LD1"), (2, "Verb")]),
+                two_tracks(),
+            ]
+        };
         let ptx = session(Some("10.3.9"), &parts(Some(566_102)));
         assert_eq!(ptx.tempo.song_start, Some(566_102));
         let sr = SampleRate::HZ_48000;

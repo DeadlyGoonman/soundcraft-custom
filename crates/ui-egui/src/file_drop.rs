@@ -105,7 +105,7 @@ pub(crate) fn audio_lane(app: &mut SoundApp, ui: &Ui, lane: Rect, tl: Rect, id: 
     }
     let accent = Tokens::current().accent;
     let header = is_header(lane, tl);
-    let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new(("audio_drop", id.0)))).with_clip_rect(if header { lane } else { tl });
+    let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::unique(("audio_drop", id.0)))).with_clip_rect(if header { lane } else { tl });
     painter.rect_stroke(lane, 0.0, Stroke::new(2.0, accent), StrokeKind::Inside);
     if !header {
         let s = app.engine.session();

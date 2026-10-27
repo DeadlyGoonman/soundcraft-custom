@@ -530,7 +530,9 @@ pub fn palette_for(ctx: &egui::Context, mode: ThemeMode, custom: [u8; 3]) -> Pal
         ThemeMode::Dark => Palette::Dark,
         ThemeMode::Oled => Palette::Oled,
         ThemeMode::Custom => Palette::Custom(custom),
-        ThemeMode::System if ctx.system_theme() == Some(egui::Theme::Light) => Palette::Light,
+        ThemeMode::System if crate::appearance::resolve(ctx.system_theme(), || crate::appearance::desktop_theme(ctx)) == Some(egui::Theme::Light) => {
+            Palette::Light
+        }
         ThemeMode::System => Palette::Dark,
     }
 }

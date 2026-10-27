@@ -58,11 +58,7 @@ pub struct TempoMap {
 
 impl Default for TempoMap {
     fn default() -> Self {
-        TempoMap {
-            tempos: vec![TempoEvent { tick: 0, bpm: 120.0 }],
-            meters: vec![MeterEvent { tick: 0, numerator: 4, denominator: 4 }],
-            origin: 0,
-        }
+        TempoMap { tempos: vec![TempoEvent { tick: 0, bpm: 120.0 }], meters: vec![MeterEvent { tick: 0, numerator: 4, denominator: 4 }], origin: 0 }
     }
 }
 
@@ -496,7 +492,12 @@ mod tests {
             // The whole map shifts by the origin, nothing else changes.
             assert_eq!(m.tick_to_samples(tick, sr), plain.tick_to_samples(tick, sr) + 566_102);
         }
-        for bb in [BarBeat { bar: 1, beat: 1, tick: 0 }, BarBeat { bar: 5, beat: 3, tick: 10 }, BarBeat { bar: 9, beat: 2, tick: 0 }, BarBeat { bar: 0, beat: 2, tick: 0 }] {
+        for bb in [
+            BarBeat { bar: 1, beat: 1, tick: 0 },
+            BarBeat { bar: 5, beat: 3, tick: 10 },
+            BarBeat { bar: 9, beat: 2, tick: 0 },
+            BarBeat { bar: 0, beat: 2, tick: 0 },
+        ] {
             assert_eq!(m.bar_beat_at(m.samples_at_bar_beat(bb, sr), sr), bb);
         }
         for s in [0, 1, 566_101, 566_102, 1_000_000, 5_000_000] {

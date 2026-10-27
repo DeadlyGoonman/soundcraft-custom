@@ -91,7 +91,7 @@ fn clicking_an_insert_slot_opens_the_plugin_editor_not_the_parameter_menu() {
         app,
     );
     h.run_steps(4);
-    h.get_by_label("Insert A").click();
+    h.get_by_label("Insert A for Vox").click();
     h.run_steps(3);
     let id = vox_id(&h);
     assert_eq!(h.state().ui.plugin_windows, vec![(id, 0)], "clicking the slot opened the plugin");

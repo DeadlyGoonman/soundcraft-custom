@@ -133,7 +133,7 @@ impl ProjectSave {
 pub fn project_fields(ui: &mut egui::Ui, services: &Services, cmd: &str, p: &mut ProjectSave, path: &mut String) {
     egui::Grid::new("project_prompt").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
         ui.label("Folder");
-        ui.add(egui::TextEdit::singleline(&mut p.folder).desired_width(420.0));
+        crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut p.folder).desired_width(420.0)), "Folder");
         ui.end_row();
         ui.label("");
         if let Some(pick) = &services.pick_folder {
@@ -153,7 +153,7 @@ pub fn project_fields(ui: &mut egui::Ui, services: &Services, cmd: &str, p: &mut
         }
         ui.end_row();
         ui.label("Name");
-        ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(420.0));
+        crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(420.0)), "Name");
         ui.end_row();
         ui.label("");
         crate::widgets::checkbox(ui, &mut p.subfolder, "Create a folder for the project");
@@ -196,7 +196,7 @@ impl SoundApp {
 
 /// UI commands handled here (`window.preferences`).
 pub fn run(app: &mut SoundApp, id: &str, p: &serde_json::Value) -> Option<serde_json::Value> {
-    (id == "window.preferences").then(|| {
+    (id == "window.preferences" || id == "setup.preferences").then(|| {
         let prefs = &mut app.ui.preferences;
         prefs.show = p.get("value").and_then(serde_json::Value::as_bool).unwrap_or(!prefs.show);
         json!({"value": prefs.show})
@@ -256,7 +256,7 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
         Page::General => {
             ui.label("Default projects folder");
             let prefs = &mut app.ui.preferences;
-            ui.add(egui::TextEdit::singleline(&mut prefs.default_projects_dir).desired_width(420.0));
+            crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut prefs.default_projects_dir).desired_width(420.0)), "Default projects folder");
             if let Some(pick) = &app.services.pick_folder
                 && ui.button("Browse…").clicked()
                 && let Some(dir) = pick(&prefs.projects_dir())
@@ -285,7 +285,10 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
                     }
                 });
             });
-            note(ui, "Recordings are WAV files. 32-bit float keeps every level above full scale; 16 and 24-bit are smaller but clip above full scale.");
+            note(
+                ui,
+                "Recordings are WAV files. 32-bit float keeps every level above full scale; 16 and 24-bit are smaller but clip above full scale.",
+            );
             ui.horizontal(|ui| {
                 use soundcraft_engine::device_rate::RatePolicy;
                 let label = |p: RatePolicy| match p {
@@ -328,7 +331,7 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
         }
         Page::Export => {
             ui.label("Bounce folder (beside the session)");
-            ui.add(egui::TextEdit::singleline(&mut app.ui.preferences.bounce_folder).desired_width(260.0));
+            crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut app.ui.preferences.bounce_folder).desired_width(260.0)), "Bounce folder");
             note(ui, "Bounce Mix proposes <session folder>/<this folder>/<name> Bounce.wav.");
         }
     }
@@ -344,7 +347,11 @@ fn plugins_page(app: &mut SoundApp, ui: &mut egui::Ui) {
     ui.add_space(6.0);
     let idle = !s.scanning() && s.can_scan();
     ui.horizontal(|ui| {
-        if ui.add_enabled(idle, egui::Button::new("Scan Plugins")).on_hover_text("Load every plugin file and keep the list for later launches").clicked() {
+        if ui
+            .add_enabled(idle, egui::Button::new("Scan Plugins"))
+            .on_hover_text("Load every plugin file and keep the list for later launches")
+            .clicked()
+        {
             s.start_scan(true);
         }
         if ui

@@ -25,7 +25,9 @@ fn main() {
     let defs = all.iter().filter(|(s, _, t)| *t == 0x2628 && b.get(s + 7..s + 9) == Some(&0x2628u16.to_le_bytes()[..])).count();
     println!("clip defs {defs}, parsed clips {}", p.clips.len());
     // `PTX_DEFS=<from>-<to>`: those clip definitions.
-    if let Some((a, z)) = std::env::var("PTX_DEFS").ok().and_then(|s| s.split_once('-').map(|(a, z)| (a.parse::<usize>().ok(), z.parse::<usize>().ok()))) {
+    if let Some((a, z)) =
+        std::env::var("PTX_DEFS").ok().and_then(|s| s.split_once('-').map(|(a, z)| (a.parse::<usize>().ok(), z.parse::<usize>().ok())))
+    {
         for (i, c) in p.clips.iter().enumerate().skip(a.unwrap_or(0)).take(z.unwrap_or(0).saturating_sub(a.unwrap_or(0)) + 1) {
             println!("{i:>5} {:<36} off {:>9} len {:>8} file {:?}", c.name, c.offset, c.length, c.file.and_then(|f| p.files.get(f)));
         }
@@ -53,7 +55,13 @@ fn main() {
                 .iter()
                 .filter(|(cs, ce, _)| *cs < s && s < *ce && ce - cs < 50_000_000)
                 .map(|&(cs, _, t)| {
-                    let name = if t == 0x1052 || t == 0x261b { uint(&b, cs + 9, 4).and_then(|n| b.get(cs + 13..cs + 13 + n.min(64) as usize)).map(|x| String::from_utf8_lossy(x).into_owned()) } else { None };
+                    let name = if t == 0x1052 || t == 0x261b {
+                        uint(&b, cs + 9, 4)
+                            .and_then(|n| b.get(cs + 13..cs + 13 + n.min(64) as usize))
+                            .map(|x| String::from_utf8_lossy(x).into_owned())
+                    } else {
+                        None
+                    };
                     format!("{t:04x}{}", name.map(|n| format!("'{n}'")).unwrap_or_default())
                 })
                 .collect();
@@ -112,12 +120,18 @@ fn main() {
         let Some(ci) = p.clips.iter().position(|c| c.name == *want) else { continue };
         println!("== {want} (clip {ci})");
         let tag = 0x104fu16.to_le_bytes();
-        for &(s, e, _) in all.iter().filter(|(s, _, t)| *t == 0x104f && b.get(s + 7..s + 9) == Some(&tag[..]) && uint(&b, s + 11, 4) == Some(ci as u64)) {
+        for &(s, e, _) in
+            all.iter().filter(|(s, _, t)| *t == 0x104f && b.get(s + 7..s + 9) == Some(&tag[..]) && uint(&b, s + 11, 4) == Some(ci as u64))
+        {
             let chain: Vec<String> = all
                 .iter()
                 .filter(|(cs, ce, _)| *cs < s && s < *ce && ce - cs < 50_000_000)
                 .map(|&(cs, ce, t)| {
-                    let name = if t == 0x1052 { uint(&b, cs + 9, 4).and_then(|n| b.get(cs + 13..cs + 13 + n as usize)).map(|x| String::from_utf8_lossy(x).into_owned()) } else { None };
+                    let name = if t == 0x1052 {
+                        uint(&b, cs + 9, 4).and_then(|n| b.get(cs + 13..cs + 13 + n as usize)).map(|x| String::from_utf8_lossy(x).into_owned())
+                    } else {
+                        None
+                    };
                     format!("{t:04x}@{cs}+{}{}", ce - cs, name.map(|n| format!("'{n}'")).unwrap_or_default())
                 })
                 .collect();

@@ -34,7 +34,8 @@ fn wav(secs: f32) -> Vec<u8> {
 
 fn step(h: &mut Harness<'_, SoundApp>) {
     let mut raw = std::mem::take(h.input_mut());
-    h.state_mut().raw_input_hook(&mut raw);
+    let ctx = h.ctx.clone();
+    h.state_mut().raw_input_hook(&ctx, &mut raw);
     *h.input_mut() = raw;
     h.step();
 }
@@ -50,7 +51,7 @@ fn harness_with(services: Services) -> Harness<'static, SoundApp> {
         |ui, app: &mut SoundApp| {
             let ctx = ui.ctx().clone();
             app.logic(&ctx);
-            let rest = app.take_dropped_files(&ctx);
+            let rest = app.take_dropped_files();
             app.ui.status = if rest.is_empty() { app.ui.status.clone() } else { format!("unclaimed:{}", rest.len()) };
             app.ui(ui);
         },

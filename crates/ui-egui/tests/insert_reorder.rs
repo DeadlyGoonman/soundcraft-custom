@@ -48,7 +48,7 @@ fn slot_point(h: &Harness<SoundApp>, label: &str) -> Pos2 {
 fn dragging_insert_a_onto_insert_c_swaps_the_two() {
     let (engine, first, second) = vox();
     let mut h = harness(engine);
-    let (from, to) = (slot_point(&h, "Insert A"), slot_point(&h, "Insert C"));
+    let (from, to) = (slot_point(&h, "Insert A for Vox"), slot_point(&h, "Insert C for Vox"));
     h.hover_at(from);
     h.drag_at(from);
     for k in 1..=8 {
@@ -69,7 +69,7 @@ fn dragging_insert_a_onto_insert_c_swaps_the_two() {
 fn a_plain_click_on_an_insert_still_opens_its_plugin_window() {
     let (engine, _, _) = vox();
     let mut h = harness(engine);
-    h.get_by_label("Insert A").click();
+    h.get_by_label("Insert A for Vox").click();
     h.run_steps(3);
     let id = vox_id(&h);
     assert_eq!(h.state().ui.plugin_windows, vec![(id, 0)], "the click opened the plugin");
