@@ -320,6 +320,8 @@ pub enum Gesture {
         anchor: (f32, f32),
         fine: bool,
         fader_bottom: egui::Pos2,
+        /// Dragged by the handle on the clip's bottom edge, which shows no fader popup.
+        handle: bool,
     },
     Pencil {
         track: TrackId,

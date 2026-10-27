@@ -51,3 +51,31 @@ fn the_clip_gain_icon_drags_with_the_pointer_in_one_undo_step() {
     app.engine.execute("edit.undo", &json!({})).unwrap();
     assert_eq!(gain(&app), 0.0);
 }
+
+#[test]
+fn the_clip_gain_handle_on_the_bottom_edge_drags_the_gain() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut app, vec![]);
+    frame(&ctx, &mut app, vec![]);
+    let s = app.engine.session().clone();
+    let kick = s.track_by_name("Kick").unwrap();
+    let clip = kick.clips()[0].clone();
+    let [x0, y0, x1, y1] = app.edit_layout.timeline;
+    let tl = Rect::from_min_max(pos2(x0, y0), pos2(x1, y1));
+    let row = app.edit_layout.rows.iter().find(|(id, _)| *id == kick.id.0).unwrap().1;
+    let lane = Rect::from_min_max(pos2(tl.min.x, row[1]), pos2(tl.max.x, row[1] + kick.height.points()));
+    let at = edit_window::clip_gain_handle(&s, tl, lane, &clip).unwrap().center();
+    let gain = |app: &SoundApp| app.engine.session().find_clip(clip.id).unwrap().1.gain_db;
+
+    frame(&ctx, &mut app, vec![Event::PointerMoved(at)]);
+    frame(&ctx, &mut app, vec![button(at, true)]);
+    for dy in [3.0, 10.0, 30.0] {
+        frame(&ctx, &mut app, vec![Event::PointerMoved(at - vec2(0.0, dy))]);
+    }
+    assert!(gain(&app) > 1.0, "dragging up raises the gain: {}", gain(&app));
+    frame(&ctx, &mut app, vec![button(at - vec2(0.0, 30.0), false)]);
+    frame(&ctx, &mut app, vec![]);
+    app.engine.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(gain(&app), 0.0);
+}

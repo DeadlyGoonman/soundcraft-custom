@@ -1806,6 +1806,15 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         painter.rect_filled(Rect::from_center_size(pos2(icon.center().x, icon.center().y + 2.0), vec2(icon.width(), 3.0)), 1.0, col);
         painter.text(pos2(icon.max.x + 3.0, icon.center().y), Align2::LEFT_CENTER, text, regular(9.5), col);
     }
+    if !dim && let Some(grip) = clip_gain_handle(s, tl, lane, clip) {
+        let active = matches!(app.gesture, Some(Gesture::ClipGain { clip: id, .. }) if id == clip.id);
+        let hovered = painter.ctx().input(|i| i.pointer.hover_pos()).is_some_and(|p| r.contains(p));
+        if active || hovered {
+            let on = painter.ctx().input(|i| i.pointer.hover_pos()).is_some_and(|p| grip.contains(p)) || active;
+            let fill = if on { Color32::WHITE } else { Color32::from_rgba_unmultiplied(235, 235, 235, 200) };
+            painter.circle(grip.center() + vec2(0.0, 2.0), 4.5, fill, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)));
+        }
+    }
     let fade_col = Color32::from_rgba_unmultiplied(255, 255, 255, 90);
     for (side, fade) in [(true, fade_in), (false, fade_out)] {
         if fade.len <= 0 {
@@ -2063,6 +2072,14 @@ pub fn clip_gain_icon(s: &Session, tl: Rect, lane: Rect, clip: &Clip) -> Option<
     (shown && x1 - x0 >= 48.0 && lane.height() >= 30.0).then(|| Rect::from_min_size(pos2(x0 + 4.0, lane.max.y - 16.0), vec2(9.0, 13.0)))
 }
 
+/// The grip on the bottom edge of an audio clip: drag it up or down to change the clip gain.
+pub fn clip_gain_handle(s: &Session, tl: Rect, lane: Rect, clip: &Clip) -> Option<Rect> {
+    let x0 = x_of(s, tl, clip.start).max(lane.min.x);
+    let x1 = x_of(s, tl, clip.end()).min(lane.max.x);
+    let shown = matches!(clip.content, ClipContent::Audio { .. });
+    (shown && x1 - x0 >= 90.0 && lane.height() >= 30.0).then(|| Rect::from_center_size(pos2((x0 + x1) * 0.5, lane.max.y - 8.0), vec2(14.0, 14.0)))
+}
+
 fn clip_gain_popup(ctx: &egui::Context, fader_bottom: Pos2, pos: f32) {
     let t = Tokens::current();
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("clip_gain_fader")));
@@ -2214,7 +2231,9 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     }
     let gain_icon_at = |q: Pos2| {
         let c = clip_at(track, sample_at(&s, tl, q.x).max(0)).filter(|_| auto_view.is_none())?;
-        clip_gain_icon(&s, tl, lane, c).filter(|r| r.contains(q)).map(|_| c.clone())
+        let on_icon = clip_gain_icon(&s, tl, lane, c).is_some_and(|r| r.contains(q));
+        let on_handle = clip_gain_handle(&s, tl, lane, c).is_some_and(|r| r.contains(q));
+        (on_icon || on_handle).then(|| c.clone())
     };
     if resp.hovered() && gain_icon_at(p).is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
@@ -2238,7 +2257,8 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
         let y = (origin.y + CLIP_FADER_TRAVEL * pos).max(screen.min.y + CLIP_FADER_TRAVEL + 30.0).min(screen.max.y - 10.0);
         let fader_bottom = pos2(origin.x.max(screen.min.x + 26.0), y);
         let fine = mods.command || mods.ctrl;
-        app.gesture = Some(Gesture::ClipGain { clip: c.id, track: track.id, pos, anchor: (origin.y, pos), fine, fader_bottom });
+        let handle = clip_gain_handle(&s, tl, lane, &c).is_some_and(|r| r.contains(origin));
+        app.gesture = Some(Gesture::ClipGain { clip: c.id, track: track.id, pos, anchor: (origin.y, pos), fine, fader_bottom, handle });
     } else if resp.drag_started()
         && let Some((c, fade_in)) = curve_handle
     {
@@ -2277,7 +2297,7 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
             Tool::Zoom => Some(Gesture::ZoomBox { start: origin.x }),
         };
     }
-    if let Some(Gesture::ClipGain { clip, track: t, pos, anchor, fine, fader_bottom }) = &mut app.gesture
+    if let Some(Gesture::ClipGain { clip, track: t, pos, anchor, fine, fader_bottom, handle }) = &mut app.gesture
         && *t == track.id
         && resp.dragged()
     {
@@ -2293,7 +2313,9 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
             let _ = app.engine.execute_merged("clip.gain", &json!({"clips": [clip.0], "db": db}), &format!("clip_gain:{}", clip.0));
         }
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-        clip_gain_popup(ui.ctx(), *fader_bottom, *pos);
+        if !*handle {
+            clip_gain_popup(ui.ctx(), *fader_bottom, *pos);
+        }
     }
     if resp.clicked()
         && let Some((param, at)) = &point_hit
