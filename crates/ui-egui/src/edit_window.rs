@@ -1580,9 +1580,17 @@ fn grid_lines(painter: &egui::Painter, s: &Session, tl: Rect, lane: Rect) {
     }
 }
 
-fn clip_name_height(s: &Session, lane: Rect) -> f32 {
-    if lane.height() >= 40.0 && s.edit.flag("view.clip.name") { 13.0 } else { 0.0 }
+/// The clip name floats over the waveform on a translucent black box, so it reserves no height.
+fn clip_name_height(_s: &Session, _lane: Rect) -> f32 {
+    0.0
 }
+
+fn clip_name_shown(s: &Session, lane: Rect) -> bool {
+    lane.height() >= 40.0 && s.edit.flag("view.clip.name")
+}
+
+/// Translucent black box behind clip text, so it reads over any waveform.
+const CLIP_LABEL_VEIL: u8 = 150;
 
 fn fade_curve_points(fade: soundcraft_model::Fade, fade_in: bool, a: f32, b: f32, body: Rect, pixels_per_point: f32) -> Vec<Pos2> {
     let scale = if pixels_per_point.is_finite() { pixels_per_point.clamp(0.5, 4.0) } else { 1.0 };
@@ -1679,7 +1687,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
             && s.edit.selection.start <= clip.start
             && s.edit.selection.end >= clip.end());
     let color = clip.color.unwrap_or(track.color);
-    let (mut body, bar, mut wave) = clip_colors(color, selected);
+    let (mut body, _, mut wave) = clip_colors(color, selected);
     if clip.muted || dim {
         body = body.gamma_multiply(0.45);
         wave = Color32::from_rgb(70, 70, 70);
@@ -1687,18 +1695,6 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
     let body = if s.edit.flag("view.clip.transparency") { body.gamma_multiply(0.55) } else { body };
     painter.rect(r, CornerRadius::same(2), body, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
     let name_h = clip_name_height(s, lane);
-    if name_h > 0.0 {
-        let nb = Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + name_h));
-        painter.rect_filled(nb, CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, if clip.muted { Color32::from_rgb(70, 70, 70) } else { bar });
-        let name_clip = nb.intersect(lane);
-        painter.with_clip_rect(name_clip).text(
-            pos2(nb.min.x.max(lane.min.x) + 4.0, nb.center().y),
-            Align2::LEFT_CENTER,
-            &clip.name,
-            bold(10.5),
-            Color32::from_rgb(12, 12, 12),
-        );
-    }
     let body_r = Rect::from_min_max(pos2(r.min.x, r.min.y + name_h), r.max);
     let vis = body_r.intersect(lane);
     // The waveform and fade curve share the same temporary envelope every frame.
@@ -1801,10 +1797,14 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         }
     }
     if !dim && let Some(icon) = clip_gain_icon(s, tl, lane, clip) {
-        let col = Color32::from_rgba_unmultiplied(255, 255, 255, 200);
+        let col = Color32::from_rgba_unmultiplied(255, 255, 255, 230);
+        let text = if clip.gain_db.abs() < 0.05 { "0 dB".to_string() } else { format!("{:.1} dB", clip.gain_db) };
+        let width = icon.width() + 8.0 + text.len() as f32 * 5.6;
+        let veil = Rect::from_min_size(pos2(icon.min.x - 3.0, icon.min.y - 1.0), vec2(width, icon.height() + 2.0)).intersect(r);
+        painter.rect_filled(veil, CornerRadius::same(2), Color32::from_black_alpha(CLIP_LABEL_VEIL));
         painter.line_segment([pos2(icon.center().x, icon.min.y), pos2(icon.center().x, icon.max.y)], Stroke::new(1.0, col));
         painter.rect_filled(Rect::from_center_size(pos2(icon.center().x, icon.center().y + 2.0), vec2(icon.width(), 3.0)), 1.0, col);
-        painter.text(pos2(icon.max.x + 3.0, icon.center().y), Align2::LEFT_CENTER, format!("{:+.1} dB", clip.gain_db), regular(9.5), col);
+        painter.text(pos2(icon.max.x + 3.0, icon.center().y), Align2::LEFT_CENTER, text, bold(9.5), col);
     }
     let fade_col = Color32::from_rgba_unmultiplied(255, 255, 255, 90);
     for (side, fade) in [(true, fade_in), (false, fade_out)] {
@@ -1881,6 +1881,20 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
     if clip.edit_locked || clip.time_locked {
         painter.text(pos2(r.max.x - 10.0, r.min.y + 7.0), Align2::CENTER_CENTER, "🔒", regular(9.0), Color32::WHITE);
     }
+    if clip_name_shown(s, lane) {
+        let left = r.min.x.max(lane.min.x) + 2.0;
+        let galley = painter.layout_no_wrap(clip.name.clone(), bold(10.5), Color32::WHITE);
+        let w = (galley.size().x + 8.0).min((r.max.x - left - 2.0).max(0.0));
+        if w > 4.0 {
+            let nb = Rect::from_min_size(pos2(left, r.min.y + 2.0), vec2(w, 13.0));
+            let label = painter.with_clip_rect(nb.intersect(lane));
+            label.rect_filled(nb, CornerRadius::same(2), Color32::from_black_alpha(CLIP_LABEL_VEIL));
+            let col = if clip.muted { Color32::from_gray(170) } else { Color32::WHITE };
+            label.text(pos2(nb.min.x + 4.0, nb.center().y), Align2::LEFT_CENTER, &clip.name, bold(10.5), col);
+        }
+    }
+    // The thin black outline, redrawn last so the waveform and fades never cover the sides.
+    painter.rect_stroke(r, CornerRadius::same(2), Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
     let _ = app;
 }
 
