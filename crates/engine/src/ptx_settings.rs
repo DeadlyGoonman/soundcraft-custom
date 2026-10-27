@@ -161,6 +161,7 @@ pub fn is_autotune_variant(name: &str) -> bool {
 }
 
 /// Auto-Tune Pro's VST3 parameters an Auto-Tune variant's settings map to.
+const AT_MODERN_SCALE: &str = "162";
 const AT_SCALE: &str = "1";
 const AT_KEY: &str = "2";
 const AT_RETUNE: &str = "4";
@@ -186,7 +187,12 @@ pub fn autotune_params(data: &[u8]) -> std::collections::BTreeMap<String, f32> {
         }
         let (id, value) = match name.as_str() {
             "kypu" => (AT_KEY, v.round().clamp(0.0, 11.0)),
-            "scpu" if v == 0.0 || v == 1.0 => (AT_SCALE, v),
+            "scpu" if v == 0.0 || v == 1.0 => {
+                // Pro's Modern Scale list starts with Chromatic, so Major is 1 and Minor 2: without
+                // this the plugin shows the key with Chromatic.
+                out.insert(AT_MODERN_SCALE.to_string(), v as f32 + 1.0);
+                (AT_SCALE, v)
+            }
             "sld1" => (AT_RETUNE, 1.0 - (1.0 + 0.12 * v.clamp(0.0, 400.0)).ln() / (2.0 * 7f64.ln())),
             "vrpu" => (AT_INPUT, v.round().clamp(0.0, 4.0)),
             "HumK" => (AT_HUMANIZE, (v / 100.0).clamp(0.0, 1.0)),
@@ -196,6 +202,112 @@ pub fn autotune_params(data: &[u8]) -> std::collections::BTreeMap<String, f32> {
         out.insert(id.to_string(), value as f32);
     }
     out
+}
+
+/// JUCE's base64 alphabet (6 bits per character, least significant first).
+const JUCE_B64: &[u8] = b".ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+";
+
+/// Auto-Tune Pro keeps its parameters as XML (`<Parameter X11="0.0"/>`) in JUCE-base64
+/// (`<length>.<data>`, the bytes `VC2!`, a u32 LE length, the XML), in each `ParamsData` of its
+/// component state (`VC2!`, u32 LE XML length, the XML, a tail). Parameter 11 is "Use Classic Mode
+/// DSP" and isn't exposed as a VST3 parameter, so it is set in the state.
+const AT_CLASSIC_ID: &str = "11";
+
+fn juce_b64_decode(s: &str) -> Option<Vec<u8>> {
+    let (n, body) = s.split_once('.')?;
+    let (mut acc, mut bits, mut out) = (0u32, 0, Vec::new());
+    for c in body.bytes() {
+        acc |= u32::try_from(JUCE_B64.iter().position(|&a| a == c)?).ok()? << bits;
+        bits += 6;
+        while bits >= 8 {
+            out.push((acc & 255) as u8);
+            acc >>= 8;
+            bits -= 8;
+        }
+    }
+    out.truncate(n.parse().ok()?);
+    Some(out)
+}
+
+fn juce_b64_encode(raw: &[u8]) -> String {
+    let (mut acc, mut bits, mut out) = (0u32, 0, String::new());
+    for &b in raw {
+        acc |= u32::from(b) << bits;
+        bits += 8;
+        while bits >= 6 {
+            out.push(char::from(JUCE_B64[(acc & 63) as usize]));
+            acc >>= 6;
+            bits -= 6;
+        }
+    }
+    if bits > 0 {
+        out.push(char::from(JUCE_B64[(acc & 63) as usize]));
+    }
+    format!("{}.{out}", raw.len())
+}
+
+/// `value` as Pro writes parameter values (`6.0`, `0.5`).
+fn at_value(v: f32) -> String {
+    format!("{v:?}")
+}
+
+/// Auto-Tune Pro's state from a fresh `template` with Classic Mode on (the older Auto-Tune
+/// versions' algorithm) and `params` (VST3 id -> plain value) written into it, so the editor
+/// opens on them. `None` when the state isn't Pro's.
+pub fn autotune_state(template: &[u8], params: &std::collections::BTreeMap<String, f32>) -> Option<Vec<u8>> {
+    const KEY: &str = "ParamsData=\"";
+    let rest = template.strip_prefix(b"SCV3")?;
+    let comp_len = usize::try_from(u32::from_le_bytes(rest.get(..4)?.try_into().ok()?)).ok()?;
+    let comp = rest.get(4..4usize.checked_add(comp_len)?)?;
+    let after = rest.get(4 + comp_len..)?;
+    let xml_len = usize::try_from(u32::from_le_bytes(comp.strip_prefix(b"VC2!")?.get(..4)?.try_into().ok()?)).ok()?;
+    let xml = std::str::from_utf8(comp.get(8..8usize.checked_add(xml_len)?)?).ok()?;
+    let tail = comp.get(8 + xml_len..)?;
+    let mut wanted: Vec<(String, f32)> = params.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    wanted.push((AT_CLASSIC_ID.to_string(), 1.0));
+    let (mut out, mut from, mut changed) = (String::new(), 0, false);
+    while let Some(p) = xml[from..].find(KEY) {
+        let start = from + p + KEY.len();
+        let end = start + xml[start..].find('"')?;
+        out.push_str(&xml[from..start]);
+        from = end;
+        let Some(raw) = juce_b64_decode(&xml[start..end]) else {
+            out.push_str(&xml[start..end]);
+            continue;
+        };
+        let Some(inner) = raw.get(8..).and_then(|x| std::str::from_utf8(x).ok()) else {
+            out.push_str(&xml[start..end]);
+            continue;
+        };
+        let mut inner = inner.to_string();
+        for (id, v) in &wanted {
+            let key = format!("X{id}=\"");
+            if let Some(at) = inner.find(&key) {
+                let vstart = at + key.len();
+                if let Some(vend) = inner[vstart..].find('"') {
+                    inner.replace_range(vstart..vstart + vend, &at_value(*v));
+                    changed = true;
+                }
+            }
+        }
+        let mut new = raw.get(..4)?.to_vec();
+        new.extend_from_slice(&u32::try_from(inner.len()).ok()?.to_le_bytes());
+        new.extend_from_slice(inner.as_bytes());
+        out.push_str(&juce_b64_encode(&new));
+    }
+    out.push_str(&xml[from..]);
+    if !changed {
+        return None;
+    }
+    let mut new_comp = b"VC2!".to_vec();
+    new_comp.extend_from_slice(&u32::try_from(out.len()).ok()?.to_le_bytes());
+    new_comp.extend_from_slice(out.as_bytes());
+    new_comp.extend_from_slice(tail);
+    let mut state = b"SCV3".to_vec();
+    state.extend_from_slice(&u32::try_from(new_comp.len()).ok()?.to_le_bytes());
+    state.extend_from_slice(&new_comp);
+    state.extend_from_slice(after);
+    Some(state)
 }
 
 /// Index of Pro-Q 2's "Solo Band" in its value list.
@@ -346,6 +458,35 @@ mod tests {
     }
 
     #[test]
+    fn auto_tune_state_gets_classic_mode_and_params_with_lengths_kept_right() {
+        let mut raw = b"VC2!    ".to_vec();
+        let inner = "<ActualParams><Parameter X2=\"0.0\"/><Parameter X11=\"0.0\"/></ActualParams>";
+        raw.extend_from_slice(inner.as_bytes());
+        let xml = format!("<S ParamsData=\"{}\"/>", juce_b64_encode(&raw));
+        let mut comp = b"VC2!".to_vec();
+        comp.extend_from_slice(&u32::try_from(xml.len()).unwrap().to_le_bytes());
+        comp.extend_from_slice(xml.as_bytes());
+        comp.extend_from_slice(b"  JUCEPrivateData");
+        let mut state = b"SCV3".to_vec();
+        state.extend_from_slice(&u32::try_from(comp.len()).unwrap().to_le_bytes());
+        state.extend_from_slice(&comp);
+        state.extend_from_slice(&0u32.to_le_bytes());
+        let params = std::collections::BTreeMap::from([("2".to_string(), 10.0f32)]);
+        let out = autotune_state(&state, &params).expect("patched");
+        let c = component(&out).expect("component");
+        let n = usize::try_from(u32::from_le_bytes(c[4..8].try_into().unwrap())).unwrap();
+        assert!(c[8 + n..].starts_with(b"  JUCE"), "xml length matches");
+        let x = std::str::from_utf8(&c[8..8 + n]).unwrap();
+        let (a, b) = (x.find("ParamsData=\"").unwrap() + 12, x.rfind('"').unwrap());
+        let got = juce_b64_decode(&x[a..b]).unwrap();
+        assert_eq!(u32::from_le_bytes(got[4..8].try_into().unwrap()) as usize, got.len() - 8);
+        let got = String::from_utf8_lossy(&got[8..]).into_owned();
+        assert!(got.contains("X2=\"10.0\"") && got.contains("X11=\"1.0\""), "{got}");
+        assert!(out.ends_with(&0u32.to_le_bytes()));
+        assert!(autotune_state(b"no params here", &params).is_none());
+    }
+
+    #[test]
     fn aax_parameter_lists_read_in_order_and_stop_at_foreign_data() {
         let d = aax(&[(b"l_", 1.0), (b"d_", 7.0105), (b"d_", -3.39)]);
         assert_eq!(aax_params(&d), vec![1.0, 7.0105, -3.39]);
@@ -429,12 +570,13 @@ mod tests {
         let p = autotune_params(&d);
         assert_eq!(p.get(AT_KEY), Some(&10.0), "A#");
         assert_eq!(p.get(AT_SCALE), Some(&1.0), "minor");
+        assert_eq!(p.get(AT_MODERN_SCALE), Some(&2.0), "minor in the modern list");
         assert_eq!(p.get(AT_INPUT), Some(&2.0), "low male");
         assert!((p[AT_HUMANIZE] - 0.325).abs() < 1e-6);
         // 25 ms on Pro's curve: x with 400 (7^(2(1 - x)) - 1) / 48 = 25.
         let x = f64::from(p[AT_RETUNE]);
         assert!((400.0 * (7f64.powf(2.0 * (1.0 - x)) - 1.0) / 48.0 - 25.0).abs() < 0.01);
-        assert_eq!(p.len(), 5, "note buttons are not Pro parameters");
+        assert_eq!(p.len(), 6, "note buttons are not Pro parameters");
         assert!(autotune_params(b"\x12\xc5\x88\x93 encrypted").is_empty());
     }
 

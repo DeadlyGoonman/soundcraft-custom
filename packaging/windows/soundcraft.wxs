@@ -60,6 +60,12 @@
             <Verb Id="open" Command="Open" TargetFile="SoundcraftExe" Argument="&quot;%1&quot;" />
           </Extension>
         </ProgId>
+        <!-- .ptx: session files SoundCraft imports; double-clicking opens them in SoundCraft. -->
+        <ProgId Id="SoundCraft.Ptx" Description="Session File (import)" Icon="SoundcraftExe" IconIndex="0">
+          <Extension Id="ptx" ContentType="application/x-soundcraft-import">
+            <Verb Id="open" Command="Open" TargetFile="SoundcraftExe" Argument="&quot;%1&quot;" />
+          </Extension>
+        </ProgId>
         <!-- Audio and MIDI files: offered under "Open with" (imported into a session), never forced
              as the default. -->
         <ProgId Id="SoundCraft.Audio" Description="Audio File" Icon="SoundcraftExe" IconIndex="0" />
