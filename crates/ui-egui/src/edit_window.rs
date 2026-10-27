@@ -874,6 +874,10 @@ fn views_button(app: &mut SoundApp, ui: &mut Ui, rulers: Rect) {
         if ui.button("Minimal").clicked() {
             let _ = app.run("view.edit_minimal", json!({}));
         }
+        ui.separator();
+        if ui.button("Save as Default").on_hover_text("New sessions and imports start with these views").clicked() {
+            app.remember_edit_views();
+        }
     });
 }
 

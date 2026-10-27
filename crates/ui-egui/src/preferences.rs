@@ -21,6 +21,9 @@ pub struct Prefs {
     pub project_subfolder: bool,
     /// The folder Bounce Mix proposes beside the session.
     pub bounce_folder: String,
+    /// The Edit window views (`edit_view.*` flags) last switched on; new sessions and imports start
+    /// with them. `None` until a view is first changed.
+    pub edit_views: Option<Vec<String>>,
     #[serde(skip)]
     pub show: bool,
     #[serde(skip)]
@@ -33,6 +36,7 @@ impl Default for Prefs {
             default_projects_dir: platform_projects_dir(),
             project_subfolder: true,
             bounce_folder: DEFAULT_BOUNCE_FOLDER.into(),
+            edit_views: None,
             show: false,
             page: Page::General,
         }
@@ -157,6 +161,37 @@ pub fn project_fields(ui: &mut egui::Ui, services: &Services, cmd: &str, p: &mut
     });
     *path = p.path();
     ui.label(egui::RichText::new(format!("Will be saved to: {path}")).small().color(crate::theme::Tokens::current().text_dim));
+}
+
+const VIEW_PREFIX: &str = "edit_view.";
+
+/// Whether running `id` starts a session whose views come from the saved set: a new one or a
+/// Pro Tools import (a saved `.scraft` keeps the views it was saved with).
+pub fn starts_fresh_views(id: &str, p: &serde_json::Value) -> bool {
+    matches!(id, "session.new" | "session.new_from_template")
+        || (id == "session.open" && p.get("path").and_then(|v| v.as_str()).is_some_and(|f| f.to_lowercase().ends_with(".ptx")))
+}
+
+impl SoundApp {
+    /// Saves the views now on in this session as the default for new sessions and imports. Views
+    /// changed in a session otherwise stay with that session (Views › Save as Default).
+    pub(crate) fn remember_edit_views(&mut self) {
+        let on: Vec<String> = self.engine.session().edit.flags.iter().filter(|f| f.starts_with(VIEW_PREFIX)).cloned().collect();
+        if self.ui.preferences.edit_views.as_ref() != Some(&on) {
+            self.ui.preferences.edit_views = Some(on);
+            // The host saves ui.json straight away on this flag, so a crash cannot lose the choice.
+            self.recent_changed = true;
+        }
+    }
+
+    /// Turns on the saved default views in the current (fresh) session.
+    pub(crate) fn apply_saved_edit_views(&mut self) {
+        let Some(saved) = self.ui.preferences.edit_views.clone() else { return };
+        let edit = &mut self.engine.session_mut().edit;
+        for f in saved.iter().filter(|f| f.starts_with(VIEW_PREFIX)) {
+            edit.set_flag(f, true);
+        }
+    }
 }
 
 /// UI commands handled here (`window.preferences`).

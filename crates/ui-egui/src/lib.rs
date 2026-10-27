@@ -558,6 +558,9 @@ impl SoundApp {
                 if id == "app.quit" {
                     self.quit_requested = true;
                 }
+                if preferences::starts_fresh_views(id, &params) {
+                    self.apply_saved_edit_views();
+                }
                 if matches!(id, "edit.copy" | "edit.cut") {
                     self.claim_clipboard = true;
                 }
@@ -1742,6 +1745,26 @@ mod open_step_tests {
 mod tests {
     use super::{Services, SoundApp, automation_step_due};
     use serde_json::json;
+
+    #[test]
+    fn edit_views_are_remembered_for_new_sessions() {
+        let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+        app.run("view.edit_minimal", json!({})).unwrap();
+        for id in ["view.edit_sends_ae", "view.edit_inserts_ae", "view.edit_io"] {
+            app.run(id, json!({"value": true})).unwrap();
+        }
+        assert!(app.ui.preferences.edit_views.is_none(), "a view change stays with its session");
+        app.remember_edit_views();
+        assert!(app.take_recent_changed(), "saving the default asks the host to save ui.json");
+        // Survives a ui.json round trip.
+        let saved = serde_json::to_value(&app.ui.preferences).unwrap();
+        let back: crate::preferences::Prefs = serde_json::from_value(saved).unwrap();
+        assert_eq!(back.edit_views, app.ui.preferences.edit_views);
+        app.run("session.new", json!({})).unwrap();
+        let edit = &app.engine.session().edit;
+        assert!(edit.flag("edit_view.sends_ae") && edit.flag("edit_view.inserts_ae") && edit.flag("edit_view.io"));
+        assert!(!edit.flag("edit_view.comments"));
+    }
 
     #[test]
     fn new_session_stops_playback_and_the_old_clock() {
