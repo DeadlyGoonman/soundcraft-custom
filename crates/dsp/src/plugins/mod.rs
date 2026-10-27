@@ -8,6 +8,7 @@ pub mod modulation;
 pub mod pitch;
 pub mod reverb;
 pub mod sampler;
+pub mod stock;
 pub mod strip;
 pub mod synth;
 pub mod utility;
@@ -29,6 +30,12 @@ pub(crate) static REGISTRY: &[&PluginInfo] = &[
     &modulation::CHORUS_INFO,
     &modulation::FLANGER_INFO,
     &modulation::PHASER_INFO,
+    &stock::DYN_DELAY_INFO,
+    &stock::CHORUS_INFO,
+    &stock::FLANGER_INFO,
+    &stock::ENSEMBLE_INFO,
+    &stock::PHASER_INFO,
+    &stock::DVERB_INFO,
     &harmonic::SAT_INFO,
     &harmonic::LOFI_INFO,
     &harmonic::RECT_INFO,
@@ -61,6 +68,12 @@ pub(crate) fn instantiate(id: &str) -> Option<Box<dyn Plugin>> {
         "chorus" => Box::new(modulation::ModFx::chorus()),
         "flanger" => Box::new(modulation::ModFx::flanger()),
         "phaser" => Box::new(modulation::Phaser::new()),
+        "dynamic_delay" => Box::new(stock::DynamicDelay::new()),
+        "stock_chorus" => Box::new(stock::StockMod::chorus()),
+        "stock_flanger" => Box::new(stock::StockMod::flanger()),
+        "stock_ensemble" => Box::new(stock::Ensemble::new()),
+        "stock_phaser" => Box::new(stock::Phaser::new()),
+        "stock_dverb" => Box::new(stock::DVerb::new()),
         "saturator" => Box::new(harmonic::Saturator::new()),
         "lofi" => Box::new(harmonic::LoFi::new()),
         "rectifier" => Box::new(harmonic::Rectifier::new()),

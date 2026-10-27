@@ -4,7 +4,7 @@
 //! Each conversion starts from a fresh instance's state (made once per plugin, in SoundCraft's
 //! VST3 container: "SCV3", u32 LE length + component state, u32 LE length + controller state):
 //! - Waves: the AAX data is the same preset XML the VST3 component state holds ([`waves_state`]).
-//! - FabFilter Pro-Q 2, Pro-MB, Pro-L 2 (older FabFilter): the AAX data is Avid's typed
+//! - FabFilter Pro-Q 2, Pro-MB, Pro-L 2 (older FabFilter): the AAX data is Pro Tools' typed
 //!   parameter list and the VST3 component state the same values as floats ([`fabfilter_state`]).
 //! - FabFilter Pro-Q 3 (`FFBS`): the same value array in both, with format-specific blocks
 //!   after it ([`ffbs_state`]).
@@ -25,7 +25,7 @@ pub const STATE_PROBE_ARG: &str = "--probe-state";
 const STATE_PROBE_MARK: &str = "SOUNDCRAFT-STATE ";
 /// How long the settings check may take (two instances of one plugin) before it is killed.
 const STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
-/// Avid's typed parameter list (`AAX_CChunkDataParser`): this header, then per value a type
+/// Pro Tools' typed parameter list (`AAX_CChunkDataParser`): this header, then per value a type
 /// (`l_` i32, `d_` f64, `f_` f32, `s_` i16), its name NUL-terminated and padded to an even
 /// length, and the value, big-endian.
 const AAX_PARAMS: &[u8] = &[1, 1, 1, 1];
@@ -117,13 +117,13 @@ fn waves_state(template: &[u8], xml: &[u8]) -> Option<Vec<u8>> {
     Some(container(&c))
 }
 
-/// The values of Avid's typed parameter list, in order, up to the first entry that isn't one
+/// The values of Pro Tools' typed parameter list, in order, up to the first entry that isn't one
 /// (FabFilter follows them with data of its own).
 fn aax_params(data: &[u8]) -> Vec<f64> {
     aax_named(data).into_iter().map(|(_, v)| v).collect()
 }
 
-/// Avid's typed parameter list as (name, value) pairs, in order (see [`aax_params`]).
+/// Pro Tools' typed parameter list as (name, value) pairs, in order (see [`aax_params`]).
 pub(crate) fn aax_named(data: &[u8]) -> Vec<(String, f64)> {
     let mut out = Vec::new();
     let mut i = AAX_PARAMS.len();
@@ -139,12 +139,15 @@ pub(crate) fn aax_named(data: &[u8]) -> Vec<(String, f64)> {
         at += (at - i) % 2;
         let Some(v) = data.get(at..at + width) else { break };
         let name = String::from_utf8_lossy(data.get(i + 2..i + 2 + nul).unwrap_or_default()).into_owned();
-        out.push((name, match kind {
-            b"l_" => f64::from(i32::from_be_bytes([v[0], v[1], v[2], v[3]])),
-            b"f_" => f64::from(f32::from_be_bytes([v[0], v[1], v[2], v[3]])),
-            b"s_" => f64::from(i16::from_be_bytes([v[0], v[1]])),
-            _ => f64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]),
-        }));
+        out.push((
+            name,
+            match kind {
+                b"l_" => f64::from(i32::from_be_bytes([v[0], v[1], v[2], v[3]])),
+                b"f_" => f64::from(f32::from_be_bytes([v[0], v[1], v[2], v[3]])),
+                b"s_" => f64::from(i16::from_be_bytes([v[0], v[1]])),
+                _ => f64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]),
+            },
+        ));
         i = at + width;
     }
     out
@@ -165,7 +168,7 @@ const AT_INPUT: &str = "10";
 const AT_HUMANIZE: &str = "61";
 
 /// Auto-Tune Pro parameter values (VST3 id -> plain value) for an Auto-Tune variant's saved
-/// settings, where they can be read: Auto-Tune EFX's Avid parameter list (`kypu` key 0-11 from
+/// settings, where they can be read: Auto-Tune EFX's Pro Tools parameter list (`kypu` key 0-11 from
 /// C, `scpu` 0 major / 1 minor, `sld1` retune speed in ms, `vrpu` input type, `HumK` humanize
 /// 0-100). Pro's units, read from its own value texts: scale 0 Major, 1 Minor; key 0-11 from C;
 /// input type 0 Soprano, 1 Alto-Tenor, 2 Low Male; humanize 0-1; retune speed 0-1 for 400 ms
@@ -198,7 +201,7 @@ pub fn autotune_params(data: &[u8]) -> std::collections::BTreeMap<String, f32> {
 /// Index of Pro-Q 2's "Solo Band" in its value list.
 const PRO_Q2_SOLO_BAND: usize = 188;
 
-/// Older FabFilter plugins: the AAX data is Avid's parameter list, one value per parameter in
+/// Older FabFilter plugins: the AAX data is Pro Tools' parameter list, one value per parameter in
 /// the VST3 parameter order and units (Pro-Q 2: 24 bands x state, frequency as log2 Hz, gain,
 /// Q, shape, slope, stereo placement, then the globals). The VST3 component state is "FabF",
 /// u32 version, u32 name length, the preset name, u32, u32 count, that many f32 LE values, then
@@ -272,7 +275,8 @@ fn state_loads_in_child(id: &str, state: &[u8]) -> bool {
             state: soundcraft_model::b64::encode(state),
         };
         // The job goes on the child's standard input: no file to write or clean up.
-        let ran = serde_json::to_vec(&job).ok().map(|j| crate::plugin_scan::run_child(exe, &[STATE_PROBE_ARG.as_ref()], Some(j), STATE_PROBE_TIMEOUT));
+        let ran =
+            serde_json::to_vec(&job).ok().map(|j| crate::plugin_scan::run_child(exe, &[STATE_PROBE_ARG.as_ref()], Some(j), STATE_PROBE_TIMEOUT));
         let ok = matches!(ran, Some(Ok((ref text, _))) if text.lines().any(|l| l.trim_end() == format!("{STATE_PROBE_MARK}ok")));
         if !ok {
             log::warn!("{id}: the session's settings failed the check in a child process; it starts from its defaults");
@@ -326,7 +330,7 @@ mod tests {
         c
     }
 
-    /// Avid's parameter list with unnamed values, then FabFilter's own data.
+    /// Pro Tools' parameter list with unnamed values, then FabFilter's own data.
     fn aax(values: &[(&[u8; 2], f64)]) -> Vec<u8> {
         let mut d = AAX_PARAMS.to_vec();
         for (kind, v) in values {

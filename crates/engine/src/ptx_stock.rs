@@ -1,5 +1,5 @@
 //! Pro Tools' own plugins (EQ3, Dyn3) have no VST3 or CLAP version, but SoundCraft's built-in
-//! EQ and dynamics cover the same controls. A session's data for them is Avid's parameter list
+//! EQ and dynamics cover the same controls. A session's data for them is Pro Tools' parameter list
 //! with four-character names and real units (Hz, dB, seconds); this reads those and returns the
 //! built-in plugin and its settings.
 //!
@@ -22,7 +22,10 @@ use crate::ptx_settings::aax_named;
 /// The built-in plugin id and settings standing for the Pro Tools plugin `name` with `data`,
 /// or `None` when it isn't one of these.
 pub fn stock_plugin(name: &str, data: &[u8]) -> Option<(&'static str, BTreeMap<String, f32>)> {
-    let v: HashMap<String, f64> = aax_named(data).into_iter().filter(|(_, x)| x.is_finite()).collect();
+    let named = aax_named(data);
+    // Some plugins (the AIR ones) store unnamed 0..1 values: they are read by position.
+    let pos: Vec<f64> = named.iter().map(|(_, x)| if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.0 }).collect();
+    let v: HashMap<String, f64> = named.into_iter().filter(|(_, x)| x.is_finite()).collect();
     let mut out = BTreeMap::new();
     let id = match name {
         "EQ3 7-Band" => {
@@ -45,6 +48,29 @@ pub fn stock_plugin(name: &str, data: &[u8]) -> Option<(&'static str, BTreeMap<S
             de_ess(&v, &mut out);
             "de_esser"
         }
+        "AIR Dynamic Delay" => {
+            dynamic_delay(&pos, &mut out);
+            "dynamic_delay"
+        }
+        "AIR Chorus" => {
+            chorus(&pos, &mut out);
+            "stock_chorus"
+        }
+        "AIR Flanger" => {
+            flanger(&pos, &mut out);
+            "stock_flanger"
+        }
+        "AIR Ensemble" => {
+            ensemble(&pos, &mut out);
+            "stock_ensemble"
+        }
+        "AIR Phaser" => {
+            phaser(&pos, &mut out);
+            "stock_phaser"
+        }
+        // D-Verb stores ten fixed-point words that can't be told apart reliably yet (see the
+        // vault), so it comes in with its default settings.
+        "D-Verb" => "stock_dverb",
         _ => return None,
     };
     Some((id, out))
@@ -52,7 +78,44 @@ pub fn stock_plugin(name: &str, data: &[u8]) -> Option<(&'static str, BTreeMap<S
 
 /// Whether `name` is a Pro Tools plugin [`stock_plugin`] can stand in for.
 pub fn is_stock(name: &str) -> bool {
-    matches!(name, "EQ3 7-Band" | "EQ3 1-Band" | "Dyn3 Compressor/Limiter" | "Dyn3 Expander/Gate" | "Dyn3 De-Esser")
+    matches!(
+        name,
+        "EQ3 7-Band"
+            | "EQ3 1-Band"
+            | "Dyn3 Compressor/Limiter"
+            | "Dyn3 Expander/Gate"
+            | "Dyn3 De-Esser"
+            | "AIR Dynamic Delay"
+            | "AIR Chorus"
+            | "AIR Flanger"
+            | "AIR Ensemble"
+            | "AIR Phaser"
+            | "D-Verb"
+    )
+}
+
+/// A 0..1 value on a linear range.
+fn lin(x: f64, lo: f64, hi: f64) -> f64 {
+    lo + (hi - lo) * x
+}
+
+/// A 0..1 value on an exponential range (`lo` at 0, `hi` at 1).
+fn exp_range(x: f64, lo: f64, hi: f64) -> f64 {
+    lo * (hi / lo).powf(x)
+}
+
+/// A 0..1 value on a quadratic range (slow near `lo`).
+fn quad(x: f64, lo: f64, hi: f64) -> f64 {
+    lo + (hi - lo) * x * x
+}
+
+/// The modulation rate, 0.01 to 10 Hz: 1 Hz in the middle, a straight line below it and a
+/// cubic above, both leaving the middle at the same slope.
+fn rate(x: f64) -> f64 {
+    let (lo, hi) = (0.01, 10.0);
+    let u = x - 0.5;
+    let slope = (1.0 - lo) / 0.5;
+    if u < 0.0 { 1.0 + slope * u } else { 1.0 + slope * u + (hi - 1.0 - slope * 0.5) / 0.125 * u * u * u }
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -190,6 +253,85 @@ fn de_ess(v: &HashMap<String, f64>, out: &mut BTreeMap<String, f32>) {
     }
 }
 
+/// Dynamic Delay, twelve 0..1 values in this order: mode (3 steps), sync, time, feedback, ratio,
+/// width, low cut, high cut, env > feedback, env > mix, env rate, mix. Time is quadratic from
+/// 1 to 1000 ms (a synced time picks one of 17 note steps); the cuts are exponential, the rest
+/// linear.
+fn dynamic_delay(x: &[f64], out: &mut BTreeMap<String, f32>) {
+    let Some(x) = x.get(..12) else { return };
+    put(out, "mode", (x[0] * 2.0).round(), 0.0, 2.0);
+    put(out, "sync", x[1].round(), 0.0, 1.0);
+    put(out, "time", lin(x[2] * x[2], 1.0, 1000.0), 1.0, 1000.0);
+    put(out, "note", (x[2] * 16.0).round(), 0.0, 16.0);
+    put(out, "feedback", x[3] * 100.0, 0.0, 100.0);
+    put(out, "ratio", x[4] * 100.0, 0.0, 100.0);
+    put(out, "width", x[5] * 100.0, 0.0, 100.0);
+    put(out, "low_cut", exp_range(x[6], 20.0, 1000.0), 20.0, 1000.0);
+    put(out, "high_cut", exp_range(x[7], 1000.0, 20000.0), 1000.0, 20000.0);
+    put(out, "env_fbk", lin(x[8], -100.0, 100.0), -100.0, 100.0);
+    put(out, "env_mix", lin(x[9], -100.0, 100.0), -100.0, 100.0);
+    put(out, "env_rate", exp_range(x[10], 0.01, 1.0), 0.01, 1.0);
+    put(out, "mix", x[11] * 100.0, 0.0, 100.0);
+}
+
+/// Chorus, seven 0..1 values in this order: rate, depth (0-24 ms), pre delay (0-24 ms), feedback,
+/// waveform, left/right phase (-180 to 180 degrees), mix.
+fn chorus(x: &[f64], out: &mut BTreeMap<String, f32>) {
+    let Some(x) = x.get(..7) else { return };
+    put(out, "rate", rate(x[0]), 0.01, 10.0);
+    put(out, "depth", quad(x[1], 0.0, 24.0), 0.0, 24.0);
+    put(out, "pre_delay", quad(x[2], 0.0, 24.0), 0.0, 24.0);
+    put(out, "feedback", x[3] * 100.0, 0.0, 100.0);
+    put(out, "wave", (x[4] >= 0.5).into(), 0.0, 1.0);
+    put(out, "phase", lin(x[5], -180.0, 180.0), -180.0, 180.0);
+    put(out, "mix", x[6] * 100.0, 0.0, 100.0);
+}
+
+/// Flanger, eleven 0..1 values: retrigger, sync, rate, depth (0-12 ms), pre delay (0-12 ms),
+/// feedback (-100 to 100 %), phase invert, low cut, waveform, left/right offset, mix.
+fn flanger(x: &[f64], out: &mut BTreeMap<String, f32>) {
+    let Some(x) = x.get(..11) else { return };
+    put(out, "trigger", (x[0] >= 0.5).into(), 0.0, 1.0);
+    put(out, "sync", (x[1] >= 0.5).into(), 0.0, 1.0);
+    put(out, "rate", rate(x[2]), 0.01, 10.0);
+    put(out, "depth", quad(x[3], 0.0, 12.0), 0.0, 12.0);
+    put(out, "pre_delay", quad(x[4], 0.0, 12.0), 0.0, 12.0);
+    put(out, "feedback", lin(x[5], -100.0, 100.0), -100.0, 100.0);
+    put(out, "invert", (x[6] >= 0.5).into(), 0.0, 1.0);
+    put(out, "low_cut", exp_range(x[7], 20.0, 1000.0), 20.0, 1000.0);
+    put(out, "wave", (x[8] >= 0.5).into(), 0.0, 1.0);
+    put(out, "phase", lin(x[9], -180.0, 180.0), -180.0, 180.0);
+    put(out, "mix", x[10] * 100.0, 0.0, 100.0);
+}
+
+/// Ensemble, six 0..1 values: rate, depth (0-24 ms), modulation delay (0-24 ms), shimmer, stereo
+/// width, mix.
+fn ensemble(x: &[f64], out: &mut BTreeMap<String, f32>) {
+    let Some(x) = x.get(..6) else { return };
+    put(out, "rate", rate(x[0]), 0.01, 10.0);
+    put(out, "depth", quad(x[1], 0.0, 24.0), 0.0, 24.0);
+    put(out, "delay", quad(x[2], 0.0, 24.0), 0.0, 24.0);
+    put(out, "shimmer", x[3] * 100.0, 0.0, 100.0);
+    put(out, "width", x[4] * 100.0, 0.0, 100.0);
+    put(out, "mix", x[5] * 100.0, 0.0, 100.0);
+}
+
+/// Phaser, ten 0..1 values: sync, rate, depth, feedback, low cut (20-1000 Hz), centre (100-10000
+/// Hz), poles (4 steps), waveform, left/right offset, mix.
+fn phaser(x: &[f64], out: &mut BTreeMap<String, f32>) {
+    let Some(x) = x.get(..10) else { return };
+    put(out, "sync", (x[0] >= 0.5).into(), 0.0, 1.0);
+    put(out, "rate", rate(x[1]), 0.01, 10.0);
+    put(out, "depth", x[2] * 100.0, 0.0, 100.0);
+    put(out, "feedback", x[3] * 100.0, 0.0, 100.0);
+    put(out, "low_cut", exp_range(x[4], 20.0, 1000.0), 20.0, 1000.0);
+    put(out, "center", exp_range(x[5], 100.0, 10_000.0), 100.0, 10_000.0);
+    put(out, "poles", (x[6] * 3.0).round(), 0.0, 3.0);
+    put(out, "wave", (x[7] >= 0.5).into(), 0.0, 1.0);
+    put(out, "phase", lin(x[8], -180.0, 180.0), -180.0, 180.0);
+    put(out, "mix", x[9] * 100.0, 0.0, 100.0);
+}
+
 /// The side-chain high-pass; the low-pass has no counterpart in the built-in.
 fn side_chain(v: &HashMap<String, f64>, out: &mut BTreeMap<String, f32>) {
     if v.get("LoFE").is_some_and(|x| *x >= 0.5) {
@@ -204,7 +346,7 @@ fn side_chain(v: &HashMap<String, f64>, out: &mut BTreeMap<String, f32>) {
 mod tests {
     use super::*;
 
-    /// Avid's list with named doubles.
+    /// Pro Tools' list with named doubles.
     fn list(values: &[(&str, f64)]) -> Vec<u8> {
         let mut d = vec![1, 1, 1, 1];
         for (name, v) in values {
@@ -273,5 +415,54 @@ mod tests {
         assert_eq!(p["range"], 80.0);
         assert_eq!(p["hold"], 50.0);
         assert_eq!(p["release"], 50.0);
+    }
+
+    #[test]
+    fn dynamic_delay_values_become_units() {
+        let d = unnamed(&[0.0, 1.0, 0.5925, 0.315, 0.5, 1.0, 0.645, 1.0, 0.25, 0.0, 0.5, 0.27]);
+        let (id, p) = stock_plugin("AIR Dynamic Delay", &d).unwrap();
+        assert_eq!(id, "dynamic_delay");
+        assert_eq!(p["mode"], 0.0);
+        assert_eq!(p["sync"], 1.0);
+        assert!((p["time"] - 351.5).abs() < 0.5, "{}", p["time"]);
+        assert!((p["feedback"] - 31.5).abs() < 1e-3);
+        assert!((p["low_cut"] - 20.0 * 50f32.powf(0.645)).abs() < 0.5);
+        assert_eq!(p["high_cut"], 20000.0);
+        assert_eq!(p["env_fbk"], -50.0);
+        assert_eq!(p["env_mix"], -100.0);
+        assert!((p["env_rate"] - 0.1).abs() < 1e-4);
+        assert!((p["mix"] - 27.0).abs() < 1e-3);
+    }
+
+    fn unnamed(values: &[f64]) -> Vec<u8> {
+        let mut d = vec![1, 1, 1, 1];
+        for v in values {
+            d.extend_from_slice(b"d_\0\0");
+            d.extend_from_slice(&v.to_be_bytes());
+        }
+        d
+    }
+
+    #[test]
+    fn modulation_defaults_become_units() {
+        // The default chorus found in 117 inserts of a session.
+        let (id, p) = stock_plugin("AIR Chorus", &unnamed(&[0.5, 0.25, 0.5, 0.0, 1.0, 0.75, 0.61])).unwrap();
+        assert_eq!(id, "stock_chorus");
+        assert!((p["rate"] - 1.0).abs() < 1e-4, "rate {}", p["rate"]);
+        assert!((p["depth"] - 1.5).abs() < 1e-4);
+        assert!((p["pre_delay"] - 6.0).abs() < 1e-4);
+        assert_eq!(p["wave"], 1.0);
+        assert!((p["phase"] - 90.0).abs() < 1e-3);
+        assert!((p["mix"] - 61.0).abs() < 1e-3);
+        let (_, p) = stock_plugin("AIR Flanger", &unnamed(&[0.0, 0.0, 0.5, 0.5, 0.25, 0.135, 0.0, 0.0, 0.0, 0.5, 0.265])).unwrap();
+        assert!((p["feedback"] + 73.0).abs() < 1e-3);
+        assert!((p["low_cut"] - 20.0).abs() < 1e-3);
+        let (_, p) = stock_plugin("AIR Phaser", &unnamed(&[0.0, 0.5, 0.575, 0.595, 0.0, 0.5, 0.6667, 0.0, 0.5, 0.5])).unwrap();
+        assert!((p["center"] - 1000.0).abs() < 0.5);
+        assert_eq!(p["poles"], 2.0);
+        let (_, p) = stock_plugin("AIR Ensemble", &unnamed(&[0.495, 0.355, 0.0, 0.61, 1.0, 1.0])).unwrap();
+        assert_eq!(p["width"], 100.0);
+        // The rate curve spans 0.01 to 10 Hz.
+        assert!((rate(0.0) - 0.01).abs() < 1e-9 && (rate(1.0) - 10.0).abs() < 1e-9);
     }
 }
