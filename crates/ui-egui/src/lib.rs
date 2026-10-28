@@ -401,6 +401,9 @@ pub struct SoundApp {
     /// Where a dropped audio file loads into a track's sampler (last frame's rects).
     pub sample_drop_targets: Vec<(egui::Rect, TrackId)>,
     pub audio_drop_lanes: Vec<(egui::Rect, egui::Rect, TrackId)>,
+    /// A session picked to open: its path, and whether the "Opening…" bar has been drawn yet (the
+    /// open itself blocks the UI, so the bar gets one frame first).
+    pub(crate) opening: Option<(String, bool)>,
     pub(crate) drop_preview: file_drop::DropPreview,
     sample_reads: Vec<sampler_window::SampleRead>,
     synthetic_grace: u32,
@@ -499,6 +502,7 @@ impl SoundApp {
             editor_key_events: Vec::new(),
             sample_drop_targets: Vec::new(),
             audio_drop_lanes: Vec::new(),
+            opening: None,
             drop_preview: file_drop::DropPreview::default(),
             sample_reads: Vec::new(),
             synthetic_grace: 0,
@@ -550,6 +554,11 @@ impl SoundApp {
             self.capture_plugin_states();
         }
         let replacing = matches!(id, "session.new" | "session.new_from_template" | "session.open" | "session.close" | "session.revert");
+        if replacing && let Some(p) = &self.player {
+            // The old session's plugins go away with it: close their editor windows first, on the
+            // main thread, or a window outliving its plugin crashes the plugin (Auto-Tune Pro).
+            p.close_editors();
+        }
         match self.engine.execute(id, &params) {
             Ok(v) => {
                 if replacing || (id.starts_with("session.save") && !self.engine.is_dirty()) {

@@ -407,8 +407,39 @@ pub fn join_save_path(dir: &str, name: &str, ext: &str) -> String {
     if dir.is_empty() { file } else { std::path::Path::new(dir).join(file).to_string_lossy().into_owned() }
 }
 
+/// Opens the session picked in the file picker: asks to save a modified one first, else shows the
+/// "Opening…" bar and opens it on the next frame.
+pub fn open_session_with_progress(app: &mut SoundApp, path: String) {
+    if ask_to_save(app, "session.open", &json!({ "path": path })) {
+        return;
+    }
+    app.opening = Some((path, false));
+    app.ui.status = "Opening…".into();
+}
+
+/// The "Opening <file>" bar. The open blocks the UI, so the bar is drawn for one frame and the
+/// open runs on the next.
+fn opening_window(app: &mut SoundApp, ctx: &egui::Context) {
+    let Some((path, drawn)) = app.opening.clone() else { return };
+    let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if !drawn {
+        egui::Window::new("Opening Session").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+            ui.label(&name);
+            ui.add(egui::ProgressBar::new(0.0).animate(true).desired_width(360.0).text("Opening…"));
+        });
+        app.opening = Some((path, true));
+        ctx.request_repaint();
+        return;
+    }
+    app.opening = None;
+    if let Err(e) = app.run("session.open", json!({ "path": path })) {
+        app.ui.status = e;
+    }
+}
+
 /// Show the open dialog, if any.
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
+    opening_window(app, ctx);
     audiosuite_window(app, ctx);
     crate::bounce::show(app, ctx);
     let Some(mut d) = app.dialogs.open.take() else { return };
