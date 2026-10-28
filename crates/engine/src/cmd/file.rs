@@ -38,6 +38,11 @@ pub fn specs() -> Vec<CommandSpec> {
             let written = crate::io::save_session_copy(e, &path)?;
             Ok(json!({"path": path, "audio_files_written": written}))
         }),
+        cmd!(noundo "session.collect_audio", "Collect All Audio into Audio Files", ["File"], None, "{} — saves the session and copies every audio file it uses into its Audio Files folder", |e| if e.path.is_some() { Ok(()) } else { Err("save the session first".into()) }, |e, _| {
+            let path = e.path.clone().ok_or_else(|| bad("session.collect_audio", "the session has not been saved"))?;
+            let written = crate::io::save_session(e, &path)?;
+            Ok(json!({"path": path, "audio_files_written": written}))
+        }),
         cmd!(noundo "session.save_template", "Save As Template...", ["File"], None, "{path, replace?: false}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("session.save_template", "`path` required"))?.to_string();
             let file = crate::io::session_file(&path);

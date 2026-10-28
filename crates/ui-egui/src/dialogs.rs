@@ -660,6 +660,10 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         });
                         if let Some(p) = picked {
                             *path = p;
+                            // Choosing a file in the picker is the answer: open/import it right away.
+                            if opening {
+                                action = Some((cmd.clone(), json!({ key.as_str(): path })));
+                            }
                         } else if !folder && !opening && (dir != old_dir || name != old_name) {
                             *path = join_save_path(&dir, &name, &ext);
                         }
