@@ -61,6 +61,9 @@ pub type EditorEdit = (TrackId, usize, String, f32);
 enum Cmd {
     /// A new snapshot plus the third-party instances it needs (created on the UI thread).
     Session(Arc<Session>, Vec<PreparedInstance>),
+    /// More third-party instances for the current session, created in later UI frames
+    /// ([`Player::continue_loading`]).
+    Adopt(Vec<PreparedInstance>),
     /// Where the callback sends the snapshots it replaces (freeing one takes thousands of frees).
     OldSessions(SyncSender<Arc<Session>>),
     Input(Arc<record::InputRing>),
@@ -327,6 +330,10 @@ impl AudioState {
                         let _ = tx.try_send(old);
                     }
                 }
+                Cmd::Adopt(instances) => {
+                    changed = true;
+                    self.mix.adopt(instances);
+                }
                 Cmd::OldSessions(tx) => self.old_sessions = Some(tx),
                 Cmd::Play { from, end, looped } => {
                     self.pos = from;
@@ -549,6 +556,30 @@ struct Side {
     latency: HashMap<(TrackId, usize), usize>,
     garbage: Receiver<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<Receiver<Arc<Session>>>,
+    /// The session whose plugins are still being created in batches, if not all exist yet.
+    pending: Option<Arc<Session>>,
+    /// Plugins of the session that exist / that it needs, and the one created last.
+    loading: (usize, usize, String),
+}
+
+/// How long one UI frame may spend creating plugins while a session loads.
+const LOAD_BUDGET: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// Plugin loading progress for the UI: how many of the session's third-party plugins exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginLoading {
+    pub done: usize,
+    pub total: usize,
+    /// The plugin created last.
+    pub last: String,
+}
+
+/// Drops a retired plugin instance, logging its name and how long that took.
+fn release_logged(p: Box<dyn Plugin>) {
+    let name = p.info().name.to_string();
+    let at = std::time::Instant::now();
+    drop(p);
+    log::info!("plugin release {name} {} ms", at.elapsed().as_millis());
 }
 
 impl Side {
@@ -562,6 +593,8 @@ impl Side {
             latency: HashMap::new(),
             garbage,
             old_sessions: None,
+            pending: None,
+            loading: (0, 0, String::new()),
         }
     }
 
@@ -570,13 +603,41 @@ impl Side {
     fn collect_garbage(&mut self) {
         while let Ok(g) = self.garbage.try_recv() {
             for p in g {
-                log::debug!("plugin instance released: {}", p.info().name);
-                drop(p);
+                release_logged(p);
             }
         }
         if let Some(rx) = &self.old_sessions {
             rx.try_iter().for_each(drop);
         }
+    }
+
+    /// Forgets every slot, sends the audio thread an empty session and waits (up to 2 s) until it
+    /// has handed every instance back, dropping them here. Returns (handed back, were live).
+    fn release_all(&mut self, tx: &Sender<Cmd>) -> (usize, usize) {
+        let started = std::time::Instant::now();
+        self.pending = None;
+        self.loading = (0, 0, String::new());
+        let live = self.shadow.values().filter(|(_, _, made)| *made).count();
+        let keys: Vec<(TrackId, usize)> = self.shadow.keys().copied().collect();
+        for k in keys {
+            self.forget(k);
+        }
+        let _ = tx.send(Cmd::Session(Arc::new(Session::default()), Vec::new()));
+        // The audio thread retires the old instances on its next callback and sends them back:
+        // wait for all of them, so none outlives this call.
+        let mut gone = 0;
+        let deadline = started + std::time::Duration::from_secs(2);
+        while gone < live {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let Ok(g) = self.garbage.recv_timeout(left) else { break };
+            gone += g.len();
+            g.into_iter().for_each(release_logged);
+        }
+        self.collect_garbage();
+        if live > 0 {
+            log::info!("unloaded {gone} of {live} plugins in {} ms", started.elapsed().as_millis());
+        }
+        (gone, live)
     }
 
     fn return_old_sessions(&mut self, tx: &Sender<Cmd>) {
@@ -1072,24 +1133,48 @@ impl Player {
     /// shells (Waves') crash when instances of two sessions are alive together. Waits briefly
     /// for the audio thread to hand them back. Call on the UI thread.
     pub fn release_all(&self) {
-        let mut side = self.side();
-        let keys: Vec<(TrackId, usize)> = side.shadow.keys().copied().collect();
-        for k in keys {
-            side.forget(k);
-        }
-        let _ = self.tx.send(Cmd::Session(Arc::new(Session::default()), Vec::new()));
-        // The audio thread retires the old instances on its next callback and sends them back.
-        if let Ok(g) = side.garbage.recv_timeout(std::time::Duration::from_millis(500)) {
-            drop(g);
-        }
-        side.collect_garbage();
+        self.side().release_all(&self.tx);
     }
 
     /// Sends a new session snapshot to the audio thread, with freshly created (state-restored,
     /// prepared) instances of any third-party plugin it newly needs. Call on the UI thread.
+    ///
+    /// Creating plugins is slow, so about [`LOAD_BUDGET`] worth is created per call; the rest
+    /// follows from [`Player::continue_loading`], called each frame while
+    /// [`Player::plugins_loading`] says so.
     pub fn update_session(&self, s: Arc<Session>) {
-        let instances = self.side().prepare(&s);
+        let mut side = self.side();
+        let (instances, more) = side.prepare_within(&s, Some(LOAD_BUDGET), &mut soundcraft_mix::create_instance);
+        side.pending = more.then(|| Arc::clone(&s));
+        drop(side);
         let _ = self.tx.send(Cmd::Session(s, instances));
+    }
+
+    /// Creates the next batch of the session's plugins and hands it to the audio thread. UI thread.
+    pub fn continue_loading(&self) {
+        let mut side = self.side();
+        let Some(s) = side.pending.take() else { return };
+        let (instances, more) = side.prepare_within(&s, Some(LOAD_BUDGET), &mut soundcraft_mix::create_instance);
+        side.pending = more.then_some(s);
+        drop(side);
+        if !instances.is_empty() {
+            let _ = self.tx.send(Cmd::Adopt(instances));
+        }
+    }
+
+    /// Creates every plugin the last session still lacks, now (before playing or opening an editor).
+    pub fn finish_loading(&self) {
+        while self.side().pending.is_some() {
+            self.continue_loading();
+        }
+    }
+
+    /// How far the last session's plugins are created, while some are still missing.
+    pub fn plugins_loading(&self) -> Option<PluginLoading> {
+        let side = self.side();
+        side.pending.as_ref()?;
+        let (done, total, last) = side.loading.clone();
+        Some(PluginLoading { done, total, last })
     }
 
     /// Reads the state of every live third-party plugin, for saving the session.
@@ -1303,8 +1388,16 @@ impl Side {
     }
 
     /// Creates the third-party instances `s` needs that the audio thread does not have yet.
+    #[cfg(test)]
     fn prepare(&mut self, s: &Session) -> Vec<PreparedInstance> {
+        self.prepare_within(s, None, &mut soundcraft_mix::create_instance).0
+    }
+
+    /// [`Side::prepare`], stopping once `budget` is spent (after at least one instance). The flag
+    /// says that instances are still missing: call again for the next batch.
+    fn prepare_within(&mut self, s: &Session, budget: Option<std::time::Duration>, create: &mut impl FnMut(&str, Option<&[u8]>, f32, usize, usize) -> Option<soundcraft_mix::NewInstance>) -> (Vec<PreparedInstance>, bool) {
         self.collect_garbage();
+        let started = std::time::Instant::now();
         let sr = s.sample_rate.as_f64() as f32;
         if (sr - self.rate).abs() > 0.5 {
             // The audio thread rebuilds its engine: everything is created anew.
@@ -1319,15 +1412,26 @@ impl Side {
         for k in stale {
             self.forget(k);
         }
+        let total = specs.len();
         let mut out = Vec::new();
+        let mut more = false;
+        let mut last = String::new();
         for spec in specs {
             let key = (spec.track, spec.slot);
             if self.shadow.get(&key).is_some_and(|(id, ch, _)| *id == spec.id && *ch == spec.ch) {
                 continue;
             }
+            if !out.is_empty() && budget.is_some_and(|b| started.elapsed() >= b) {
+                more = true;
+                break;
+            }
             self.forget(key);
-            let made = soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), sr, BLOCK, spec.ch);
-            log::debug!("plugin instance for {:?} slot {}: {} ({} ch, created: {})", spec.track, spec.slot, spec.id, spec.ch, made.is_some());
+            let began = std::time::Instant::now();
+            let made = create(&spec.id, spec.state.as_deref(), sr, BLOCK, spec.ch);
+            let track = s.tracks.iter().find(|t| t.id == spec.track).map_or("?", |t| t.name.as_str());
+            let name = made.as_ref().map_or_else(|| spec.id.clone(), |m| m.plugin.info().name.to_string());
+            log::info!("plugin create {name} on {track} slot {} {} ms{}", spec.slot, began.elapsed().as_millis(), if made.is_some() { "" } else { " (failed)" });
+            last = name;
             self.shadow.insert(key, (spec.id.clone(), spec.ch, made.is_some()));
             if let Some(soundcraft_mix::NewInstance { mut plugin, refused_state }) = made {
                 self.latency.insert(key, plugin.latency());
@@ -1343,7 +1447,13 @@ impl Side {
                 out.push(PreparedInstance { track: spec.track, slot: spec.slot, id: spec.id, ch: spec.ch, plugin });
             }
         }
-        out
+        // Every spec has an entry once all are created (created or failed); until then count them.
+        let done = if more { self.shadow.len().min(total) } else { total };
+        if last.is_empty() {
+            last = std::mem::take(&mut self.loading.2);
+        }
+        self.loading = (done, total, last);
+        (out, more)
     }
 }
 
@@ -1922,6 +2032,107 @@ mod tests {
         tx.send(Cmd::Session(Arc::new(s44), Vec::new())).unwrap();
         st.fill(&mut out, 2);
         assert_eq!(grx.try_recv().unwrap().len(), 1);
+    }
+
+    /// A session with `n` audio tracks, each with a (fake) CLAP plugin in insert slot 1.
+    fn session_with_plugins(n: usize) -> Arc<soundcraft_model::Session> {
+        use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+        let mut s = soundcraft_model::Session::default();
+        for _ in 0..n {
+            let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+            if let Some(t) = s.track_mut(t) {
+                t.mixer.inserts[1] = Some(Insert::new("clap:test.fake"));
+            }
+        }
+        Arc::new(s)
+    }
+
+    fn fake_instance(made: &mut usize) -> Option<soundcraft_mix::NewInstance> {
+        *made += 1;
+        Some(soundcraft_mix::NewInstance { plugin: soundcraft_dsp::create("gain")?, refused_state: false })
+    }
+
+    #[test]
+    fn budgeted_prepare_delivers_every_instance_across_calls() {
+        let (_gtx, grx) = channel();
+        let mut side = Side::new(48_000.0, grx);
+        let s = session_with_plugins(5);
+        let mut made = 0;
+        let mut create = |_: &str, _: Option<&[u8]>, _: f32, _: usize, _: usize| fake_instance(&mut made);
+        // A zero budget still makes progress: one instance per call.
+        let mut slots = Vec::new();
+        let mut calls = 0;
+        loop {
+            let (got, more) = side.prepare_within(&s, Some(std::time::Duration::ZERO), &mut create);
+            calls += 1;
+            assert!(got.len() <= 1, "one instance per call under a zero budget");
+            slots.extend(got.iter().map(|i| (i.track, i.slot)));
+            let progress = side.loading.clone();
+            if !more {
+                assert_eq!((progress.0, progress.1), (5, 5));
+                break;
+            }
+            assert_eq!(progress.1, 5);
+            assert!(progress.0 < 5 && calls < 10);
+        }
+        assert_eq!(calls, 5);
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), 5, "every slot got exactly one instance");
+        // Nothing is created twice once it exists.
+        let (again, more) = side.prepare_within(&s, Some(std::time::Duration::ZERO), &mut create);
+        assert!(again.is_empty() && !more);
+        assert_eq!(made, 5);
+    }
+
+    #[test]
+    fn unbudgeted_prepare_creates_everything_at_once() {
+        let (_gtx, grx) = channel();
+        let mut side = Side::new(48_000.0, grx);
+        let s = session_with_plugins(4);
+        let mut made = 0;
+        let mut create = |_: &str, _: Option<&[u8]>, _: f32, _: usize, _: usize| fake_instance(&mut made);
+        let (got, more) = side.prepare_within(&s, None, &mut create);
+        assert_eq!((got.len(), more), (4, false));
+    }
+
+    #[test]
+    fn old_instances_are_all_released_before_the_next_session_creates_any() {
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let (gtx, grx) = channel();
+        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
+        let mut side = Side::new(48_000.0, grx);
+        let a = session_with_plugins(3);
+        let mut made = 0;
+        let mut create = |_: &str, _: Option<&[u8]>, _: f32, _: usize, _: usize| fake_instance(&mut made);
+        let (first, _) = side.prepare_within(&a, None, &mut create);
+        tx.send(Cmd::Session(Arc::clone(&a), first)).unwrap();
+        let mut out = vec![0.0f32; 256];
+        st.fill(&mut out, 2);
+        // The "audio thread" keeps asking for blocks while the UI side unloads.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let audio = std::thread::spawn(move || {
+            let mut out = vec![0.0f32; 256];
+            while !stop2.load(Ordering::Relaxed) {
+                st.fill(&mut out, 2);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        let (gone, live) = side.release_all(&tx);
+        stop.store(true, Ordering::Relaxed);
+        assert!(audio.join().is_ok());
+        assert_eq!((gone, live), (3, 3), "all of session A's instances were handed back and dropped before B is prepared");
+        assert!(side.shadow.is_empty());
+        let (second, _) = side.prepare_within(&session_with_plugins(2), None, &mut create);
+        assert_eq!(second.len(), 2);
+        assert_eq!(made, 5);
     }
 
     #[test]
