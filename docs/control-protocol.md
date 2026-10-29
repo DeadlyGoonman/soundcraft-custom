@@ -54,6 +54,8 @@ Errors: `{"id": 1, "ok": false, "error": "bad parameters for `mix.volume`: no tr
 | `ui.move` | `{x, y}` | Move the pointer. |
 | `ui.key` | `{key, cmd?, shift?, alt?, ctrl?}` | Key press (`Space`, `Enter`, `A`, `F7`, `=`…). |
 | `ui.text` | `{text}` | Type text into the focused field. |
+| `ui.open_session` | `{path}` | What the file picker does: asks to save a modified session, then reads the file on a worker thread behind a progress window and returns at once. `ui.inspect` reports `opening` (the path while it runs) and `plugins_loading` (`done/total`). `engine.execute session.open` stays synchronous. |
+| `ui.open_editor` | `{track, slot?}` | Opens the plugin's own editor window for the insert in `slot` (default 0) of the track named `track`. |
 | `ui.screenshot` | `{path?}` | PNG of the window (base64 in `png_base64` when no path). |
 | `app.quit` | `{}` | Quit. |
 

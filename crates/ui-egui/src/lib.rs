@@ -401,9 +401,8 @@ pub struct SoundApp {
     /// Where a dropped audio file loads into a track's sampler (last frame's rects).
     pub sample_drop_targets: Vec<(egui::Rect, TrackId)>,
     pub audio_drop_lanes: Vec<(egui::Rect, egui::Rect, TrackId)>,
-    /// A session picked to open: its path, and whether the "Opening…" bar has been drawn yet (the
-    /// open itself blocks the UI, so the bar gets one frame first).
-    pub(crate) opening: Option<(String, bool)>,
+    /// The session being opened off the UI thread, behind a progress window.
+    pub(crate) opening: Option<dialogs::Opening>,
     pub(crate) drop_preview: file_drop::DropPreview,
     sample_reads: Vec<sampler_window::SampleRead>,
     synthetic_grace: u32,
@@ -559,6 +558,9 @@ impl SoundApp {
             // main thread, or a window outliving its plugin crashes the plugin (Auto-Tune Pro).
             p.close_editors();
         }
+        if replacing && self.opening.is_some() {
+            return Err("A session is opening".into());
+        }
         match self.engine.execute(id, &params) {
             Ok(v) => {
                 if replacing || (id.starts_with("session.save") && !self.engine.is_dirty()) {
@@ -590,6 +592,23 @@ impl SoundApp {
         }
     }
 
+    /// Puts a session read on a worker thread in place of the open one (what `session.open` does
+    /// for a path, minus the read). The old session's plugins are released on the next frame.
+    pub(crate) fn install_opened(&mut self, opened: soundcraft_engine::io::Opened, path: &str) {
+        if let Some(p) = &self.player {
+            // A window outliving its plugin crashes the plugin (Auto-Tune Pro): close them first.
+            p.close_editors();
+        }
+        let missing = soundcraft_engine::io::install_opened(&mut self.engine, opened);
+        self.release_autosave(false);
+        if preferences::starts_fresh_views("session.open", &json!({ "path": path })) {
+            self.apply_saved_edit_views();
+        }
+        if !missing.is_empty() {
+            self.ui.status = format!("Opened with {} missing files", missing.len());
+        }
+    }
+
     pub fn is_playing(&self) -> bool {
         self.engine.transport.playing
     }
@@ -609,6 +628,7 @@ impl SoundApp {
     fn start_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
         if let Some(p) = &self.player {
             p.update_session(self.engine.session_arc());
+            p.finish_loading();
             p.play(from, end, looped);
         } else {
             self.sim = Some((from, end, looped));
@@ -767,6 +787,7 @@ impl SoundApp {
         let Some(p) = &self.player else { return };
         p.forget_instance(track, slot);
         p.update_session(self.engine.session_arc());
+        p.finish_loading();
         if let Err(e) = self.open_slot_editor(track, slot) {
             self.ui.status = format!("Reload: {e}");
         }
@@ -1537,6 +1558,12 @@ impl SoundApp {
             if let Some(p) = &self.player {
                 p.update_session(self.engine.session_arc());
             }
+        } else if let Some(p) = &self.player {
+            // The rest of a big session's plugins, a few per frame.
+            p.continue_loading();
+        }
+        if self.player.as_ref().is_some_and(|p| p.plugins_loading().is_some()) {
+            ctx.request_repaint();
         }
         self.open_inserted(ctx);
         self.autosave_changes();
@@ -1665,6 +1692,8 @@ impl SoundApp {
             "audio_silent": self.player.as_ref().is_some_and(|p| p.silent),
             "audio_trouble": self.player.as_ref().and_then(|p| p.trouble()).map(|t| format!("{t:?}")),
             "status": self.ui.status,
+            "opening": self.opening.as_ref().map(|o| o.path()),
+            "plugins_loading": self.player.as_ref().and_then(|p| p.plugins_loading()).map(|l| format!("{}/{}", l.done, l.total)),
         })
     }
 }

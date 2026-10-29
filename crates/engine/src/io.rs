@@ -120,6 +120,11 @@ fn unique_audio_rel(s: &Session, stem: &str) -> String {
     }
 }
 
+thread_local! {
+    /// Where an import running through [`load_session_file`] on this thread counts the audio it adds.
+    static IMPORT_PROGRESS: std::cell::RefCell<Option<Arc<OpenProgress>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Register decoded audio as a new source. Resamples to the session rate if needed.
 pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Option<&str>, format: FileFormat) -> SourceId {
     let sr = s.sample_rate.hz();
@@ -127,6 +132,11 @@ pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Optio
         buf.channels = soundcraft_dsp::offline::resample(&buf.channels, buf.sample_rate, sr);
         buf.sample_rate = sr;
     }
+    IMPORT_PROGRESS.with(|p| {
+        if let Some(p) = p.borrow().as_ref() {
+            p.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
     let id = SourceId(s.alloc());
     let stem = Path::new(name).file_stem().and_then(|x| x.to_str()).unwrap_or(name).to_string();
     let stored = match path {
@@ -1488,6 +1498,18 @@ pub struct OpenProgress {
     pub done: std::sync::atomic::AtomicUsize,
     /// Audio files to read (0 until the session file is parsed).
     pub total: std::sync::atomic::AtomicUsize,
+    /// What the import is doing besides reading audio (empty when just reading).
+    pub note: std::sync::Mutex<String>,
+}
+
+/// Tells the UI what the import running on this thread is doing, e.g. which plugin's settings it
+/// is checking (nothing happens when no [`load_session_file`] runs on this thread).
+pub(crate) fn import_note(text: &str) {
+    IMPORT_PROGRESS.with(|p| {
+        if let Some(p) = p.borrow().as_ref() {
+            *p.note.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = text.to_string();
+        }
+    });
 }
 
 /// A session read from disk but not yet installed in an [`Engine`]: everything slow (parsing,
@@ -1504,16 +1526,24 @@ pub struct Opened {
 
 /// Reads the session (or Pro Tools / FL Studio import) at `path` without touching any engine, so
 /// it can run on a worker thread. `progress` counts the audio files decoded.
-pub fn load_session_file(path: &str, progress: &OpenProgress) -> Result<Opened> {
+pub fn load_session_file(path: &str, progress: &Arc<OpenProgress>) -> Result<Opened> {
     let ext = Path::new(path).extension();
     let import = ext.is_some_and(|x| x.eq_ignore_ascii_case("ptx") || x.eq_ignore_ascii_case("flp"));
     if !import {
         return load_linked(path, Path::new(path), progress);
     }
     // Imports build their session through an engine (messages, inserts): give them a scratch one
-    // and carry the result over.
+    // and carry the result over. Their audio is counted as it is added; the files in `Audio Files`
+    // are the most there can be (FL Studio samples live anywhere: no total).
+    let started = std::time::Instant::now();
+    let folder = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
+    progress.total.store(if ext.is_some_and(|x| x.eq_ignore_ascii_case("ptx")) { list_dir(&folder.join("Audio Files")).len() } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+    IMPORT_PROGRESS.with(|p| *p.borrow_mut() = Some(Arc::clone(progress)));
     let mut scratch = Engine::new(Session::default());
-    let missing = open_session(&mut scratch, path)?;
+    let imported = open_session(&mut scratch, path);
+    IMPORT_PROGRESS.with(|p| *p.borrow_mut() = None);
+    let missing = imported?;
+    log::info!("import read: {path}: {} audio files ({} missing) in {} ms", progress.done.load(std::sync::atomic::Ordering::Relaxed), missing.len(), started.elapsed().as_millis());
     Ok(Opened {
         session: scratch.session().clone(),
         path: scratch.path.take(),
@@ -1537,11 +1567,11 @@ pub fn install_opened(e: &mut Engine, o: Opened) -> Vec<String> {
 /// [`open_session`], following the media paths in it as if they were stored in the session file
 /// `links` (crash recovery: the session written beside the autosave, its paths from the original).
 pub(crate) fn open_session_linked(e: &mut Engine, path: &str, links: &Path) -> Result<Vec<String>> {
-    let o = load_linked(path, links, &OpenProgress::default())?;
+    let o = load_linked(path, links, &Arc::new(OpenProgress::default()))?;
     Ok(install_opened(e, o))
 }
 
-fn load_linked(path: &str, links: &Path, progress: &OpenProgress) -> Result<Opened> {
+fn load_linked(path: &str, links: &Path, progress: &Arc<OpenProgress>) -> Result<Opened> {
     let started = std::time::Instant::now();
     let text = read_text(path)?;
     let mut s = Session::from_json(&text).map_err(|err| EngineError::Io(err.to_string()))?;
@@ -2073,7 +2103,7 @@ mod save_tests {
         for p in [&path, &gone_path] {
             let mut old = Engine::default();
             let old_missing = open_session(&mut old, p).unwrap();
-            let progress = OpenProgress::default();
+            let progress = Arc::new(OpenProgress::default());
             let opened = load_session_file(p, &progress).unwrap();
             let mut new = Engine::default();
             let new_missing = install_opened(&mut new, opened);
