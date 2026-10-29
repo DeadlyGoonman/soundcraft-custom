@@ -391,7 +391,12 @@ fn state_loads_in_child(id: &str, state: &[u8]) -> bool {
             serde_json::to_vec(&job).ok().map(|j| crate::plugin_scan::run_child(exe, &[STATE_PROBE_ARG.as_ref()], Some(j), STATE_PROBE_TIMEOUT));
         let ok = matches!(ran, Some(Ok((ref text, _))) if text.lines().any(|l| l.trim_end() == format!("{STATE_PROBE_MARK}ok")));
         if !ok {
-            log::warn!("{id}: the session's settings failed the check in a child process; it starts from its defaults");
+            let how = match &ran {
+                Some(Ok((_, Some(s)))) if !s.success() => crate::plugin_scan::exit_text(s),
+                Some(Ok((_, None))) => "timed out".to_string(),
+                _ => "refused".to_string(),
+            };
+            log::warn!("{id}: the session's settings failed the check in a child process ({how}); it starts from its defaults");
         }
         ok
     });
@@ -406,6 +411,7 @@ pub fn state_probe_command_line(args: &[String]) -> Option<i32> {
     if args.first().map(String::as_str) != Some(STATE_PROBE_ARG) {
         return None;
     }
+    soundcraft_vst3_host::quiet_crash_dialogs();
     let mut text = String::new();
     let read = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).is_ok();
     let job = read.then(|| serde_json::from_str::<StateJob>(&text).ok()).flatten();

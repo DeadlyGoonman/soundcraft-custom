@@ -504,6 +504,7 @@ fn parse_probe_output(text: &str) -> Option<Result<Probed, String>> {
 /// Probes each file by running `exe --probe-plugin <format> <path>` (the app itself), killing it
 /// after `timeout`. A crash or hang is reported as the failure reason.
 pub fn child_probe(exe: PathBuf, timeout: Duration) -> ProbeFn {
+    soundcraft_vst3_host::quiet_crash_dialogs();
     Arc::new(move |format, path| probe_child(&exe, format, path, timeout))
 }
 
@@ -536,6 +537,16 @@ pub(crate) fn run_child(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+/// An exit status as text: a Windows crash code as hex (`0xC0000005`), else the code or signal.
+pub(crate) fn exit_text(s: &std::process::ExitStatus) -> String {
+    match s.code() {
+        #[allow(clippy::cast_sign_loss)]
+        Some(c) if !(0..=0xFFFF).contains(&c) => format!("exit code 0x{:08X}", c as u32),
+        Some(c) => format!("exit code {c}"),
+        None => s.to_string(),
+    }
+}
+
     let mut child = cmd.spawn().map_err(|e| format!("cannot start the scanner process: {e}"))?;
     // Written from a thread of its own, so a child that doesn't read it can't block this one.
     if let (Some(data), Some(mut pipe)) = (input, child.stdin.take()) {
@@ -584,6 +595,13 @@ mod tests {
             sdk_version: String::new(),
             sub_categories: vec!["Fx".into()],
             category: Category::Other,
+    if let Some(s) = status.filter(|s| !s.success()) {
+        // 1 is the probes' own "refused" code; anything else (0xC0000005, a signal...) is a crash.
+        if s.code() != Some(1) {
+            let what: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
+            log::warn!("child process died abnormally ({}): {} {}", exit_text(&s), exe.display(), what.join(" "));
+        }
+    }
             is_instrument: false,
             path: path.into(),
         }
