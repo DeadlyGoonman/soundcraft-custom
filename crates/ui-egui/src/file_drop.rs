@@ -41,7 +41,7 @@ impl DropPreview {
 }
 
 fn load_preview(path: &Path) -> Option<Preview> {
-    if !path.is_absolute() || !is_audio_name(&path.to_string_lossy()) || std::fs::metadata(path).ok()?.len() > MAX_PREVIEW_BYTES {
+    if !path.is_absolute() || !is_audio_name(path) || std::fs::metadata(path).ok()?.len() > MAX_PREVIEW_BYTES {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
@@ -146,7 +146,7 @@ pub(crate) fn lane_drop(app: &mut SoundApp, files: Vec<egui::DroppedFileHandle>,
     let mut at = drop_at(app.engine.session(), lane, tl, p, flip);
     let mut rest = Vec::new();
     for f in files {
-        if !f.path().is_absolute() || !is_audio_name(&f.path().to_string_lossy()) {
+        if !f.path().is_absolute() || !is_audio_name(f.path()) {
             rest.push(f);
             continue;
         }

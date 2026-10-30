@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    Arc, AtomicBool, BLOCK, BTreeMap, Cmd, HashMap, HashSet, LivePlugins, MAX_CHANNELS, MeterSnapshot, MixEngine, OLD_SESSIONS, Ordering,
+    OutputTrouble, Plugin, PluginEditor, PluginStateReader, PluginStates, PreparedInstance, Range, Receiver, Samples, Sender, Session, Shared,
+    SyncSender, TrackId, itu_stereo_fold, main_channels, record, sync_channel,
+};
 
 /// How the audio output is doing, for the UI.
 #[derive(Default)]
@@ -664,7 +668,12 @@ impl Side {
 
     /// [`Side::prepare`], stopping once `budget` is spent (after at least one instance). The flag
     /// says that instances are still missing: call again for the next batch.
-    pub(crate) fn prepare_within(&mut self, s: &Session, budget: Option<std::time::Duration>, create: &mut impl FnMut(&str, Option<&[u8]>, f32, usize, usize) -> Option<soundcraft_mix::NewInstance>) -> (Vec<PreparedInstance>, bool) {
+    pub(crate) fn prepare_within(
+        &mut self,
+        s: &Session,
+        budget: Option<std::time::Duration>,
+        create: &mut impl FnMut(&str, Option<&[u8]>, f32, usize, usize) -> Option<soundcraft_mix::NewInstance>,
+    ) -> (Vec<PreparedInstance>, bool) {
         self.collect_garbage();
         let started = std::time::Instant::now();
         let sr = s.sample_rate.as_f64() as f32;
@@ -699,7 +708,12 @@ impl Side {
             let made = create(&spec.id, spec.state.as_deref(), sr, BLOCK, spec.ch);
             let track = s.tracks.iter().find(|t| t.id == spec.track).map_or("?", |t| t.name.as_str());
             let name = made.as_ref().map_or_else(|| spec.id.clone(), |m| m.plugin.info().name.to_string());
-            log::info!("plugin create {name} on {track} slot {} {} ms{}", spec.slot, began.elapsed().as_millis(), if made.is_some() { "" } else { " (failed)" });
+            log::info!(
+                "plugin create {name} on {track} slot {} {} ms{}",
+                spec.slot,
+                began.elapsed().as_millis(),
+                if made.is_some() { "" } else { " (failed)" }
+            );
             last = name;
             self.shadow.insert(key, (spec.id.clone(), spec.ch, made.is_some()));
             if let Some(soundcraft_mix::NewInstance { mut plugin, refused_state }) = made {
@@ -755,7 +769,7 @@ pub(crate) struct AsioCallback {
 #[cfg(all(windows, feature = "asio"))]
 impl soundcraft_asio::Callback for AsioCallback {
     fn process(&mut self, input: &[f32], output: &mut [f32], frames: usize) {
-        mark_audio_thread();
+        crate::mark_audio_thread();
         self.tap.feed(input);
         // The driver hands over `frames` frames of `channels` interleaved samples each.
         let channels = output.len().checked_div(frames).unwrap_or(1).max(1);

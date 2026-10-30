@@ -1,5 +1,9 @@
 use super::instance::Instance;
-use super::*;
+use super::{
+    AtomicU64, Choice, Class, ComPtr, ComWrapper, EditorHeaderAction, EditorHeaderState, EditorScale, IComponentTrait, IEditControllerTrait,
+    IPlugFrameTrait, IPlugViewContentScaleSupportTrait, IPlugViewTrait, Mutex, Ordering, PoisonError, STATE_MAGIC, ScaledWindow, UpscaleFilter,
+    c_void, ok, plan, read_c16, sb, sv, window,
+};
 
 // ---- editor (IPlugView) --------------------------------------------------------------------
 /// The window an editor is shown in: a host window the plugin draws in at its scale, or a

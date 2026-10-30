@@ -2,7 +2,10 @@ use super::bundle::save_session_bundle;
 #[cfg(test)]
 use super::import::add_source;
 use super::import::{IMPORT_PROGRESS, MAX_IMPORT_SAMPLES, at_rate, relink_videos};
-use super::*;
+use super::{
+    Arc, Engine, EngineError, OsStr, Path, PathBuf, Result, Session, SourceAudio, file_key, list_dir, read_file, read_text, stored_path,
+    write_session,
+};
 
 /// Save the session to `path` (a `.scraft` file). Audio that only exists in memory is written
 /// as 32-bit float WAV into `Audio Files/` next to it. Returns how many audio files were written.
@@ -34,14 +37,15 @@ pub fn save_session_copy(e: &Engine, path: &str) -> Result<usize> {
 }
 
 /// Open a `.scraft` session and decode its audio files (missing files are reported, not fatal).
-pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
-    if Path::new(path).extension().is_some_and(|x| x.eq_ignore_ascii_case("ptx")) {
-        return crate::ptx::open_ptx(e, path);
+pub fn open_session(e: &mut Engine, path: impl AsRef<Path>) -> Result<Vec<String>> {
+    let path = path.as_ref();
+    if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("ptx")) {
+        return crate::ptx::open_ptx(e, &path.to_string_lossy());
     }
-    if Path::new(path).extension().is_some_and(|x| x.eq_ignore_ascii_case("flp")) {
-        return crate::flp::open_flp(e, path);
+    if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("flp")) {
+        return crate::flp::open_flp(e, &path.to_string_lossy());
     }
-    open_session_linked(e, path, Path::new(path))
+    open_session_linked(e, path, path)
 }
 
 /// How far a [`load_session_file`] got, read by the UI while a worker thread loads.
@@ -79,24 +83,34 @@ pub struct Opened {
 
 /// Reads the session (or Pro Tools / FL Studio import) at `path` without touching any engine, so
 /// it can run on a worker thread. `progress` counts the audio files decoded.
-pub fn load_session_file(path: &str, progress: &Arc<OpenProgress>) -> Result<Opened> {
-    let ext = Path::new(path).extension();
+pub fn load_session_file(path: impl AsRef<Path>, progress: &Arc<OpenProgress>) -> Result<Opened> {
+    let path = path.as_ref();
+    let ext = path.extension();
     let import = ext.is_some_and(|x| x.eq_ignore_ascii_case("ptx") || x.eq_ignore_ascii_case("flp"));
     if !import {
-        return load_linked(path, Path::new(path), progress);
+        return load_linked(path, path, progress);
     }
     // Imports build their session through an engine (messages, inserts): give them a scratch one
     // and carry the result over. Their audio is counted as it is added; the files in `Audio Files`
     // are the most there can be (FL Studio samples live anywhere: no total).
     let started = std::time::Instant::now();
-    let folder = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
-    progress.total.store(if ext.is_some_and(|x| x.eq_ignore_ascii_case("ptx")) { list_dir(&folder.join("Audio Files")).len() } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+    let folder = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    progress.total.store(
+        if ext.is_some_and(|x| x.eq_ignore_ascii_case("ptx")) { list_dir(&folder.join("Audio Files")).len() } else { 0 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
     IMPORT_PROGRESS.with(|p| *p.borrow_mut() = Some(Arc::clone(progress)));
     let mut scratch = Engine::new(Session::default());
     let imported = open_session(&mut scratch, path);
     IMPORT_PROGRESS.with(|p| *p.borrow_mut() = None);
     let missing = imported?;
-    log::info!("import read: {path}: {} audio files ({} missing) in {} ms", progress.done.load(std::sync::atomic::Ordering::Relaxed), missing.len(), started.elapsed().as_millis());
+    log::info!(
+        "import read: {}: {} audio files ({} missing) in {} ms",
+        path.display(),
+        progress.done.load(std::sync::atomic::Ordering::Relaxed),
+        missing.len(),
+        started.elapsed().as_millis()
+    );
     Ok(Opened {
         session: scratch.session().clone(),
         path: scratch.path.take(),
@@ -119,16 +133,16 @@ pub fn install_opened(e: &mut Engine, o: Opened) -> Vec<String> {
 
 /// [`open_session`], following the media paths in it as if they were stored in the session file
 /// `links` (crash recovery: the session written beside the autosave, its paths from the original).
-pub(crate) fn open_session_linked(e: &mut Engine, path: &str, links: &Path) -> Result<Vec<String>> {
+pub(crate) fn open_session_linked(e: &mut Engine, path: &Path, links: &Path) -> Result<Vec<String>> {
     let o = load_linked(path, links, &Arc::new(OpenProgress::default()))?;
     Ok(install_opened(e, o))
 }
 
-fn load_linked(path: &str, links: &Path, progress: &Arc<OpenProgress>) -> Result<Opened> {
+fn load_linked(path: &Path, links: &Path, progress: &Arc<OpenProgress>) -> Result<Opened> {
     let started = std::time::Instant::now();
     let text = read_text(path)?;
     let mut s = Session::from_json(&text).map_err(|err| EngineError::Io(err.to_string()))?;
-    let dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let mut missing = Vec::new();
     let mut files = DecodedFiles::new();
     progress.total.store(s.sources.len(), std::sync::atomic::Ordering::Relaxed);
@@ -143,9 +157,16 @@ fn load_linked(path: &str, links: &Path, progress: &Arc<OpenProgress>) -> Result
     }
     missing.extend(relink_videos(&mut s, links));
     s.folder = Some(dir);
-    log::info!("session read: {path}: {} sources ({} distinct files, {} missing) in {} ms", s.sources.len(), files.len(), missing.len(), started.elapsed().as_millis());
+    log::info!(
+        "session read: {}: {} sources ({} distinct files, {} missing) in {} ms",
+        path.display(),
+        s.sources.len(),
+        files.len(),
+        missing.len(),
+        started.elapsed().as_millis()
+    );
     let messages = missing.iter().map(|m| format!("missing media: {m}")).collect();
-    Ok(Opened { session: s, path: Some(path.to_string()), missing, missing_plugins: Vec::new(), messages })
+    Ok(Opened { session: s, path: path.to_str().map(str::to_owned), missing, missing_plugins: Vec::new(), messages })
 }
 
 /// File › New › Open from Template: a new, unsaved session copied from the session file at `path`
@@ -196,7 +217,9 @@ pub(crate) fn decode_file(files: &mut DecodedFiles, p: &Path, rate: u32) -> std:
 
 #[cfg(test)]
 mod save_tests {
+    use super::super::{AudioBuffer, ChannelFormat, Clip, Engine, FileFormat, Range, TrackKind, back_up, copy_new};
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn worker_loader_matches_open_session() {
@@ -220,7 +243,10 @@ mod save_tests {
             assert_eq!(old.path, new.path);
             assert_eq!(old.messages, new.messages);
             assert_eq!(old.session().to_json().unwrap(), new.session().to_json().unwrap());
-            assert_eq!(old.session().sources.iter().filter(|x| old.session().pool.get(x.id).is_some()).count(), new.session().sources.iter().filter(|x| new.session().pool.get(x.id).is_some()).count());
+            assert_eq!(
+                old.session().sources.iter().filter(|x| old.session().pool.get(x.id).is_some()).count(),
+                new.session().sources.iter().filter(|x| new.session().pool.get(x.id).is_some()).count()
+            );
             assert_eq!(progress.done.load(std::sync::atomic::Ordering::Relaxed), progress.total.load(std::sync::atomic::Ordering::Relaxed));
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -327,11 +353,11 @@ mod save_tests {
         assert_eq!(level(&reopen(&path("B/B.scraft"))), 0.5);
         std::fs::remove_file(dir.join("A/Audio Files/Audio 1_02.wav")).unwrap();
         let mut missing = Engine::default();
-        open_session(&mut missing, &path("A/A.scraft")).unwrap();
+        open_session(&mut missing, path("A/A.scraft")).unwrap();
         save_session(&mut missing, &path("B/Moved.scraft")).unwrap();
         let mut r = Engine::default();
         assert_eq!(
-            open_session(&mut r, &path("B/Moved.scraft")).unwrap(),
+            open_session(&mut r, path("B/Moved.scraft")).unwrap(),
             vec![dir.join("A").join("Audio Files").join("Audio 1_02.wav").display().to_string()]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -357,7 +383,7 @@ mod save_tests {
         Engine::default().execute("session.save_as", &json!({"path": dir.join("New/New.scraft")})).unwrap();
         std::fs::copy(&path, dir.join("Song")).unwrap();
         let mut bare = Engine::default();
-        open_session(&mut bare, &dir.join("Song").to_string_lossy()).unwrap();
+        open_session(&mut bare, dir.join("Song")).unwrap();
         bare.execute("session.save", &json!({})).unwrap();
         second.execute("session.save_as", &json!({"path": path, "replace": true})).unwrap();
         let r = reopen(&path);
@@ -447,7 +473,9 @@ mod save_tests {
 
 #[cfg(test)]
 mod open_tests {
+    use super::super::{AudioBuffer, ChannelFormat, Clip, EncodeOptions, Engine, FileFormat, SourceId, TrackKind};
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_file_named_by_many_sources_is_decoded_once() {
@@ -560,7 +588,9 @@ mod open_tests {
 
 #[cfg(all(test, unix))]
 mod pipe_tests {
+    use super::super::{AudioBuffer, FileFormat};
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_pipe_named_as_media_is_refused_not_waited_on() {

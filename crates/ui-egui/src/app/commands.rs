@@ -1,4 +1,5 @@
-use super::*;
+use super::{SoundApp, TrackId, Value, bounce, json, menus};
+use crate::{mix_window, preferences};
 
 impl SoundApp {
     /// Run a command; errors go to the status line. Returns the result.

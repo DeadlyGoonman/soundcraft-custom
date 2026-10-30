@@ -17,6 +17,8 @@ const KNOWN_UNREACHED: &[&str] = &[
     "file.bounce_stems",
     "markers.next",
     "markers.previous",
+    "session.collect_audio",
+    "track.show_automated_lanes",
     "mix.clear_mutes",
     "mix.clear_solos",
     "mix.phase_invert",

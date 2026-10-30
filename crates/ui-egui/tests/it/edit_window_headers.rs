@@ -80,7 +80,7 @@ fn header_keys_freeze_silence_and_show_automation() {
     assert!(kick(&h).inactive);
 
     click(&mut h, at(7.5, row[3] - row[1] - 7.5));
-    assert_eq!(kick(&h).view, "volume");
+    assert!(kick(&h).lanes_open, "the arrow shows the automation lanes under the track");
 
     click(&mut h, at(HEADER_W + 81.5, 29.5));
     assert_eq!(h.state().ui.window, MainWindow::Mix);

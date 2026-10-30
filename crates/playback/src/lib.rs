@@ -50,8 +50,8 @@ mod stream;
 
 #[cfg(all(windows, feature = "asio"))]
 use callback::AsioCallback;
-use callback::{AudioState, Fault, LOAD_BUDGET, Side, take_meter_snapshot};
 pub use callback::PluginLoading;
+use callback::{AudioState, Fault, LOAD_BUDGET, Side, take_meter_snapshot};
 #[cfg(test)]
 use callback::{STALL, copy_meter_snapshot};
 #[cfg(not(target_arch = "wasm32"))]

@@ -1,6 +1,6 @@
 use super::audio::feed_meter;
 use super::plugins::failed_plugin_status;
-use super::*;
+use super::{Gesture, MainWindow, MeterDisplay, Range, Samples, SoundApp, TrackId, TransportRequest, edit_window, json};
 
 /// How long after the last editor edit a plugin param still counts as held (Touch).
 const PLUGIN_RELEASE: std::time::Duration = std::time::Duration::from_millis(250);
@@ -331,7 +331,6 @@ impl SoundApp {
             self.pan_touched.insert((track, i), (std::time::Instant::now(), value));
         }
     }
-
 
     /// Play from the selection, honouring loop playback and selection end.
     pub fn play_from_selection(&mut self) {

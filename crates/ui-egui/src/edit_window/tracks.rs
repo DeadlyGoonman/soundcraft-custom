@@ -1,9 +1,12 @@
 use super::automation::{auto_value, breakpoint_at, draw_automation, lane_range};
-use super::clips::{draw_clip, draw_live_take, draw_strip_silence, grid_lines};
+use super::clips::{ClipLane, draw_clip, draw_live_take, draw_strip_silence, grid_lines};
 use super::header::{header_column, header_selector, track_header};
 use super::input::{lane_interaction, place_insertion, snap};
 use super::layout::{AUTO_LANE_H, Column, HEADER_W, LANE_H, STRIP_W, lane_rect, lanes_h, sample_at, x_of};
-use super::*;
+use super::{
+    Align2, AutoParam, Color32, Gesture, Range, Rect, Sense, Session, SoundApp, Stroke, Tokens, Tool, Track, TrackHeight, TrackId, TrackKind, Ui,
+    json, ops, pos2, regular, rgb, vec2,
+};
 
 pub(super) fn in_edit_window(s: &Session, t: &Track) -> bool {
     ops::shown(s, t)
@@ -96,7 +99,7 @@ pub(super) fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect,
         if !clip.range().overlaps(&view) {
             continue;
         }
-        draw_clip(app, &painter, &s, track, sorted, clip, tl, lane, auto_view.is_some());
+        draw_clip(&ClipLane { app, painter: &painter, s: &s, track, sorted, tl, lane }, clip, auto_view.is_some());
     }
     draw_live_take(app, &painter, &s, track, tl, lane);
     crate::video_track::draw_lane(app, &painter, &s, track, tl, lane);
@@ -127,12 +130,12 @@ pub(super) fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect,
     if track.view == "playlists" {
         playlist_lanes(app, ui, track, row, main_h, tl);
     }
-    auto_lanes(app, ui, track, row, tl, head_bg, lane_bg, selected);
+    auto_lanes(app, ui, track, row, tl, (head_bg, lane_bg), selected);
 }
 
 /// The automation lanes under a track: a header with the lane's parameter selector, add and remove
 /// buttons, and a body that draws and edits the lane like the track's own automation view.
-fn auto_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, tl: Rect, head_bg: Color32, lane_bg: Color32, selected: bool) {
+fn auto_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, tl: Rect, (head_bg, lane_bg): (Color32, Color32), selected: bool) {
     let t = Tokens::current();
     let s = app.engine.session_arc();
     let id = track.id;
@@ -144,7 +147,15 @@ fn auto_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, tl: Rec
         ui.painter().rect_filled(head, 0.0, head_bg);
         ui.painter().hline(row.min.x + STRIP_W..=tl.max.x, y + 0.5, Stroke::new(1.0, t.border));
         let sel = Rect::from_min_size(pos2(head.min.x + 6.0, y + 5.0), vec2(105.0, 17.0));
-        let resp = header_selector(ui, sel, ui.scope_id().with(("lane_sel", id.0, i)), &lane_label(track, &param), t.text, true, &format!("Automation lane for {}", track.name));
+        let resp = header_selector(
+            ui,
+            sel,
+            ui.scope_id().with(("lane_sel", id.0, i)),
+            &lane_label(track, &param),
+            t.text,
+            true,
+            &format!("Automation lane for {}", track.name),
+        );
         let mut picked = None;
         egui::Popup::menu(&resp).show(|ui| picked = automation_menu(ui, track));
         if let Some(v) = picked {
@@ -288,7 +299,6 @@ pub(super) fn plugin_menu_items(slot: u8, info: Option<&soundcraft_dsp::PluginIn
     out
 }
 
-
 /// Alternate playlists as lanes under the main one; clicking a clip promotes it (comping).
 fn playlist_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, main_h: f32, tl: Rect) {
     let t = Tokens::current();
@@ -306,7 +316,7 @@ fn playlist_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, mai
         let sorted = track.clips().is_sorted_by_key(|c| c.start);
         let view = Range::new(sample_at(&s, tl, tl.min.x), sample_at(&s, tl, tl.max.x));
         for c in pl.clips.iter().filter(|c| c.range().overlaps(&view)) {
-            draw_clip(app, &painter, &s, track, sorted, c, tl, lane, false);
+            draw_clip(&ClipLane { app, painter: &painter, s: &s, track, sorted, tl, lane }, c, false);
         }
         let resp = ui.interact(lane, ui.scope_id().with(("pl_lane", track.id.0, i)), Sense::click());
         if resp.clicked()

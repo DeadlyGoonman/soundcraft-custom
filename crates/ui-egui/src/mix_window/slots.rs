@@ -1,5 +1,8 @@
 use super::plugin_menu::{instrument_menu, plugin_info, plugin_menu};
-use super::*;
+use super::{
+    Align2, Color32, Rect, Sense, SoundApp, Stroke, StrokeKind, TRACK_TINT_EMPTY, Tokens, Track, TrackId, Ui, bold, groove, json, pos2, raised_key,
+    shade, track_tint, vec2,
+};
 
 /// An instrument track's INSTRUMENT row: click opens a hosted instrument's plugin window,
 /// right-click (or click, when none is set) picks another instrument. A built-in's parameters

@@ -428,7 +428,7 @@ impl<W: Write + Seek> Writer<W> {
         validate_layout(channels, sample_rate)?;
         let format = sample_format(depth);
         let start = out.stream_position()?;
-        out.write_all(&header(channels, sample_rate, format, bwf, mask, 0, force_rf64, metadata)?)?;
+        out.write_all(&header(channels, sample_rate, format, HeaderExtras { bwf, mask, force_rf64, metadata }, 0)?)?;
         let quantizers = Quantizer::per_channel(u32::from(format.0), dither, channels);
         Ok(Writer {
             out,
@@ -448,7 +448,13 @@ impl<W: Write + Seek> Writer<W> {
     }
 
     fn header(&self, frames: u64) -> Result<Vec<u8>> {
-        header(self.channels, self.sample_rate, self.format, self.bwf.as_ref(), self.mask, frames, self.force_rf64, self.metadata.as_ref())
+        header(
+            self.channels,
+            self.sample_rate,
+            self.format,
+            HeaderExtras { bwf: self.bwf.as_ref(), mask: self.mask, force_rf64: self.force_rf64, metadata: self.metadata.as_ref() },
+            frames,
+        )
     }
 
     /// The frame count after `frames` more (RF64 has room for any bounce).
@@ -505,7 +511,7 @@ pub(crate) fn encode(
     let channels = buf.channels.len();
     let frames = buf.frames();
     let format = sample_format(depth);
-    let head = header(channels, buf.sample_rate, format, bwf, mask, frames as u64, force_rf64, metadata)?;
+    let head = header(channels, buf.sample_rate, format, HeaderExtras { bwf, mask, force_rf64, metadata }, frames as u64)?;
     let data_len = (usize::from(format.0 / 8) * channels).checked_mul(frames).ok_or_else(|| AudioError::TooLarge("data size overflow".into()))?;
     let mut out = Vec::new();
     out.try_reserve_exact(head.len().saturating_add(data_len).saturating_add(1))
@@ -516,16 +522,8 @@ pub(crate) fn encode(
 }
 
 /// Everything before the sample data of a WAV holding `frames` frames.
-pub(crate) fn header(
-    channels: usize,
-    sample_rate: u32,
-    (bits, is_float): (u16, bool),
-    bwf: Option<&BwfInfo>,
-    mask: Option<u32>,
-    frames: u64,
-    force_rf64: bool,
-    metadata: Option<&crate::Metadata>,
-) -> Result<Vec<u8>> {
+pub(crate) fn header(channels: usize, sample_rate: u32, (bits, is_float): (u16, bool), extras: HeaderExtras<'_>, frames: u64) -> Result<Vec<u8>> {
+    let HeaderExtras { bwf, mask, force_rf64, metadata } = extras;
     let block = usize::from(bits / 8).checked_mul(channels).ok_or_else(|| AudioError::TooLarge("block size overflow".into()))?;
     let block_align = u16::try_from(block).map_err(|_| AudioError::Encode("too many channels for WAV".into()))?;
     let data_len = u64::from(block_align).checked_mul(frames).ok_or_else(|| AudioError::TooLarge("data size overflow".into()))?;

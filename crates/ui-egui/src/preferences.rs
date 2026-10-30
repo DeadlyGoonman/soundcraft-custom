@@ -138,15 +138,15 @@ pub fn project_fields(ui: &mut egui::Ui, services: &Services, cmd: &str, p: &mut
         ui.label("");
         if let Some(pick) = &services.pick_folder {
             if ui.button("Browse…").clicked()
-                && let Some(dir) = pick(&p.folder)
+                && let Some(dir) = pick(Path::new(&p.folder))
             {
-                p.folder = dir;
+                p.folder = dir.to_string_lossy().into_owned();
             }
         } else if let Some(pick) = &services.pick_save
             && ui.button("Browse…").clicked()
-            && let Some(file) = pick(cmd, path)
+            && let Some(file) = pick(cmd, Path::new(path.as_str()))
         {
-            let f = Path::new(&file);
+            let f = file.as_path();
             p.folder = f.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
             p.name = f.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             p.subfolder = false;
@@ -256,12 +256,15 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
         Page::General => {
             ui.label("Default projects folder");
             let prefs = &mut app.ui.preferences;
-            crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut prefs.default_projects_dir).desired_width(420.0)), "Default projects folder");
+            crate::widgets::named_text_field(
+                ui.add(egui::TextEdit::singleline(&mut prefs.default_projects_dir).desired_width(420.0)),
+                "Default projects folder",
+            );
             if let Some(pick) = &app.services.pick_folder
                 && ui.button("Browse…").clicked()
-                && let Some(dir) = pick(&prefs.projects_dir())
+                && let Some(dir) = pick(Path::new(&prefs.projects_dir()))
             {
-                prefs.default_projects_dir = dir;
+                prefs.default_projects_dir = dir.to_string_lossy().into_owned();
             }
             crate::widgets::checkbox(ui, &mut prefs.project_subfolder, "Create a folder for each new project");
             note(ui, "A new project called “hello” is saved as <folder>/hello/hello.scraft. Save Session As can pick another folder each time.");
@@ -279,7 +282,7 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 ui.label("Recording format");
                 let depth = &mut app.ui.audio.record_depth;
-                egui::ComboBox::from_id_salt("prefs_record_depth").selected_text(record_label(*depth)).show_ui(ui, |ui| {
+                craft_ui::ComboBox::from_id_salt("prefs_record_depth").selected_text(record_label(*depth)).show_ui(ui, |ui| {
                     for d in [RecordDepth::Int16, RecordDepth::Int24, RecordDepth::Float32] {
                         ui.selectable_value(depth, d, record_label(d));
                     }
@@ -298,7 +301,7 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
                 };
                 ui.label("44.1 kHz session on a 48 kHz device");
                 let policy = &mut app.ui.device_rate_policy;
-                egui::ComboBox::from_id_salt("prefs_device_rate").selected_text(label(*policy)).show_ui(ui, |ui| {
+                craft_ui::ComboBox::from_id_salt("prefs_device_rate").selected_text(label(*policy)).show_ui(ui, |ui| {
                     for p in [RatePolicy::Ask, RatePolicy::AlwaysSwitch, RatePolicy::AlwaysKeep] {
                         ui.selectable_value(policy, p, label(p));
                     }
@@ -312,7 +315,7 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
             egui::Grid::new("prefs_appearance").num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
                 ui.label("Theme");
                 let mut chosen = None;
-                egui::ComboBox::from_id_salt("prefs_theme").selected_text(app.ui.theme.label()).show_ui(ui, |ui| {
+                craft_ui::ComboBox::from_id_salt("prefs_theme").selected_text(app.ui.theme.label()).show_ui(ui, |ui| {
                     for mode in crate::theme::ThemeMode::ALL {
                         if ui.selectable_label(app.ui.theme == mode, mode.label()).clicked() {
                             chosen = Some(mode);
@@ -331,7 +334,10 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
         }
         Page::Export => {
             ui.label("Bounce folder (beside the session)");
-            crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut app.ui.preferences.bounce_folder).desired_width(260.0)), "Bounce folder");
+            crate::widgets::named_text_field(
+                ui.add(egui::TextEdit::singleline(&mut app.ui.preferences.bounce_folder).desired_width(260.0)),
+                "Bounce folder",
+            );
             note(ui, "Bounce Mix proposes <session folder>/<this folder>/<name> Bounce.wav.");
         }
     }

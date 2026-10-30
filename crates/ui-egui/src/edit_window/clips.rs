@@ -1,7 +1,11 @@
 use super::drag::fade_drag_preview;
 use super::input::{clip_gain_icon, near_fade_midpoint};
 use super::layout::{sample_at, x_of};
-use super::*;
+use super::{
+    Align2, AutoParam, Clip, ClipContent, ClipGainEdit, Color32, CornerRadius, Gesture, GridValue, NoteValue, Pos2, Range, Rect, Session, Shape,
+    SoundApp, Stroke, StrokeKind, TimeFormat, Tokens, Tool, Track, bold, clip_colors, clip_gain_edit_id, clip_gain_handle, clip_gain_label,
+    clip_gain_text, format_position, pos2, regular, vec2,
+};
 
 /// The outline of the Strip Silence rectangles.
 pub fn strip_silence_stroke() -> Stroke {
@@ -146,18 +150,39 @@ fn grid_veil(line: Color32, bg: Color32) -> Color32 {
     }
 }
 
-/// `sorted`: whether `track.clips()` is sorted by start (worked out once per track and frame).
-pub(super) fn draw_clip(
-    app: &SoundApp,
-    painter: &egui::Painter,
-    s: &Session,
-    track: &Track,
-    sorted: bool,
-    clip: &Clip,
-    tl: Rect,
-    lane: Rect,
+/// What `draw_clip` draws into: the app, painter and session, and the track lane the clips sit on.
+#[derive(Clone, Copy)]
+pub(super) struct ClipLane<'a> {
+    pub(super) app: &'a SoundApp,
+    pub(super) painter: &'a egui::Painter,
+    pub(super) s: &'a Session,
+    pub(super) track: &'a Track,
+    /// Whether `track.clips()` is sorted by start (worked out once per track and frame).
+    pub(super) sorted: bool,
+    pub(super) tl: Rect,
+    pub(super) lane: Rect,
+}
+
+/// Where and in what colours one clip is drawn, shared by the parts of `draw_clip`.
+#[derive(Clone, Copy)]
+struct ClipGeom<'a> {
+    r: Rect,
+    body_r: Rect,
+    vis: Rect,
+    x0: f32,
+    x1: f32,
+    name_h: f32,
+    body: Color32,
+    wave: Color32,
+    selected: bool,
     dim: bool,
-) {
+    fade_in: soundcraft_model::Fade,
+    fade_out: soundcraft_model::Fade,
+    prev: Option<&'a Clip>,
+}
+
+pub(super) fn draw_clip(cl: &ClipLane<'_>, clip: &Clip, dim: bool) {
+    let ClipLane { app, painter, s, track, tl, lane, .. } = *cl;
     let x0 = x_of(s, tl, clip.start);
     let x1 = x_of(s, tl, clip.end()).max(x0 + 1.0);
     let r = Rect::from_min_max(pos2(x0, lane.min.y + 1.0), pos2(x1, lane.max.y - 1.0));
@@ -179,6 +204,19 @@ pub(super) fn draw_clip(
     let vis = body_r.intersect(lane);
     // The waveform and fade curve share the same temporary envelope every frame.
     let (fade_in, fade_out) = clip_preview_fades(clip, app.gesture.as_ref().filter(|_| !dim));
+    let prev = crossfade_partner(track, clip);
+    let g = ClipGeom { r, body_r, vis, x0, x1, name_h, body, wave, selected, dim, fade_in, fade_out, prev };
+    draw_clip_content(cl, clip, &g);
+    draw_crossfade_tail(cl, &g);
+    draw_gain_line(cl, clip, &g);
+    draw_fades(cl, clip, &g);
+    draw_clip_overlays(cl, clip, &g);
+}
+
+/// The clip body: waveform, MIDI notes or the offline notice.
+fn draw_clip_content(cl: &ClipLane<'_>, clip: &Clip, g: &ClipGeom<'_>) {
+    let ClipLane { app, painter, s, track, tl, .. } = *cl;
+    let ClipGeom { body_r, vis, body, wave, selected, fade_in, fade_out, .. } = *g;
     match &clip.content {
         _ if track.view == "blocks" => {}
         ClipContent::Audio { source, .. } => {
@@ -241,7 +279,12 @@ pub(super) fn draw_clip(
             }
         }
     }
-    let prev = crossfade_partner(track, clip);
+}
+
+/// The waveform of the clip this one crossfades with, drawn over the overlap.
+fn draw_crossfade_tail(cl: &ClipLane<'_>, g: &ClipGeom<'_>) {
+    let ClipLane { app, painter, s, track, tl, .. } = *cl;
+    let ClipGeom { body_r, vis, x0, x1, dim, prev, .. } = *g;
     if s.edit.flag("waveform.overlapped_crossfades")
         && track.view != "blocks"
         && let Some(prev) = prev
@@ -264,6 +307,12 @@ pub(super) fn draw_clip(
             app.ui.wave_view_zoom,
         );
     }
+}
+
+/// The clip gain line and its icon.
+fn draw_gain_line(cl: &ClipLane<'_>, clip: &Clip, g: &ClipGeom<'_>) {
+    let ClipLane { app, painter, s, track, tl, lane, .. } = *cl;
+    let ClipGeom { r, body_r, x0, x1, dim, .. } = *g;
     // Clip gain line.
     let show_gain = s.edit.flag("view.clip.gain_line") && (!clip.gain_env.is_empty() || clip.gain_db.abs() > 0.01 || track.view == "clip_gain");
     if show_gain && body_r.height() > 12.0 {
@@ -303,6 +352,12 @@ pub(super) fn draw_clip(
             painter.circle(grip.center() + vec2(0.0, 2.0), 4.5, fill, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)));
         }
     }
+}
+
+/// The fade curves, their midpoint handles and the crossfade partner's fade-out.
+fn draw_fades(cl: &ClipLane<'_>, clip: &Clip, g: &ClipGeom<'_>) {
+    let ClipLane { app, painter, s, track, tl, .. } = *cl;
+    let ClipGeom { body_r, vis, x0, x1, body, dim, fade_in, fade_out, prev, .. } = *g;
     let fade_col = Color32::from_rgba_unmultiplied(255, 255, 255, 90);
     for (side, fade) in [(true, fade_in), (false, fade_out)] {
         if fade.len <= 0 {
@@ -326,6 +381,12 @@ pub(super) fn draw_clip(
         let pts = fade_curve_points(c.fade_out, false, a, b, body_r, painter.ctx().pixels_per_point());
         painter.with_clip_rect(vis).add(Shape::line(pts, Stroke::new(1.2, fade_col)));
     }
+}
+
+/// Optional clip overlays (View › Clip).
+fn draw_clip_overlays(cl: &ClipLane<'_>, clip: &Clip, g: &ClipGeom<'_>) {
+    let ClipLane { app, painter, s, track, sorted, tl, lane, .. } = *cl;
+    let ClipGeom { r, name_h, .. } = *g;
     // Optional clip overlays (View › Clip).
     let ov = Color32::from_rgb(16, 16, 16);
     if s.edit.flag("view.clip.rating") && clip.rating > 0 && name_h > 0.0 {
@@ -340,23 +401,7 @@ pub(super) fn draw_clip(
         ));
         painter.line_segment([pos2(x, r.min.y + name_h), pos2(x, r.max.y)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 90)));
     }
-    let time_text = if s.edit.flag("view.clip.time.current") {
-        Some(s.format_position(clip.start, s.edit.main_counter))
-    } else if s.edit.flag("view.clip.time.original") || s.edit.flag("view.clip.time.user") {
-        clip.source().and_then(|src| s.source(src)).map(|src| {
-            format_position(
-                i64::try_from(src.time_reference).unwrap_or(0).saturating_add(clip.source_offset()).saturating_sub(s.timecode_start),
-                TimeFormat::Timecode,
-                s.sample_rate,
-                &s.tempo,
-                s.frame_rate,
-                0,
-                0,
-            )
-        })
-    } else {
-        None
-    };
+    let time_text = clip_time_text(s, clip);
     if let Some(tt) = time_text
         && r.height() > 30.0
     {
@@ -401,6 +446,27 @@ pub(super) fn draw_clip(
     // The thin black outline, redrawn last so the waveform and fades never cover the sides.
     painter.rect_stroke(r, CornerRadius::same(2), Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
     let _ = app;
+}
+
+/// The clip's start (or original) time label for the overlays, when one is shown.
+fn clip_time_text(s: &Session, clip: &Clip) -> Option<String> {
+    if s.edit.flag("view.clip.time.current") {
+        Some(s.format_position(clip.start, s.edit.main_counter))
+    } else if s.edit.flag("view.clip.time.original") || s.edit.flag("view.clip.time.user") {
+        clip.source().and_then(|src| s.source(src)).map(|src| {
+            format_position(
+                i64::try_from(src.time_reference).unwrap_or(0).saturating_add(clip.source_offset()).saturating_sub(s.timecode_start),
+                TimeFormat::Timecode,
+                s.sample_rate,
+                &s.tempo,
+                s.frame_rate,
+                0,
+                0,
+            )
+        })
+    } else {
+        None
+    }
 }
 
 /// The earlier clip of a crossfade pair: the one before `clip` in its playlist, overlapping its start.

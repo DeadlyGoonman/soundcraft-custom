@@ -24,7 +24,6 @@ pub mod preferences;
 pub mod shortcuts;
 pub mod theme;
 pub mod toolbar;
-pub mod updates_ui;
 pub mod video_track;
 pub mod waveform;
 pub mod widgets;
@@ -367,7 +366,6 @@ pub struct SoundApp {
     /// When the driver last asked to be reset and the device was reopened for it (see `reset_output`).
     last_reset: Option<std::time::Instant>,
     pub dialogs: dialogs::Dialogs,
-    pub(crate) updates_rt: updates_ui::Runtime,
     pub meters: HashMap<TrackId, MeterDisplay>,
     pub main_meter: MeterDisplay,
     /// Reused meter snapshot, taken from the player at an adaptive rate by `logic`: the highest
@@ -467,6 +465,8 @@ pub struct SoundApp {
     last_rev: u64,
     fonts_ready: bool,
     fonts_installed: bool,
+    /// Whether the system fonts are loaded next to the bundled ones; set before the first frame.
+    system_fonts: bool,
     /// The palette last applied to the context (light?), so visuals are set only on a change.
     theme_applied: Option<theme::Palette>,
     /// Last panel host context, used to cancel renderer-owned gestures on explicit replacement.

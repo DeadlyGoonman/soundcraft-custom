@@ -1,5 +1,5 @@
 use super::plugin_menu::{MenuSearch, menu_row};
-use super::*;
+use super::{Rect, Route, SoundApp, Track, TrackId, Ui, json, pos2, rgb, vec2};
 
 /// Pro Tools draws the track's colour down the whole strip — the PREAMP, INSERTS, SENDS and I/O
 /// sections all sit on it, so tracks are easy to tell apart at a glance. A 3 px bar down the

@@ -28,8 +28,8 @@ fn harness(app: SoundApp) -> Harness<'static, SoundApp> {
 fn hello(projects: &Path, pick: Option<PathBuf>) -> Harness<'static, SoundApp> {
     let mut engine = soundcraft_engine::Engine::default();
     engine.session_mut().name = "hello".into();
-    let pick_folder: Option<Box<dyn Fn(&str) -> Option<String>>> =
-        pick.map(|p| Box::new(move |_: &str| Some(p.to_string_lossy().into_owned())) as Box<dyn Fn(&str) -> Option<String>>);
+    let pick_folder: Option<Box<dyn Fn(&Path) -> Option<PathBuf>>> =
+        pick.map(|p| Box::new(move |_: &Path| Some(p.clone())) as Box<dyn Fn(&Path) -> Option<PathBuf>>);
     let mut app = SoundApp::new(engine, None, Services { pick_folder, ..Default::default() });
     app.ui.preferences.default_projects_dir = projects.to_string_lossy().into();
     let mut h = harness(app);

@@ -17,8 +17,8 @@ mod strip_silence;
 #[cfg(test)]
 use audiosuite::SPEED_RAMP_CHOICES;
 use audiosuite::audiosuite_window;
+pub use files::{NotUnicode, ask_to_save, open_path, open_session_bytes, run_or_ask, takes_path, unicode};
 use files::{OPEN_PENDING, default_dir, open_pending_session, path_dialog, run_or_open};
-pub use files::{ask_to_save, open_session_bytes, run_or_ask, takes_path};
 use strip_silence::{AUTO_NAME_LABELS, STRIP_NAME_LABELS, StripRectangles, auto_rename_action, strip_name_fields, strip_silence_action};
 pub use strip_silence::{StripRects, strip_silence_rectangles};
 
@@ -514,6 +514,304 @@ fn opening_window(app: &mut SoundApp, ctx: &egui::Context) {
     ctx.request_repaint_after(std::time::Duration::from_millis(30).saturating_sub(started.elapsed()));
 }
 
+/// The New Tracks form; the command to run once Create is pressed.
+fn new_tracks_form(
+    ui: &mut egui::Ui,
+    count: &mut u32,
+    format: &mut String,
+    kind: &mut String,
+    timebase: &mut String,
+    name: &mut String,
+    enter: bool,
+) -> Option<(String, Value)> {
+    ui.horizontal(|ui| {
+        let create = ui.label("Create");
+        ui.add(egui::DragValue::new(count).range(1..=128)).labelled_by(create.id);
+        ui.label("new");
+        let fmt = craft_ui::ComboBox::from_id_salt("nt_fmt").selected_text(format.as_str()).show_ui(ui, |ui| {
+            for f in soundcraft_model::ChannelFormat::ALL {
+                ui.selectable_value(format, f.label().to_string(), f.label());
+            }
+        });
+        fmt.response.accessible_name("Channel format");
+        let kind_combo = craft_ui::ComboBox::from_id_salt("nt_kind")
+            .selected_text(soundcraft_model::TrackKind::from_id(kind).map_or("Audio Track", |k| k.label()))
+            .show_ui(ui, |ui| {
+                for k in soundcraft_model::TrackKind::ALL {
+                    if ui.selectable_label(kind == k.id(), k.label()).clicked() {
+                        *kind = k.id().to_string();
+                        *name = k.default_name().to_string();
+                    }
+                }
+            });
+        kind_combo.response.accessible_name("Track kind");
+        ui.label("in");
+        let tb = craft_ui::ComboBox::from_id_salt("nt_tb").selected_text(if timebase == "ticks" { "Ticks" } else { "Samples" }).show_ui(ui, |ui| {
+            ui.selectable_value(timebase, "samples".to_string(), "Samples");
+            ui.selectable_value(timebase, "ticks".to_string(), "Ticks");
+        });
+        tb.response.accessible_name("Timebase");
+    });
+    ui.horizontal(|ui| {
+        ui.label("Name:");
+        crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(name).desired_width(240.0)), "Name");
+    });
+    if buttons(ui, "Create", enter) {
+        return Some(("track.new".into(), json!({"count": count, "format": format, "kind": kind, "timebase": timebase, "name": name})));
+    }
+    None
+}
+
+/// The Bounce dialog's fields, borrowed from the open dialog.
+struct BounceForm<'a> {
+    path: &'a mut String,
+    format: &'a mut String,
+    bit_depth: &'a mut String,
+    bitrate: &'a mut u32,
+    flac_level: &'a mut u8,
+    normalize: &'a mut bool,
+    dither: &'a mut bool,
+    metadata: &'a mut BounceMetadata,
+}
+
+/// The Bounce form: folder and name, format and its options, tags; true once Bounce starts.
+fn bounce_form(app: &mut SoundApp, ui: &mut egui::Ui, form: BounceForm<'_>, enter: bool) -> bool {
+    let BounceForm { path, format, bit_depth, bitrate, flac_level, normalize, dither, metadata } = form;
+    let (mut dir, mut name) = split_bounce_path(path);
+    let (old_dir, old_name) = (dir.clone(), name.clone());
+    let mut picked = None;
+    egui::Grid::new("bounce_file").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
+        ui.label("Folder");
+        crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut dir).desired_width(420.0)), "Folder");
+        ui.end_row();
+        ui.label("");
+        if let Some(pick) = &app.services.pick_save
+            && ui.button("Browse…").clicked()
+        {
+            picked = pick("file.bounce_mix", std::path::Path::new(path.as_str()));
+        }
+        ui.end_row();
+        ui.label("Name");
+        crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut name).desired_width(420.0)), "Name");
+        ui.end_row();
+    });
+    let picked = match picked.as_deref().map(unicode) {
+        Some(Ok(text)) => Some(text.to_owned()),
+        Some(Err(e)) => {
+            app.ui.status = e.to_string();
+            None
+        }
+        None => None,
+    };
+    if let Some(p) = picked {
+        *path = p;
+        match std::path::Path::new(path.as_str()).extension().map(|x| x.to_string_lossy().to_lowercase()).as_deref() {
+            Some("wav") => *format = "wav".into(),
+            Some("aif" | "aiff") => *format = "aiff".into(),
+            Some("flac") => *format = "flac".into(),
+            Some("mp3") if !cfg!(target_arch = "wasm32") => *format = "mp3".into(),
+            _ => {}
+        }
+    } else if dir != old_dir || name != old_name {
+        *path = join_bounce_path(&dir, &name, format);
+    }
+    ui.horizontal(|ui| {
+        let before = format.clone();
+        craft_ui::ComboBox::from_label("Format").selected_text(format.to_uppercase()).show_ui(ui, |ui| {
+            for f in ["wav", "aiff", "flac", "mp3"] {
+                if f == "mp3" && cfg!(target_arch = "wasm32") {
+                    continue;
+                }
+                ui.selectable_value(format, f.to_string(), f.to_uppercase());
+            }
+        });
+        if *format != before {
+            *path = with_audio_ext(path, format);
+        }
+        if format == "mp3" {
+            ui.add(egui::Slider::new(bitrate, 32..=320).text("Bitrate (kbps)"));
+        } else {
+            craft_ui::ComboBox::from_label("Bit Depth").selected_text(format!("{bit_depth}-bit")).show_ui(ui, |ui| {
+                for b in ["16", "24", "32f"] {
+                    ui.selectable_value(bit_depth, b.to_string(), format!("{b}-bit"));
+                }
+            });
+            if format == "flac" {
+                ui.add(egui::Slider::new(flac_level, 0..=8).text("Compression (0 fastest, 8 smallest)"));
+            }
+        }
+    });
+    crate::widgets::checkbox(ui, normalize, "Normalize to -0.1 dBFS");
+    // 32-bit float keeps every sample as it is: there is nothing to dither.
+    ui.add_enabled_ui(bit_depth.as_str() != "32f", |ui| {
+        crate::widgets::checkbox(ui, dither, "Dither (TPDF)")
+            .on_hover_text("Adds ±1 LSB triangular dither when writing 16- or 24-bit files. Leave it off when the master chain already dithers.");
+    });
+    egui::CollapsingHeader::new("Metadata (optional)").default_open(metadata.expanded).show(ui, |ui| {
+        metadata.expanded = true;
+        egui::Grid::new("bounce_metadata").num_columns(2).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
+            for (label, field) in [
+                ("Title", &mut metadata.title),
+                ("Artist", &mut metadata.artist),
+                ("Album", &mut metadata.album),
+                ("Genre", &mut metadata.genre),
+                ("Year", &mut metadata.year),
+                ("Comment", &mut metadata.comment),
+            ] {
+                ui.label(label);
+                crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(field).desired_width(300.0)), label);
+                ui.end_row();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Written into the file as tags (WAV LIST/INFO, AIFF NAME/AUTH/ANNO, FLAC Vorbis comment, MP3 ID3). Left blank, nothing is written.",
+            )
+            .small()
+            .color(Tokens::current().text_dim),
+        );
+    });
+    ui.label(
+        egui::RichText::new("Bounces the edit selection, or the whole session when nothing is selected.").small().color(Tokens::current().text_dim),
+    );
+    if buttons(ui, "Bounce", enter) {
+        let p = with_audio_ext(path, format);
+        let mut params = json!({"path": p, "format": format, "bit_depth": bit_depth, "bitrate": bitrate, "flac_level": flac_level, "normalize": normalize, "dither": *dither && bit_depth.as_str() != "32f"});
+        if let (Value::Object(map), Value::Object(m)) = (&mut params, metadata.to_json()) {
+            map.insert("metadata".into(), Value::Object(m));
+        }
+        crate::bounce::start(app, &params);
+        return true;
+    }
+    false
+}
+
+/// The path prompt's form; the command to run once it is confirmed.
+fn path_prompt_form(app: &mut SoundApp, ui: &mut egui::Ui, cmd: &str, path: &mut String, key: &str, enter: bool) -> Option<(String, Value)> {
+    let mut action = None;
+    if let Some(project) = app.dialogs.project.as_mut().filter(|_| cmd.starts_with("session.save")) {
+        crate::preferences::project_fields(ui, &app.services, cmd, project, path);
+    } else {
+        let folder = key == "dir";
+        let opening = !folder && (cmd.contains("import") || cmd.contains("open") || cmd == "session.new_from_template");
+        let (mut dir, mut name, ext) = split_save_path(path);
+        let (old_dir, old_name) = (dir.clone(), name.clone());
+        let mut picked: Option<std::path::PathBuf> = None;
+        egui::Grid::new("path_prompt").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
+            if folder || opening {
+                ui.label(if folder { "Folder" } else { "File" });
+                crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(path).desired_width(420.0)), "Path");
+            } else {
+                ui.label("Folder");
+                crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut dir).desired_width(420.0)), "Folder");
+            }
+            ui.end_row();
+            ui.label("");
+            picked = if folder {
+                app.services
+                    .pick_folder
+                    .as_ref()
+                    .and_then(|pick| ui.button("Browse…").clicked().then(|| pick(std::path::Path::new(path.as_str()))).flatten())
+            } else if opening {
+                app.services.pick_open.as_ref().and_then(|pick| ui.button("Browse…").clicked().then(|| pick(cmd, &[])).flatten())
+            } else {
+                app.services
+                    .pick_save
+                    .as_ref()
+                    .and_then(|pick| ui.button("Browse…").clicked().then(|| pick(cmd, std::path::Path::new(path.as_str()))).flatten())
+            };
+            ui.end_row();
+            if !folder && !opening {
+                ui.label("Name");
+                crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut name).desired_width(420.0)), "Name");
+                ui.end_row();
+            }
+        });
+        let picked_text = match picked.as_deref().map(unicode) {
+            Some(Ok(text)) => Some(text.to_owned()),
+            Some(Err(e)) => {
+                app.ui.status = e.to_string();
+                None
+            }
+            None => None,
+        };
+        if let Some(p) = picked_text {
+            *path = p;
+            // Choosing a file in the picker is the answer: open/import it right away.
+            if opening {
+                action = Some((cmd.to_string(), json!({ key: path })));
+            }
+        } else if !folder && !opening && (dir != old_dir || name != old_name) {
+            *path = join_save_path(&dir, &name, &ext);
+        }
+    }
+    let file = soundcraft_engine::io::session_file(path);
+    let replaces = soundcraft_engine::io::replaces(&app.engine, cmd, &file);
+    if replaces {
+        ui.label(format!("“{}” already exists. Do you want to replace it?", file.file_name().unwrap_or_default().to_string_lossy()));
+    }
+    if buttons(ui, if replaces { "Replace" } else { "OK" }, enter && !replaces) {
+        let mut v = json!({});
+        v[key] = json!(path);
+        if replaces {
+            v["replace"] = json!(true);
+        }
+        action = Some((cmd.to_string(), v));
+    }
+    action
+}
+
+/// The Strip Silence form: the Strip Silence command to run, or the values to carry into Rename.
+fn strip_silence_form(
+    ui: &mut egui::Ui,
+    values: &mut [f64; 4],
+    strip_names: &StripNames,
+    enter: bool,
+) -> (Option<(String, Value)>, Option<[f64; 4]>) {
+    let mut action = None;
+    let mut rename_from = None;
+    let [threshold, min_ms, pre_ms, post_ms] = values;
+    let before = [*threshold, *min_ms, *pre_ms, *post_ms];
+    ui.add(egui::Slider::new(threshold, -96.0..=0.0).text("Threshold dB"));
+    ui.add(egui::Slider::new(min_ms, 0.0..=4000.0).text("Min strip duration ms"));
+    ui.add(egui::Slider::new(pre_ms, 0.0..=500.0).text("Clip start pad ms"));
+    ui.add(egui::Slider::new(post_ms, 0.0..=2000.0).text("Clip end pad ms"));
+    let values = [*threshold, *min_ms, *pre_ms, *post_ms];
+    // The Edit window is drawn before this window, so it draws the rectangles for new values in the next frame.
+    if values != before {
+        ui.ctx().request_repaint();
+    }
+    if !strip_names.name.trim().is_empty() {
+        let names = format!("New clips are named {}, {} and so on.", strip_names.clip_name(0), strip_names.clip_name(1));
+        ui.label(egui::RichText::new(names).small().color(Tokens::current().text_dim));
+    }
+    ui.separator();
+    ui.horizontal(|ui| {
+        let mut mode = None;
+        let mut rename = false;
+        if ui.button("Extract").clicked() {
+            mode = Some("extract");
+        }
+        if ui.button("Rename…").clicked() {
+            rename = true;
+        }
+        if ui.button("Separate").clicked() {
+            mode = Some("separate");
+        }
+        // Enter on a focused Extract or Separate clicks that button, so Enter presses Strip only when neither was clicked.
+        if buttons(ui, "Strip", enter) && mode.is_none() {
+            mode = Some("strip");
+        }
+        // Enter on a focused Rename… also presses Strip, so Rename… goes first.
+        if rename {
+            rename_from = Some(values);
+        } else if let Some(mode) = mode {
+            action = Some(strip_silence_action(mode, values, strip_names));
+        }
+    });
+    (action, rename_from)
+}
+
 /// Show the open dialog, if any.
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     opening_window(app, ctx);
@@ -562,44 +860,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
             ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
             match &mut d {
                 Dialog::NewTracks { count, format, kind, timebase, name } => {
-                    ui.horizontal(|ui| {
-                        let create = ui.label("Create");
-                        ui.add(egui::DragValue::new(count).range(1..=128)).labelled_by(create.id);
-                        ui.label("new");
-                        let fmt = egui::ComboBox::from_id_salt("nt_fmt").selected_text(format.as_str()).show_ui(ui, |ui| {
-                            for f in soundcraft_model::ChannelFormat::ALL {
-                                ui.selectable_value(format, f.label().to_string(), f.label());
-                            }
-                        });
-                        fmt.response.accessible_name("Channel format");
-                        let kind_combo = egui::ComboBox::from_id_salt("nt_kind")
-                            .selected_text(soundcraft_model::TrackKind::from_id(kind).map_or("Audio Track", |k| k.label()))
-                            .show_ui(ui, |ui| {
-                                for k in soundcraft_model::TrackKind::ALL {
-                                    if ui.selectable_label(kind == k.id(), k.label()).clicked() {
-                                        *kind = k.id().to_string();
-                                        *name = k.default_name().to_string();
-                                    }
-                                }
-                            });
-                        kind_combo.response.accessible_name("Track kind");
-                        ui.label("in");
-                        let tb = egui::ComboBox::from_id_salt("nt_tb").selected_text(if timebase == "ticks" { "Ticks" } else { "Samples" }).show_ui(
-                            ui,
-                            |ui| {
-                                ui.selectable_value(timebase, "samples".to_string(), "Samples");
-                                ui.selectable_value(timebase, "ticks".to_string(), "Ticks");
-                            },
-                        );
-                        tb.response.accessible_name("Timebase");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Name:");
-                        crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(name).desired_width(240.0)), "Name");
-                    });
-                    if buttons(ui, "Create", enter) {
-                        action =
-                            Some(("track.new".into(), json!({"count": count, "format": format, "kind": kind, "timebase": timebase, "name": name})));
+                    if let Some(cmd) = new_tracks_form(ui, count, format, kind, timebase, name, enter) {
+                        action = Some(cmd);
                     }
                 }
                 Dialog::NewSession { name, sample_rate, demo } => {
@@ -607,7 +869,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         ui.label("Name");
                         crate::widgets::named_text_field(ui.text_edit_singleline(name), "Name");
                     });
-                    egui::ComboBox::from_label("Sample Rate").selected_text(format!("{sample_rate} Hz")).show_ui(ui, |ui| {
+                    craft_ui::ComboBox::from_label("Sample Rate").selected_text(format!("{sample_rate} Hz")).show_ui(ui, |ui| {
                         for r in soundcraft_time::SampleRate::COMMON {
                             ui.selectable_value(sample_rate, r, format!("{r} Hz"));
                         }
@@ -621,104 +883,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     }
                 }
                 Dialog::Bounce { path, format, bit_depth, bitrate, flac_level, normalize, dither, metadata } => {
-                    let (mut dir, mut name) = split_bounce_path(path);
-                    let (old_dir, old_name) = (dir.clone(), name.clone());
-                    let mut picked = None;
-                    egui::Grid::new("bounce_file").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
-                        ui.label("Folder");
-                        crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut dir).desired_width(420.0)), "Folder");
-                        ui.end_row();
-                        ui.label("");
-                        if let Some(pick) = &app.services.pick_save
-                            && ui.button("Browse…").clicked()
-                        {
-                            picked = pick("file.bounce_mix", path);
-                        }
-                        ui.end_row();
-                        ui.label("Name");
-                        crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut name).desired_width(420.0)), "Name");
-                        ui.end_row();
-                    });
-                    if let Some(p) = picked {
-                        *path = p;
-                        match std::path::Path::new(path.as_str()).extension().map(|x| x.to_string_lossy().to_lowercase()).as_deref() {
-                            Some("wav") => *format = "wav".into(),
-                            Some("aif" | "aiff") => *format = "aiff".into(),
-                            Some("flac") => *format = "flac".into(),
-                            Some("mp3") if !cfg!(target_arch = "wasm32") => *format = "mp3".into(),
-                            _ => {}
-                        }
-                    } else if dir != old_dir || name != old_name {
-                        *path = join_bounce_path(&dir, &name, format);
-                    }
-                    ui.horizontal(|ui| {
-                        let before = format.clone();
-                        egui::ComboBox::from_label("Format").selected_text(format.to_uppercase()).show_ui(ui, |ui| {
-                            for f in ["wav", "aiff", "flac", "mp3"] {
-                                if f == "mp3" && cfg!(target_arch = "wasm32") {
-                                    continue;
-                                }
-                                ui.selectable_value(format, f.to_string(), f.to_uppercase());
-                            }
-                        });
-                        if *format != before {
-                            *path = with_audio_ext(path, format);
-                        }
-                        if format == "mp3" {
-                            ui.add(egui::Slider::new(bitrate, 32..=320).text("Bitrate (kbps)"));
-                        } else {
-                            egui::ComboBox::from_label("Bit Depth").selected_text(format!("{bit_depth}-bit")).show_ui(ui, |ui| {
-                                for b in ["16", "24", "32f"] {
-                                    ui.selectable_value(bit_depth, b.to_string(), format!("{b}-bit"));
-                                }
-                            });
-                            if format == "flac" {
-                                ui.add(egui::Slider::new(flac_level, 0..=8).text("Compression (0 fastest, 8 smallest)"));
-                            }
-                        }
-                    });
-                    crate::widgets::checkbox(ui, normalize, "Normalize to -0.1 dBFS");
-                    // 32-bit float keeps every sample as it is: there is nothing to dither.
-                    ui.add_enabled_ui(bit_depth.as_str() != "32f", |ui| {
-                        crate::widgets::checkbox(ui, dither, "Dither (TPDF)")
-                            .on_hover_text("Adds ±1 LSB triangular dither when writing 16- or 24-bit files. Leave it off when the master chain already dithers.");
-                    });
-                    egui::CollapsingHeader::new("Metadata (optional)").default_open(metadata.expanded).show(ui, |ui| {
-                        metadata.expanded = true;
-                        egui::Grid::new("bounce_metadata").num_columns(2).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
-                            for (label, field) in [
-                                ("Title", &mut metadata.title),
-                                ("Artist", &mut metadata.artist),
-                                ("Album", &mut metadata.album),
-                                ("Genre", &mut metadata.genre),
-                                ("Year", &mut metadata.year),
-                                ("Comment", &mut metadata.comment),
-                            ] {
-                                ui.label(label);
-                                crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(field).desired_width(300.0)), label);
-                                ui.end_row();
-                            }
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "Written into the file as tags (WAV LIST/INFO, AIFF NAME/AUTH/ANNO, FLAC Vorbis comment, MP3 ID3). Left blank, nothing is written.",
-                            )
-                            .small()
-                            .color(Tokens::current().text_dim),
-                        );
-                    });
-                    ui.label(
-                        egui::RichText::new("Bounces the edit selection, or the whole session when nothing is selected.")
-                            .small()
-                            .color(Tokens::current().text_dim),
-                    );
-                    if buttons(ui, "Bounce", enter) {
-                        let p = with_audio_ext(path, format);
-                        let mut params = json!({"path": p, "format": format, "bit_depth": bit_depth, "bitrate": bitrate, "flac_level": flac_level, "normalize": normalize, "dither": *dither && bit_depth.as_str() != "32f"});
-                        if let (Value::Object(map), Value::Object(m)) = (&mut params, metadata.to_json()) {
-                            map.insert("metadata".into(), Value::Object(m));
-                        }
-                        crate::bounce::start(app, &params);
+                    let form = BounceForm { path, format, bit_depth, bitrate, flac_level, normalize, dither, metadata };
+                    if bounce_form(app, ui, form, enter) {
                         keep = false;
                     }
                 }
@@ -748,61 +914,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     }
                 }
                 Dialog::PathPrompt { cmd, path, key, .. } => {
-                    if let Some(project) = app.dialogs.project.as_mut().filter(|_| cmd.starts_with("session.save")) {
-                        crate::preferences::project_fields(ui, &app.services, cmd, project, path);
-                    } else {
-                        let folder = key == "dir";
-                        let opening = !folder && (cmd.contains("import") || cmd.contains("open") || cmd == "session.new_from_template");
-                        let (mut dir, mut name, ext) = split_save_path(path);
-                        let (old_dir, old_name) = (dir.clone(), name.clone());
-                        let mut picked = None;
-                        egui::Grid::new("path_prompt").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
-                            if folder || opening {
-                                ui.label(if folder { "Folder" } else { "File" });
-                                crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(path).desired_width(420.0)), "Path");
-                            } else {
-                                ui.label("Folder");
-                                crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut dir).desired_width(420.0)), "Folder");
-                            }
-                            ui.end_row();
-                            ui.label("");
-                            let browse = if folder {
-                                app.services.pick_folder.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(path)).flatten())
-                            } else if opening {
-                                app.services.pick_open.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(cmd, &[])).flatten())
-                            } else {
-                                app.services.pick_save.as_ref().map(|pick| ui.button("Browse…").clicked().then(|| pick(cmd, path)).flatten())
-                            };
-                            picked = browse.flatten();
-                            ui.end_row();
-                            if !folder && !opening {
-                                ui.label("Name");
-                                crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut name).desired_width(420.0)), "Name");
-                                ui.end_row();
-                            }
-                        });
-                        if let Some(p) = picked {
-                            *path = p;
-                            // Choosing a file in the picker is the answer: open/import it right away.
-                            if opening {
-                                action = Some((cmd.clone(), json!({ key.as_str(): path })));
-                            }
-                        } else if !folder && !opening && (dir != old_dir || name != old_name) {
-                            *path = join_save_path(&dir, &name, &ext);
-                        }
-                    }
-                    let file = soundcraft_engine::io::session_file(path);
-                    let replaces = soundcraft_engine::io::replaces(&app.engine, cmd, &file);
-                    if replaces {
-                        ui.label(format!("“{}” already exists. Do you want to replace it?", file.file_name().unwrap_or_default().to_string_lossy()));
-                    }
-                    if buttons(ui, if replaces { "Replace" } else { "OK" }, enter && !replaces) {
-                        let mut v = json!({});
-                        v[key.as_str()] = json!(path);
-                        if replaces {
-                            v["replace"] = json!(true);
-                        }
-                        action = Some((cmd.clone(), v));
+                    if let Some(c) = path_prompt_form(app, ui, cmd, path, key, enter) {
+                        action = Some(c);
                     }
                 }
                 Dialog::Number { cmd, key, value, suffix, .. } => {
@@ -841,44 +954,11 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     }
                 }
                 Dialog::StripSilence { threshold, min_ms, pre_ms, post_ms } => {
-                    let before = [*threshold, *min_ms, *pre_ms, *post_ms];
-                    ui.add(egui::Slider::new(threshold, -96.0..=0.0).text("Threshold dB"));
-                    ui.add(egui::Slider::new(min_ms, 0.0..=4000.0).text("Min strip duration ms"));
-                    ui.add(egui::Slider::new(pre_ms, 0.0..=500.0).text("Clip start pad ms"));
-                    ui.add(egui::Slider::new(post_ms, 0.0..=2000.0).text("Clip end pad ms"));
-                    let values = [*threshold, *min_ms, *pre_ms, *post_ms];
-                    // The Edit window is drawn before this window, so it draws the rectangles for new values in the next frame.
-                    if values != before {
-                        ui.ctx().request_repaint();
-                    }
-                    if !strip_names.name.trim().is_empty() {
-                        let names = format!("New clips are named {}, {} and so on.", strip_names.clip_name(0), strip_names.clip_name(1));
-                        ui.label(egui::RichText::new(names).small().color(Tokens::current().text_dim));
-                    }
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        let mut mode = None;
-                        let mut rename = false;
-                        if ui.button("Extract").clicked() {
-                            mode = Some("extract");
-                        }
-                        if ui.button("Rename…").clicked() {
-                            rename = true;
-                        }
-                        if ui.button("Separate").clicked() {
-                            mode = Some("separate");
-                        }
-                        // Enter on a focused Extract or Separate clicks that button, so Enter presses Strip only when neither was clicked.
-                        if buttons(ui, "Strip", enter) && mode.is_none() {
-                            mode = Some("strip");
-                        }
-                        // Enter on a focused Rename… also presses Strip, so Rename… goes first.
-                        if rename {
-                            rename_from = Some(values);
-                        } else if let Some(mode) = mode {
-                            action = Some(strip_silence_action(mode, values, &strip_names));
-                        }
-                    });
+                    let mut values = [*threshold, *min_ms, *pre_ms, *post_ms];
+                    let (a, r) = strip_silence_form(ui, &mut values, &strip_names, enter);
+                    [*threshold, *min_ms, *pre_ms, *post_ms] = values;
+                    action = a.or(action.take());
+                    rename_from = r.or(rename_from);
                 }
                 Dialog::StripSilenceRename { names, .. } => {
                     strip_name_fields(ui, names, STRIP_NAME_LABELS);
@@ -928,12 +1008,12 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     }
                 }
                 Dialog::Session { frame_rate, bit_depth } => {
-                    egui::ComboBox::from_label("Timecode Rate").selected_text(frame_rate.as_str()).show_ui(ui, |ui| {
+                    craft_ui::ComboBox::from_label("Timecode Rate").selected_text(frame_rate.as_str()).show_ui(ui, |ui| {
                         for r in soundcraft_time::FrameRate::ALL {
                             ui.selectable_value(frame_rate, r.label().to_string(), r.label());
                         }
                     });
-                    egui::ComboBox::from_label("Bit Depth").selected_text(bit_depth.as_str()).show_ui(ui, |ui| {
+                    craft_ui::ComboBox::from_label("Bit Depth").selected_text(bit_depth.as_str()).show_ui(ui, |ui| {
                         for b in ["16", "24", "32f"] {
                             ui.selectable_value(bit_depth, b.to_string(), b);
                         }
@@ -1166,6 +1246,21 @@ fn loop_length(s: &Session, text: &str, format: soundcraft_time::TimeFormat, sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name that is not valid Unicode is not opened under a lossy rendering (another file): the
+    /// status line names its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_paths_are_reported_not_mangled() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(unicode(std::path::Path::new("/a/café.wav")), Ok("/a/café.wav"));
+        let latin1 = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/a/caf\xe9.scraft"));
+        assert_eq!(unicode(latin1), Err(NotUnicode(latin1.to_path_buf())));
+        let mut app = SoundApp::new(Engine::default(), None, crate::Services::default());
+        open_path(&mut app, latin1);
+        assert_eq!(app.ui.status, r#""/a/caf\xE9.scraft" is not valid Unicode"#);
+        assert!(app.engine.path.is_none() && app.dialogs.open.is_none());
+    }
 
     #[test]
     fn file_commands_get_path_prompts_with_sensible_names() {

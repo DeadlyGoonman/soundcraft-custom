@@ -275,9 +275,9 @@ pub fn window(app: &mut SoundApp, ctx: &egui::Context) {
             }
             if let Some(pick) = pick_folder
                 && ui.button("Browse…").clicked()
-                && let Some(d) = pick("Add a plugin folder")
+                && let Some(d) = pick(std::path::Path::new(""))
             {
-                s.add_folder(PathBuf::from(d));
+                s.add_folder(d);
             }
         });
         if !s.cache.failed.is_empty() {

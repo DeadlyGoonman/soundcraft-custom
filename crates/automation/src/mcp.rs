@@ -2,6 +2,7 @@
 
 use crate::Backend;
 use serde_json::{Value, json};
+use soundcraft_audio_io::FileFormat;
 use std::io::{BufRead, Write};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -23,6 +24,9 @@ fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
 }
 
 pub fn tool_definitions() -> Vec<Value> {
+    // MP3 goes through ffmpeg, so it is not one of the formats `encode` writes itself.
+    let mut bounce_formats = FileFormat::writable_extensions();
+    bounce_formats.push("mp3");
     vec![
         tool(
             "list_commands",
@@ -76,7 +80,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "bounce_mix",
             "Render the mix to an audio file (MP3 needs ffmpeg). Returns peak dBFS and integrated LUFS.",
-            json!({"path": {"type": "string"}, "format": {"type": "string", "enum": ["wav", "aiff", "flac", "mp3"]}, "bit_depth": {"type": "string"}, "bitrate": {"type": "integer", "minimum": 32, "maximum": 320}, "start": {}, "end": {}, "normalize": {"type": "boolean"}}),
+            json!({"path": {"type": "string"}, "format": {"type": "string", "enum": bounce_formats}, "bit_depth": {"type": "string"}, "bitrate": {"type": "integer", "minimum": 32, "maximum": 320}, "start": {}, "end": {}, "normalize": {"type": "boolean"}}),
             &["path"],
         ),
         tool("parity", "Feature-parity report against the incumbent's menu catalog.", json!({}), &[]),

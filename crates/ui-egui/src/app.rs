@@ -1,6 +1,10 @@
 use super::services::Services;
 use super::state::MainWindow;
-use super::*;
+use super::{
+    ControlRequest, Engine, Gesture, HashMap, MeterDisplay, OutputTrouble, Player, Range, Receiver, Samples, SoundApp, TrackId, TransportRequest,
+    Trouble, UiState, Value, VecDeque, bounce, dialogs, edit_window, extra_windows, ffmpeg_setup, file_drop, fonts, import, json, menus, midi_editor,
+    mix_window, ops_windows, palette, panels, recovery, sampler_window, score_editor, shortcuts, theme, video_track, video_window, windows,
+};
 
 mod audio;
 mod commands;
@@ -10,13 +14,19 @@ mod input;
 mod playback;
 mod plugins;
 
-pub(crate) use playback::plugin_write_due;
 #[cfg(test)]
 pub(crate) use playback::automation_step_due;
+pub(crate) use playback::plugin_write_due;
 #[cfg(test)]
 pub(crate) use plugins::{editor_changes, editor_states_due, failed_plugin_status};
 
 impl SoundApp {
+    /// Whether fonts installed from the system are used besides the bundled ones (on by default).
+    /// Takes effect only before the first frame installs the fonts.
+    pub fn set_system_fonts(&mut self, on: bool) {
+        self.system_fonts = on;
+    }
+
     /// Build an app around an engine and optional player, initialising UI, recording, autosave, control and
     /// synthetic-input state.
     pub fn new(engine: Engine, player: Option<Player>, services: Services) -> Self {
@@ -45,7 +55,6 @@ impl SoundApp {
             preset_dir: None,
             last_autosave: None,
             dialogs: dialogs::Dialogs::default(),
-            updates_rt: updates_ui::Runtime::default(),
             meters: HashMap::new(),
             main_meter: MeterDisplay::default(),
             meter_snapshot: soundcraft_playback::MeterSnapshot::default(),
@@ -95,6 +104,7 @@ impl SoundApp {
             last_rev: 0,
             fonts_ready: false,
             fonts_installed: false,
+            system_fonts: true,
             theme_applied: None,
             docking_context: None,
             sim: None,
@@ -144,7 +154,7 @@ impl SoundApp {
             if self.fonts_installed {
                 self.fonts_ready = true;
             } else {
-                fonts::install(ctx);
+                fonts::install(ctx, self.system_fonts);
                 self.fonts_installed = true;
                 ctx.request_repaint();
             }
@@ -180,8 +190,6 @@ impl SoundApp {
         if ctx.current_pass_index() == 0 {
             bounce::step(self, ctx);
             import::step(self, ctx);
-            #[cfg(not(target_arch = "wasm32"))]
-            updates_ui::tick(self, ctx);
         }
         if !self.pointer_down {
             if matches!(self.gesture, Some(Gesture::Fader { .. })) {
@@ -366,8 +374,6 @@ impl SoundApp {
         score_editor::show(self, &ctx);
         palette::show(self, &ctx);
         dialogs::show(self, &ctx);
-        #[cfg(not(target_arch = "wasm32"))]
-        updates_ui::show(self, &ctx);
         // The sampler's drop rects are current now, so route any captured drop in this pass.
         self.route_dropped_files();
         // The pass that actually received the injected events has already dispatched their widget

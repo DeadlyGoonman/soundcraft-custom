@@ -527,8 +527,10 @@ pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
     if id == "session.open"
         && let Some(picked) = app.services.pick_open.as_ref().map(|pick| pick(id, &[]))
     {
-        if let Some(file) = picked {
-            crate::dialogs::open_session_with_progress(app, file);
+        match picked.as_deref().map(crate::dialogs::unicode) {
+            Some(Ok(file)) => crate::dialogs::open_session_with_progress(app, file.to_owned()),
+            Some(Err(e)) => app.ui.status = e.to_string(),
+            None => {}
         }
         return;
     }
@@ -576,7 +578,17 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
     };
     let r = match id {
         "app.checkForUpdates" | "help.checkForUpdates" => {
-            crate::updates_ui::check(app);
+            // The fork's own check (GitHub releases of DeadlyGoonman/soundcraft-custom): it shows its
+            // dialog when a newer release exists.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                app.extra.update = crate::extra_windows::update::UpdateChecker::start();
+                app.ui.status = "Checking for updates…".into();
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                app.ui.status = "Update check is not supported in the web browser.".into();
+            }
             json!({})
         }
         "window.mix" => {
