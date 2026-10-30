@@ -110,12 +110,19 @@ fn automation(app: &mut SoundApp, ctx: &egui::Context) {
             }
         });
         ui.separator();
+        let suspended = app.engine.session().edit.automation_suspended();
+        if crate::widgets::checkbox(ui, &mut suspended.clone(), "Suspend (ignore all automation)").changed() {
+            let _ = app.run("automation.suspend", json!({"on": !suspended}));
+        }
         ui.label("Enabled parameters");
         for f in ["volume", "pan", "mute", "send level", "send pan", "send mute", "plugin"] {
-            let id = format!("automation.enable.{}", f.replace(' ', "_"));
-            let mut on = !app.engine.session().edit.flag(&format!("{id}.off"));
-            if crate::widgets::checkbox(ui, &mut on, f).changed() {
-                app.engine.session_mut().edit.set_flag(&format!("{id}.off"), !on);
+            let kind = f.replace(' ', "_");
+            let on = app.engine.session().edit.automation_enabled(&kind);
+            // Enabled parameters show red, as armed automation does.
+            let mut v = on;
+            let text = egui::RichText::new(f).color(if on { crate::theme::Tokens::current().auto_write } else { crate::theme::Tokens::current().text_dim });
+            if crate::widgets::checkbox(ui, &mut v, text).changed() {
+                let _ = app.run("automation.enable", json!({"kind": kind, "enabled": v}));
             }
         }
         ui.separator();

@@ -375,6 +375,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
             let resp = pan_knob(&mut c, ks, &mut v, "Pan (drag; double-click centres)");
             if (v - before).abs() > f32::EPSILON {
                 let _ = app.engine.execute_merged("mix.pan", &json!({"track": id.0, "pan": v, "index": i}), &format!("pan:{}:{i}", id.0));
+                app.note_pan_edit(id, i, v);
             }
             let _ = resp;
             let pr = Rect::from_center_size(pos2(cx, y + 42.0), vec2(ks + 8.0, 13.0));
@@ -383,6 +384,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
                 editable_readout(ui, pr, ui.id().with(("pan-value", id.0, i)), &pan_text(v), &format!("{:.0}", v * 100.0), parse_pan, 0.0);
             if let Some(v) = entered {
                 let _ = app.engine.execute_merged("mix.pan", &json!({"track": id.0, "pan": v, "index": i}), &format!("pan:{}:{i}", id.0));
+                app.note_pan_edit(id, i, v);
             }
         }
         y += 54.0;

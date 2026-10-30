@@ -516,6 +516,11 @@ fn set_point(e: &mut Engine, p: &Value) -> Result<Value> {
     let s = e.session_mut();
     for t in &tracks {
         if let Some(tr) = s.track_mut(*t) {
+            // A write pass that makes a lane shows it when the track's lanes are open.
+            let id = (tr.lanes_open && tr.lane(&param).is_none()).then(|| param.id());
+            if let Some(id) = id.filter(|id| !tr.shown_lanes.contains(id)) {
+                tr.shown_lanes.push(id);
+            }
             let lane = tr.lane_mut(&param);
             if let Some(from) = from {
                 lane.clear_range(from.saturating_add(1), at);

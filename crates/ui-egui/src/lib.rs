@@ -326,6 +326,8 @@ pub enum Gesture {
     Pencil {
         track: TrackId,
         points: Vec<(Samples, f32)>,
+        /// The automation the pencil draws: the track's automation view, or a lane under it.
+        param: Option<soundcraft_model::AutoParam>,
     },
     Breakpoint {
         track: TrackId,
@@ -437,6 +439,8 @@ pub struct SoundApp {
     editor_edit_at: Option<std::time::Instant>,
     /// Plugin params moved in the editor during this pass: (track, slot, param) -> (last edit, latest value).
     plugin_touched: std::collections::HashMap<(TrackId, u8, String), (std::time::Instant, f32)>,
+    /// Pan knobs moved during a pass, by (track, pan index): when, and the value.
+    pan_touched: std::collections::HashMap<(TrackId, u8), (std::time::Instant, f32)>,
     /// The pass's last point; `i64::MIN` after a stop or a jump, so the next point erases nothing it skipped.
     last_write_at: Samples,
     pub frame_ms: f32,
@@ -541,6 +545,7 @@ impl SoundApp {
             touched: std::collections::HashSet::new(),
             editor_edit_at: None,
             plugin_touched: std::collections::HashMap::new(),
+            pan_touched: std::collections::HashMap::new(),
             last_write_at: i64::MIN,
             frame_ms: 0.0,
             last_frame: None,
@@ -1388,7 +1393,14 @@ impl SoundApp {
         let may_write =
             playing && self.engine.session().tracks.iter().any(|t| matches!(t.mixer.automation_mode, M::Write | M::Touch | M::Latch | M::TouchLatch));
         self.engine.hold_merge(may_write.then_some(PASS));
-        if !playing && self.touched.is_empty() && self.plugin_touched.is_empty() {
+        if self.engine.session().edit.automation_suspended() {
+            self.touched.clear();
+            self.plugin_touched.clear();
+            self.pan_touched.clear();
+            self.last_write_at = i64::MIN;
+            return;
+        }
+        if !playing && self.touched.is_empty() && self.plugin_touched.is_empty() && self.pan_touched.is_empty() {
             self.last_write_at = i64::MIN;
             return;
         }
@@ -1417,7 +1429,7 @@ impl SoundApp {
                     M::Latch | M::TouchLatch => touched_now || self.touched.contains(&t.id),
                     _ => false,
                 };
-                write.then_some((t.id, t.mixer.volume_db))
+                (write && self.engine.session().edit.automation_enabled("volume")).then_some((t.id, t.mixer.volume_db))
             })
             .collect();
         for (t, v) in writes {
@@ -1432,7 +1444,8 @@ impl SoundApp {
             .plugin_touched
             .iter()
             .filter(|((t, ..), (at, _))| {
-                self.engine.session().track(*t).is_some_and(|tr| plugin_write_due(tr.mixer.automation_mode, at.elapsed()))
+                self.engine.session().edit.automation_enabled("plugin")
+                    && self.engine.session().track(*t).is_some_and(|tr| plugin_write_due(tr.mixer.automation_mode, at.elapsed()))
             })
             .map(|((t, slot, param), (_, v))| (*t, *slot, param.clone(), *v))
             .collect();
@@ -1444,10 +1457,35 @@ impl SoundApp {
             }
             let _ = self.engine.execute_merged("automation.set_point", &point, PASS);
         }
+        let pan_writes: Vec<(TrackId, u8, f32)> = self
+            .pan_touched
+            .iter()
+            .filter(|((t, _), (at, _))| {
+                self.engine.session().edit.automation_enabled("pan")
+                    && self.engine.session().track(*t).is_some_and(|tr| plugin_write_due(tr.mixer.automation_mode, at.elapsed()))
+            })
+            .map(|((t, i), (_, v))| (*t, *i, *v))
+            .collect();
+        for (t, i, v) in pan_writes {
+            let mut point = serde_json::json!({"track": t.0, "param": soundcraft_model::AutoParam::Pan(i).id(), "at": pos, "value": v});
+            if from != i64::MIN {
+                point["from"] = from.into();
+            }
+            let _ = self.engine.execute_merged("automation.set_point", &point, PASS);
+        }
         if !playing {
             self.touched.clear();
             self.plugin_touched.clear();
+            self.pan_touched.clear();
             self.engine.end_merge();
+        }
+    }
+
+    /// A pan knob moved: during a Write/Touch/Latch pass the move is written to the pan lane.
+    pub(crate) fn note_pan_edit(&mut self, track: TrackId, index: usize, value: f32) {
+        let Ok(i) = u8::try_from(index) else { return };
+        if self.is_playing() && self.engine.session().track(track).is_some_and(|t| plugin_write_due(t.mixer.automation_mode, std::time::Duration::ZERO)) {
+            self.pan_touched.insert((track, i), (std::time::Instant::now(), value));
         }
     }
 
@@ -1631,7 +1669,7 @@ impl SoundApp {
                 self.gesture = None;
             }
             // Keep a running automation pass merged until playback stops.
-            if !ctx.egui_wants_keyboard_input() && self.touched.is_empty() && self.plugin_touched.is_empty() {
+            if !ctx.egui_wants_keyboard_input() && self.touched.is_empty() && self.plugin_touched.is_empty() && self.pan_touched.is_empty() {
                 const EDITOR_GAP: std::time::Duration = std::time::Duration::from_millis(300);
                 match self.editor_edit_at.map(|t| t.elapsed()) {
                     Some(el) if el < EDITOR_GAP => ctx.request_repaint_after(EDITOR_GAP - el + std::time::Duration::from_millis(20)),

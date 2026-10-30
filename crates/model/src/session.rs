@@ -223,6 +223,9 @@ pub struct EditState {
     pub values: std::collections::BTreeMap<String, f64>,
 }
 
+/// The edit flag behind Automation Suspend.
+pub const AUTOMATION_SUSPEND: &str = "automation.suspend";
+
 impl EditState {
     pub fn flag(&self, id: &str) -> bool {
         self.flags.contains(id)
@@ -233,6 +236,14 @@ impl EditState {
         } else {
             self.flags.remove(id);
         }
+    }
+    /// Whether automation of a kind records (`AutoParam::kind`); the Automation window's "Enabled parameters".
+    pub fn automation_enabled(&self, kind: &str) -> bool {
+        !self.flag(&format!("automation.enable.{kind}.off"))
+    }
+    /// Automation Suspend: playback ignores every lane and nothing records.
+    pub fn automation_suspended(&self) -> bool {
+        self.flag(AUTOMATION_SUSPEND)
     }
     pub fn value(&self, id: &str, default: f64) -> f64 {
         self.values.get(id).copied().filter(|v| v.is_finite()).unwrap_or(default)
