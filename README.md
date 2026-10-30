@@ -190,7 +190,7 @@ where things are.
 
 ## Getting started
 
-Download a build from the [releases page](https://github.com/storytold/soundcraft/releases), or build
+Download a build from the [releases page](https://github.com/DeadlyGoonman/soundcraft-custom/releases), or build
 from source with Rust 1.95 or later for the desktop/web UI (the core workspace's declared
 minimum remains Rust 1.90):
 
@@ -308,7 +308,11 @@ very welcome, in the issues or on Discord.
 
 ## Downloads
 
-**Download SoundCraft** from GitHub: the [latest release](https://github.com/storytold/soundcraft/releases/latest) has every build listed below, and [all releases](https://github.com/storytold/soundcraft/releases) have earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
+<p align="center">
+  <a href="https://github.com/DeadlyGoonman/soundcraft-custom/releases/latest"><img alt="Download for Windows" src="https://img.shields.io/badge/%E2%AC%87%20Download%20for%20Windows-latest%20release-0b7385?style=for-the-badge"></a>
+</p>
+
+**Download SoundCraft** from GitHub: the [latest release](https://github.com/DeadlyGoonman/soundcraft-custom/releases/latest) has the build listed below (this fork ships Windows x64), and [all releases](https://github.com/DeadlyGoonman/soundcraft-custom/releases) have earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
 
 ### Windows
 
