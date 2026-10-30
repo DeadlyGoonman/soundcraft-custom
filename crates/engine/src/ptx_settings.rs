@@ -48,12 +48,7 @@ pub fn set_probe_exe(exe: PathBuf) {
 /// The settings to give `id` for the plugin data of a Pro Tools chunk, or `None` (defaults).
 /// `templates` holds each plugin's fresh state, made on first use.
 pub fn convert(id: &str, data: &[u8], templates: &mut HashMap<String, Option<Vec<u8>>>) -> Option<Vec<u8>> {
-    let template = templates.entry(id.to_string()).or_insert_with(|| {
-        crate::io::import_note("Preparing plugin settings");
-        let t = soundcraft_mix::create_instance(id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state());
-        crate::io::import_note("");
-        t
-    });
+    let template = templates.entry(id.to_string()).or_insert_with(|| fresh_state(id));
     let template = template.as_deref()?;
     let data = juce_state(data).unwrap_or(data);
     if data.starts_with(b"<PresetChunkXMLTree") {
@@ -365,12 +360,49 @@ fn ffbs_state(template: &[u8], data: &[u8]) -> Option<Vec<u8>> {
     Some(container(&comp))
 }
 
+/// Fresh states already made: plugin id -> its default state.
+static FRESH: Mutex<Option<HashMap<String, Option<Vec<u8>>>>> = Mutex::new(None);
+
+/// `id`'s default state, made once per plugin. An import runs on a worker thread while the open
+/// session's plugins are alive on the others: loading a second instance of such a plugin in this
+/// process crashed it (Waves while another Waves plugin was live), so the instance is made in a
+/// child process where one can be run, and in this one only where none can (the command line).
+pub fn fresh_state(id: &str) -> Option<Vec<u8>> {
+    if let Some(s) = FRESH.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(HashMap::new).get(id) {
+        return s.clone();
+    }
+    crate::io::import_note("Preparing plugin settings");
+    let state = match PROBE_EXE.get() {
+        Some(exe) => {
+            let vst3: Vec<_> = soundcraft_vst3_host::cached().unwrap_or_default().into_iter().filter(|d| d.id == id).collect();
+            let job = StateJob { id: id.to_string(), vst3, state: String::new() };
+            let ran =
+                serde_json::to_vec(&job).ok().map(|j| crate::plugin_scan::run_child(exe, &[STATE_PROBE_ARG.as_ref()], Some(j), STATE_PROBE_TIMEOUT));
+            let state = match &ran {
+                Some(Ok((text, _))) => text
+                    .lines()
+                    .find_map(|l| l.trim_end().strip_prefix(STATE_PROBE_MARK)?.strip_prefix("fresh "))
+                    .and_then(soundcraft_model::b64::decode),
+                _ => None,
+            };
+            if state.is_none() {
+                log::warn!("{id}: its default settings could not be read in a child process");
+            }
+            state
+        }
+        None => soundcraft_mix::create_instance(id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state()),
+    };
+    crate::io::import_note("");
+    FRESH.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(id.to_string(), state.clone());
+    state
+}
+
 /// A settings check job: the plugin's scan entry, so the child needs no scan of its own.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StateJob {
     id: String,
     vst3: Vec<soundcraft_vst3_host::Vst3Descriptor>,
-    /// Base64.
+    /// Base64; empty asks for the plugin's default state instead of a check.
     state: String,
 }
 
@@ -417,15 +449,28 @@ pub fn state_probe_command_line(args: &[String]) -> Option<i32> {
     let mut text = String::new();
     let read = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).is_ok();
     let job = read.then(|| serde_json::from_str::<StateJob>(&text).ok()).flatten();
+    let job_is_fresh = job.as_ref().is_some_and(|j| j.state.is_empty());
     let ok = job.is_some_and(|job| {
         soundcraft_vst3_host::set_scanned(job.vst3);
+        if job.state.is_empty() {
+            let fresh = soundcraft_mix::create_instance(&job.id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state());
+            return match fresh {
+                Some(f) => {
+                    println!("{STATE_PROBE_MARK}fresh {}", soundcraft_model::b64::encode(&f));
+                    true
+                }
+                None => false,
+            };
+        }
         let Some(state) = soundcraft_model::b64::decode(&job.state) else { return false };
         let fresh = soundcraft_mix::create_instance(&job.id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state());
         let Some(mut n) = soundcraft_mix::create_instance(&job.id, Some(&state), 48_000.0, 512, 2) else { return false };
         let after = n.plugin.save_state();
         !n.refused_state && after.is_some() && after != fresh
     });
-    println!("{STATE_PROBE_MARK}{}", if ok { "ok" } else { "failed" });
+    if !job_is_fresh {
+        println!("{STATE_PROBE_MARK}{}", if ok { "ok" } else { "failed" });
+    }
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     Some(i32::from(!ok))
@@ -434,6 +479,13 @@ pub fn state_probe_command_line(args: &[String]) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plugin_that_is_not_installed_has_no_fresh_state_and_is_asked_once() {
+        assert_eq!(fresh_state("no-such-plugin"), None);
+        let cached = FRESH.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|m| m.contains_key("no-such-plugin"));
+        assert!(cached);
+    }
 
     /// A FabFilter VST3 component state with `values` and an 8-byte trailer.
     fn fabf(values: &[f32]) -> Vec<u8> {

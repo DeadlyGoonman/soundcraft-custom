@@ -813,9 +813,7 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
             Some(id) => {
                 let (state, params) = if variant {
                     // The older Auto-Tune versions' sound is Auto-Tune Pro's Classic Mode.
-                    let fresh = templates
-                        .entry(id.clone())
-                        .or_insert_with(|| soundcraft_mix::create_instance(&id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state()));
+                    let fresh = templates.entry(id.clone()).or_insert_with(|| crate::ptx_settings::fresh_state(&id));
                     let params = ins.state.as_deref().map(crate::ptx_settings::autotune_params).unwrap_or_default();
                     // Written into the state too, so the editor opens on them (they are also sent to the plugin).
                     (fresh.as_deref().and_then(|f| crate::ptx_settings::autotune_state(f, &params)), params)
