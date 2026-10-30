@@ -435,6 +435,8 @@ pub struct SoundApp {
     touched: std::collections::HashSet<TrackId>,
     /// Last plugin-editor param edit; native editors hide the pointer from egui, so keep the merge open across a quiet gap.
     editor_edit_at: Option<std::time::Instant>,
+    /// Plugin params moved in the editor during this pass: (track, slot, param) -> (last edit, latest value).
+    plugin_touched: std::collections::HashMap<(TrackId, u8, String), (std::time::Instant, f32)>,
     /// The pass's last point; `i64::MIN` after a stop or a jump, so the next point erases nothing it skipped.
     last_write_at: Samples,
     pub frame_ms: f32,
@@ -458,6 +460,20 @@ pub struct SoundApp {
 /// arithmetic keeps restarts and loop wraps overflow-free: the previous
 /// `(pos - last).abs()` panicked in debug builds on the first playing frame,
 /// when `last` is still `i64::MIN`.
+/// How long after the last editor edit a plugin param still counts as held (Touch).
+const PLUGIN_RELEASE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether a plugin param moved in the editor is written this step. `since_edit` is the time since its last edit;
+/// a param only gets here once touched, so Write/Latch/TouchLatch keep writing it until stop.
+fn plugin_write_due(mode: soundcraft_model::AutomationMode, since_edit: std::time::Duration) -> bool {
+    use soundcraft_model::AutomationMode as M;
+    match mode {
+        M::Touch => since_edit < PLUGIN_RELEASE,
+        M::Write | M::Latch | M::TouchLatch => true,
+        _ => false,
+    }
+}
+
 fn automation_step_due(pos: Samples, last: Samples, step: Samples) -> bool {
     last == i64::MIN || pos.saturating_sub(last) >= step || last.saturating_sub(pos) >= step
 }
@@ -524,6 +540,7 @@ impl SoundApp {
             arrange_request: false,
             touched: std::collections::HashSet::new(),
             editor_edit_at: None,
+            plugin_touched: std::collections::HashMap::new(),
             last_write_at: i64::MIN,
             frame_ms: 0.0,
             last_frame: None,
@@ -926,7 +943,12 @@ impl SoundApp {
                 continue;
             }
             let key = format!("param:{}:{slot}:{param}", t.0);
-            self.editor_edit_at = Some(std::time::Instant::now());
+            let now = std::time::Instant::now();
+            self.editor_edit_at = Some(now);
+            if let (true, Ok(slot8)) = (self.is_playing(), u8::try_from(slot))
+                && self.engine.session().track(t).is_some_and(|tr| plugin_write_due(tr.mixer.automation_mode, std::time::Duration::ZERO)) {
+                self.plugin_touched.insert((t, slot8, param.clone()), (now, value));
+            }
             let _ = self.engine.execute_merged("mix.insert_param", &json!({"track": t.0, "slot": slot, "param": param, "value": value}), &key);
         }
         let actions = p.take_header_actions();
@@ -1366,7 +1388,7 @@ impl SoundApp {
         let may_write =
             playing && self.engine.session().tracks.iter().any(|t| matches!(t.mixer.automation_mode, M::Write | M::Touch | M::Latch | M::TouchLatch));
         self.engine.hold_merge(may_write.then_some(PASS));
-        if !playing && self.touched.is_empty() {
+        if !playing && self.touched.is_empty() && self.plugin_touched.is_empty() {
             self.last_write_at = i64::MIN;
             return;
         }
@@ -1406,8 +1428,25 @@ impl SoundApp {
             }
             let _ = self.engine.execute_merged("automation.set_point", &point, PASS);
         }
+        let plugin_writes: Vec<(TrackId, u8, String, f32)> = self
+            .plugin_touched
+            .iter()
+            .filter(|((t, ..), (at, _))| {
+                self.engine.session().track(*t).is_some_and(|tr| plugin_write_due(tr.mixer.automation_mode, at.elapsed()))
+            })
+            .map(|((t, slot, param), (_, v))| (*t, *slot, param.clone(), *v))
+            .collect();
+        for (t, slot, param, v) in plugin_writes {
+            let id = format!("plugin:{}:{param}", char::from(b'a'.saturating_add(slot.min(25))));
+            let mut point = serde_json::json!({"track": t.0, "param": id, "at": pos, "value": v});
+            if from != i64::MIN {
+                point["from"] = from.into();
+            }
+            let _ = self.engine.execute_merged("automation.set_point", &point, PASS);
+        }
         if !playing {
             self.touched.clear();
+            self.plugin_touched.clear();
             self.engine.end_merge();
         }
     }
@@ -1449,6 +1488,7 @@ impl SoundApp {
                     self.punch = None;
                     self.gesture = None;
                     self.touched.clear();
+                    self.plugin_touched.clear();
                     self.last_write_at = i64::MIN;
                     // A clean view: scroll, zoom-back and layout of the old session don't carry
                     // over, nor do its open plugin windows.
@@ -1591,7 +1631,7 @@ impl SoundApp {
                 self.gesture = None;
             }
             // Keep a running automation pass merged until playback stops.
-            if !ctx.egui_wants_keyboard_input() && self.touched.is_empty() {
+            if !ctx.egui_wants_keyboard_input() && self.touched.is_empty() && self.plugin_touched.is_empty() {
                 const EDITOR_GAP: std::time::Duration = std::time::Duration::from_millis(300);
                 match self.editor_edit_at.map(|t| t.elapsed()) {
                     Some(el) if el < EDITOR_GAP => ctx.request_repaint_after(EDITOR_GAP - el + std::time::Duration::from_millis(20)),
@@ -1834,7 +1874,7 @@ mod open_step_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{Services, SoundApp, automation_step_due};
+    use super::{Services, SoundApp, automation_step_due, plugin_write_due};
     use serde_json::json;
 
     #[test]
@@ -1970,6 +2010,20 @@ mod tests {
         app.main_meter.clip = true;
         app.run("track.clear_clip_indicators", json!({})).unwrap();
         assert!(!app.meters[&kick].clip && !app.main_meter.clip);
+    }
+
+    #[test]
+    fn plugin_write_decision_per_mode() {
+        use soundcraft_model::AutomationMode as M;
+        use std::time::Duration as D;
+        let (held, idle) = (D::from_millis(10), D::from_millis(400));
+        assert!(plugin_write_due(M::Touch, held) && !plugin_write_due(M::Touch, idle));
+        for m in [M::Write, M::Latch, M::TouchLatch] {
+            assert!(plugin_write_due(m, held) && plugin_write_due(m, idle));
+        }
+        for m in [M::Off, M::Read, M::Trim] {
+            assert!(!plugin_write_due(m, held));
+        }
     }
 
     #[test]
