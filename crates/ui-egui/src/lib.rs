@@ -428,6 +428,10 @@ pub struct SoundApp {
     pub audio_drop_lanes: Vec<(egui::Rect, egui::Rect, TrackId)>,
     /// The session being opened off the UI thread, behind a progress window.
     pub(crate) opening: Option<dialogs::Opening>,
+    /// A Pro Tools session with Auto-Tune Live waiting for the answer to "use Xpitch instead?".
+    pub(crate) xpitch_ask: Option<String>,
+    /// That answer, kept for the open that follows it.
+    pub(crate) xpitch_choice: Option<bool>,
     pub(crate) drop_preview: file_drop::DropPreview,
     /// Files dropped on the window, captured at the start of the UI pass before the font gate.
     pending_drops: Vec<(egui::DroppedFileHandle, Option<egui::Pos2>)>,

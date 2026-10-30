@@ -775,6 +775,93 @@ pub fn insert_plugin(e: &mut Engine, track: TrackId, slot: Option<usize>, id: &s
     }
 }
 
+/// Whether Auto-Tune Live inserts import as Xpitch (the user's choice when a session with Auto-Tune
+/// Live is opened).
+static LIVE_AS_XPITCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Imports Auto-Tune Live as Xpitch (when it is installed) instead of Auto-Tune Pro.
+pub fn set_live_as_xpitch(on: bool) {
+    LIVE_AS_XPITCH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether Xpitch is installed here.
+pub fn xpitch_installed() -> bool {
+    installed_match("Xpitch", &installed_plugins(), true).is_some()
+}
+
+/// Whether the Pro Tools session at `path` has an Auto-Tune Live insert.
+pub fn uses_autotune_live(path: &str) -> bool {
+    let Ok(raw) = std::fs::read(path) else { return false };
+    parse(&decode(&raw)).inserts.iter().any(|i| i.plugin == "Auto-Tune Live")
+}
+
+/// Xpitch's value texts for its Key parameter, as its state writes them.
+const XPITCH_KEYS: [&str; 12] = ["C", "C#/Db", "D", "D#/Eb", "E", "F", "F#/Gb", "G", "G#/Ab", "A", "A#/Bb", "B"];
+
+/// Xpitch's VST3 parameter ids (plain values: Key 0-11 from C, Scale 0 Major / 1 Minor, Transition
+/// 0-1 for 0-100 with 0 instant, Pitch Shift Mode 0 Low Latency / 1 High Quality / 2 Realtime).
+const XPITCH_KEY: &str = "322477887";
+const XPITCH_SCALE: &str = "322547095";
+const XPITCH_TRANSITION: &str = "441993146";
+const XPITCH_MODE: &str = "11040722";
+
+/// Xpitch's settings from Auto-Tune Pro's parameter values (key, scale, retune speed), where the
+/// session's settings can be read: (key, scale, transition). Auto-Tune Pro's retune speed is 1 for
+/// 0 ms and 0 for 400 ms, Xpitch's Transition the other way round.
+fn xpitch_settings(at: &std::collections::BTreeMap<String, f32>) -> (Option<u8>, Option<u8>, Option<f32>) {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let key = at.get("2").map(|v| v.round().clamp(0.0, 11.0) as u8);
+    let scale = at.get("1").copied().filter(|v| *v == 0.0 || *v == 1.0).map(|v| u8::from(v == 1.0));
+    let transition = at.get("4").map(|x| (1.0 - x).clamp(0.0, 1.0));
+    (key, scale, transition)
+}
+
+/// The text of `xml`'s attribute value that follows `before` (up to the closing quote) replaced.
+fn xml_set(xml: &mut String, before: &str, value: &str) -> bool {
+    let Some(at) = xml.find(before) else { return false };
+    let start = at + before.len();
+    let Some(len) = xml[start..].find('"') else { return false };
+    xml.replace_range(start..start + len, value);
+    true
+}
+
+/// Xpitch's state from a fresh `template` set to Realtime mode and instance group 0 (so every
+/// Xpitch instance follows the same settings), with the key, scale and transition when known.
+/// Its component state is `SCV3`, u32 LE length, `VC2!`, u32 LE XML length, the XML, a tail.
+/// `None` when the state isn't Xpitch's.
+fn xpitch_state(template: &[u8], key: Option<u8>, scale: Option<u8>, transition: Option<f32>) -> Option<Vec<u8>> {
+    let rest = template.strip_prefix(b"SCV3")?;
+    let comp_len = usize::try_from(u32::from_le_bytes(rest.get(..4)?.try_into().ok()?)).ok()?;
+    let comp = rest.get(4..4usize.checked_add(comp_len)?)?;
+    let after = rest.get(4 + comp_len..)?;
+    let xml_len = usize::try_from(u32::from_le_bytes(comp.strip_prefix(b"VC2!")?.get(..4)?.try_into().ok()?)).ok()?;
+    let mut xml = std::str::from_utf8(comp.get(8..8usize.checked_add(xml_len)?)?).ok()?.to_string();
+    let tail = comp.get(8 + xml_len..)?;
+    if !xml_set(&mut xml, "<PARAM id=\"paramPitchShiftMode\" value=\"", "Realtime") || !xml_set(&mut xml, "<INSTANCEGROUP group=\"", "0") {
+        return None;
+    }
+    if let Some((k, name)) = key.and_then(|k| XPITCH_KEYS.get(usize::from(k)).map(|n| (k, *n))) {
+        xml_set(&mut xml, "<PARAM id=\"paramScaleRoot\" value=\"", name);
+        xml_set(&mut xml, "<Scale root=\"", &k.to_string());
+    }
+    if let Some(sc) = scale {
+        xml_set(&mut xml, "<PARAM id=\"paramScaleType\" value=\"", if sc == 0 { "Major" } else { "Minor" });
+        xml_set(&mut xml, "type=\"", &sc.to_string());
+    }
+    if let Some(t) = transition {
+        xml_set(&mut xml, "<PARAM id=\"paramSpeed\" value=\"", &format!("{t:?}"));
+    }
+    let mut new_comp = b"VC2!".to_vec();
+    new_comp.extend_from_slice(&u32::try_from(xml.len()).ok()?.to_le_bytes());
+    new_comp.extend_from_slice(xml.as_bytes());
+    new_comp.extend_from_slice(tail);
+    let mut state = b"SCV3".to_vec();
+    state.extend_from_slice(&u32::try_from(new_comp.len()).ok()?.to_le_bytes());
+    state.extend_from_slice(&new_comp);
+    state.extend_from_slice(after);
+    Some(state)
+}
+
 /// Puts each insert's plugin on its imported track(s), slotted ones first, with the settings
 /// Pro Tools saved (a plugin that can't read them starts from its defaults), and returns the
 /// plugins with no installed match.
@@ -790,6 +877,40 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
             continue;
         }
         let stereo = targets.first().and_then(|(t, _)| s.track(*t)).is_some_and(|t| t.format.channels() >= 2);
+        // Auto-Tune Live becomes Xpitch when the user chose that, with the settings that can be read.
+        if ins.plugin == "Auto-Tune Live"
+            && LIVE_AS_XPITCH.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(id) = installed_match("Xpitch", &installed, stereo)
+        {
+            let at = ins.state.as_deref().map(crate::ptx_settings::autotune_params).unwrap_or_default();
+            let (key, scale, transition) = xpitch_settings(&at);
+            // Realtime mode (no latency) and instance group 0, written into the state so the editor opens on them.
+            let fresh = templates.entry(id.clone()).or_insert_with(|| crate::ptx_settings::fresh_state(&id));
+            let state = fresh.as_deref().and_then(|f| xpitch_state(f, key, scale, transition));
+            let mut params = std::collections::BTreeMap::from([(XPITCH_MODE.to_string(), 2.0)]);
+            if let Some(k) = key {
+                params.insert(XPITCH_KEY.to_string(), f32::from(k));
+            }
+            if let Some(sc) = scale {
+                params.insert(XPITCH_SCALE.to_string(), f32::from(sc));
+            }
+            if let Some(t) = transition {
+                params.insert(XPITCH_TRANSITION.to_string(), t);
+            }
+            for (track, slot) in targets {
+                let Some(t) = s.track_mut(track) else { continue };
+                let slots = &mut t.mixer.inserts;
+                let free = slot.filter(|&i| slots.get(i).is_some_and(Option::is_none)).or_else(|| slots.iter().position(Option::is_none));
+                if let Some(cell) = free.and_then(|i| slots.get_mut(i)) {
+                    let mut insert = soundcraft_model::Insert::new(id.clone());
+                    insert.state = state.as_deref().map(soundcraft_model::b64::encode);
+                    insert.params.clone_from(&params);
+                    insert.preset = format!("from {}", ins.plugin);
+                    *cell = Some(insert);
+                }
+            }
+            continue;
+        }
         // Every other Auto-Tune becomes Auto-Tune Pro, with the settings that can be read.
         let variant = crate::ptx_settings::is_autotune_variant(&ins.plugin);
         // Pro Tools' own EQ3 and Dyn3 become SoundCraft's built-in EQ and dynamics, with the
@@ -1353,6 +1474,38 @@ mod tests {
         t.extend(named(input));
         t.extend_from_slice(&[0; 40]);
         block(TRACK, &t)
+    }
+
+    #[test]
+    fn xpitch_state_sets_realtime_group_and_settings() {
+        let xml = "<XVox><PARAM id=\"paramPitchShiftMode\" value=\"High Quality\"/><PARAM id=\"paramScaleRoot\" value=\"C\"/><PARAM id=\"paramScaleType\" value=\"Chromatic\"/><PARAM id=\"paramSpeed\" value=\"0.669\"/><INSTANCEGROUP group=\"-1\"/><Scale root=\"0\" type=\"5\"/></XVox>";
+        let mut comp = b"VC2!".to_vec();
+        comp.extend_from_slice(&u32::try_from(xml.len()).unwrap().to_le_bytes());
+        comp.extend_from_slice(xml.as_bytes());
+        comp.extend_from_slice(b"tail");
+        let mut template = b"SCV3".to_vec();
+        template.extend_from_slice(&u32::try_from(comp.len()).unwrap().to_le_bytes());
+        template.extend_from_slice(&comp);
+        template.extend_from_slice(b"ctrl");
+        let out = xpitch_state(&template, Some(2), Some(1), Some(0.25)).expect("patched");
+        let text = String::from_utf8_lossy(&out);
+        for want in ["value=\"Realtime\"", "group=\"0\"", "value=\"D\"", "value=\"Minor\"", "value=\"0.25\"", "<Scale root=\"2\" type=\"1\"/>"] {
+            assert!(text.contains(want), "{want} in {text}");
+        }
+        assert!(out.ends_with(b"tailctrl"));
+        let comp_len = usize::try_from(u32::from_le_bytes(out[4..8].try_into().unwrap())).unwrap();
+        assert_eq!(out.len(), 8 + comp_len + 4);
+        // Unknown key and scale leave the chromatic default.
+        let plain = String::from_utf8_lossy(&xpitch_state(&template, None, None, None).unwrap()).into_owned();
+        assert!(plain.contains("value=\"Chromatic\"") && plain.contains("group=\"0\""));
+        assert!(xpitch_state(b"not a state", None, None, None).is_none());
+    }
+
+    #[test]
+    fn xpitch_settings_read_key_scale_and_flipped_speed() {
+        let at = std::collections::BTreeMap::from([("2".to_string(), 7.0), ("1".to_string(), 1.0), ("4".to_string(), 1.0)]);
+        assert_eq!(xpitch_settings(&at), (Some(7), Some(1), Some(0.0)));
+        assert_eq!(xpitch_settings(&std::collections::BTreeMap::new()), (None, None, None));
     }
 
     #[test]

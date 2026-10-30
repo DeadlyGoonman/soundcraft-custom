@@ -87,6 +87,8 @@ impl SoundApp {
             drop_flip: false,
             host_drops: Vec::new(),
             opening: None,
+            xpitch_ask: None,
+            xpitch_choice: None,
             sample_reads: Vec::new(),
             synthetic_grace: 0,
             control_rx: None,

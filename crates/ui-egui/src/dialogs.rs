@@ -423,6 +423,20 @@ pub fn start_open(app: &mut SoundApp, path: String) {
         return;
     }
     #[cfg(not(target_arch = "wasm32"))]
+    if path.to_ascii_lowercase().ends_with(".ptx") {
+        use soundcraft_engine::ptx;
+        match app.xpitch_choice.take() {
+            Some(use_xpitch) => ptx::set_live_as_xpitch(use_xpitch),
+            None => {
+                ptx::set_live_as_xpitch(false);
+                if ptx::xpitch_installed() && ptx::uses_autotune_live(&path) {
+                    app.xpitch_ask = Some(path);
+                    return;
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     {
         let progress = std::sync::Arc::new(soundcraft_engine::io::OpenProgress::default());
         let (p2, path2) = (std::sync::Arc::clone(&progress), path.clone());
@@ -441,6 +455,38 @@ pub fn start_open(app: &mut SoundApp, path: String) {
     }
     if let Err(e) = app.run("session.open", json!({ "path": path })) {
         app.ui.status = e;
+    }
+}
+
+/// Asks whether a session with Auto-Tune Live should use Xpitch instead, then opens it.
+fn xpitch_window(app: &mut SoundApp, ctx: &egui::Context) {
+    let Some(path) = app.xpitch_ask.clone() else { return };
+    let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut answer: Option<Option<bool>> = None;
+    egui::Modal::new(egui::Id::unique("xpitch_ask")).show(ctx, |ui| {
+        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+        ui.set_width(380.0);
+        ui.label(egui::RichText::new("Auto-Tune Live").font(bold(13.0)));
+        ui.label(&name);
+        ui.label("This session uses Auto-Tune Live. Use Xpitch instead? All of them run in Realtime mode and share one instance group, so they follow the same settings.");
+        ui.horizontal(|ui| {
+            if ui.button("Use Xpitch").clicked() {
+                answer = Some(Some(true));
+            }
+            if ui.button("Use Auto-Tune Pro").clicked() {
+                answer = Some(Some(false));
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(None);
+            }
+        });
+    });
+    if let Some(choice) = answer {
+        app.xpitch_ask = None;
+        if choice.is_some() {
+            app.xpitch_choice = choice;
+            start_open(app, path);
+        }
     }
 }
 
@@ -815,6 +861,7 @@ fn strip_silence_form(
 /// Show the open dialog, if any.
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     opening_window(app, ctx);
+    xpitch_window(app, ctx);
     audiosuite_window(app, ctx);
     crate::bounce::show(app, ctx);
     crate::import::show(app, ctx);
