@@ -405,6 +405,10 @@ pub struct SoundApp {
     pub audio_drop_lanes: Vec<(egui::Rect, egui::Rect, TrackId)>,
     /// The session being opened off the UI thread, behind a progress window.
     pub(crate) opening: Option<dialogs::Opening>,
+    /// A Pro Tools session with Auto-Tune Live waiting for the answer to "use Xpitch instead?".
+    pub(crate) xpitch_ask: Option<String>,
+    /// That answer, kept for the open that follows it.
+    pub(crate) xpitch_choice: Option<bool>,
     pub(crate) drop_preview: file_drop::DropPreview,
     sample_reads: Vec<sampler_window::SampleRead>,
     synthetic_grace: u32,
@@ -524,6 +528,8 @@ impl SoundApp {
             sample_drop_targets: Vec::new(),
             audio_drop_lanes: Vec::new(),
             opening: None,
+            xpitch_ask: None,
+            xpitch_choice: None,
             drop_preview: file_drop::DropPreview::default(),
             sample_reads: Vec::new(),
             synthetic_grace: 0,
