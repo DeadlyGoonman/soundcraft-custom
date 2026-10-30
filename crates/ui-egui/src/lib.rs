@@ -433,6 +433,8 @@ pub struct SoundApp {
     pub arrange_request: bool,
     /// Tracks whose automation was touched during this pass (Touch/Latch writing).
     touched: std::collections::HashSet<TrackId>,
+    /// Last plugin-editor param edit; native editors hide the pointer from egui, so keep the merge open across a quiet gap.
+    editor_edit_at: Option<std::time::Instant>,
     /// The pass's last point; `i64::MIN` after a stop or a jump, so the next point erases nothing it skipped.
     last_write_at: Samples,
     pub frame_ms: f32,
@@ -521,6 +523,7 @@ impl SoundApp {
             claim_clipboard: false,
             arrange_request: false,
             touched: std::collections::HashSet::new(),
+            editor_edit_at: None,
             last_write_at: i64::MIN,
             frame_ms: 0.0,
             last_frame: None,
@@ -881,6 +884,7 @@ impl SoundApp {
                 continue;
             }
             let key = format!("param:{}:{slot}:{param}", t.0);
+            self.editor_edit_at = Some(std::time::Instant::now());
             let _ = self.engine.execute_merged("mix.insert_param", &json!({"track": t.0, "slot": slot, "param": param, "value": value}), &key);
         }
         let actions = p.take_header_actions();
@@ -1546,7 +1550,14 @@ impl SoundApp {
             }
             // Keep a running automation pass merged until playback stops.
             if !ctx.egui_wants_keyboard_input() && self.touched.is_empty() {
-                self.engine.end_merge();
+                const EDITOR_GAP: std::time::Duration = std::time::Duration::from_millis(300);
+                match self.editor_edit_at.map(|t| t.elapsed()) {
+                    Some(el) if el < EDITOR_GAP => ctx.request_repaint_after(EDITOR_GAP - el + std::time::Duration::from_millis(20)),
+                    _ => {
+                        self.editor_edit_at = None;
+                        self.engine.end_merge();
+                    }
+                }
             }
         }
         self.watch_output();
