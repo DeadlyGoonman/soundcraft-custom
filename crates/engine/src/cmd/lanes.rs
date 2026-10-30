@@ -115,6 +115,10 @@ fn remove(e: &mut Engine, p: &Value) -> Result<Value> {
         if t.shown_lanes.is_empty() {
             t.lanes_open = false;
         }
+        // The lane's points go too, so playback and later passes see no trace of it.
+        if let Some(param) = soundcraft_model::AutoParam::parse(&id) {
+            t.automation.retain(|l| l.param != param);
+        }
     }
     Ok(json!({}))
 }
@@ -222,6 +226,17 @@ mod tests {
         e.execute("edit.undo", &json!({})).unwrap();
         assert_eq!(shown(&e), ["volume", "plugin:b:7", "pan"]);
         assert!(e.execute("track.lane_add", &json!({"track": t, "param": "bogus"})).is_err());
+    }
+
+    #[test]
+    fn remove_deletes_the_lane_points_and_undo_restores_them() {
+        let (mut e, t) = session();
+        e.execute("automation.set_point", &json!({"track": t, "param": "pan", "at": 0, "value": 0.5})).unwrap();
+        e.execute("track.lane_add", &json!({"track": t, "param": "pan"})).unwrap();
+        e.execute("track.lane_remove", &json!({"track": t, "param": "pan"})).unwrap();
+        assert!(e.session().tracks[0].lane(&soundcraft_model::AutoParam::Pan(0)).is_none());
+        e.execute("edit.undo", &json!({})).unwrap();
+        assert!(e.session().tracks[0].lane(&soundcraft_model::AutoParam::Pan(0)).is_some());
     }
 
     #[test]
