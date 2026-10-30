@@ -23,6 +23,17 @@ pub fn run_or_ask(app: &mut SoundApp, id: &str, params: Value) -> Result<Value, 
     if ask_to_save(app, id, &params) {
         return Ok(Value::Null);
     }
+    run_or_open(app, id, params)
+}
+
+/// `session.open` of a path opens behind the progress window; anything else runs at once.
+pub(super) fn run_or_open(app: &mut SoundApp, id: &str, params: Value) -> Result<Value, String> {
+    if id == "session.open"
+        && let Some(path) = params.get("path").and_then(Value::as_str)
+    {
+        super::start_open(app, path.to_string());
+        return Ok(Value::Null);
+    }
     app.run(id, params)
 }
 

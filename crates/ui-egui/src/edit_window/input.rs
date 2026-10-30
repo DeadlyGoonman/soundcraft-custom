@@ -319,7 +319,7 @@ pub(super) fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, l
             Tool::Pencil if auto_view.is_none() && track.kind.is_midi() => {
                 hit.is_none().then_some(Gesture::MidiClip { track: track.id, from: at_origin, to: at_origin })
             }
-            Tool::Pencil => Some(Gesture::Pencil { track: track.id, points: Vec::new() }),
+            Tool::Pencil => Some(Gesture::Pencil { track: track.id, points: Vec::new(), param: auto_view.clone() }),
             Tool::Zoom => Some(Gesture::ZoomBox { start: origin.x }),
         };
     }
@@ -459,7 +459,7 @@ fn gain_text_edit(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, tl
     }
 }
 
-fn place_insertion(app: &mut SoundApp, ui: &Ui, s: &Session, track: TrackId, at: Samples, extend: bool) {
+pub(super) fn place_insertion(app: &mut SoundApp, ui: &Ui, s: &Session, track: TrackId, at: Samples, extend: bool) {
     let at = snap(s, at);
     let sel = s.edit.selection;
     let params = if extend && s.edit.selected_tracks.contains(&track) {

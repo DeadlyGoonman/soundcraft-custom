@@ -39,6 +39,11 @@ fn unique_audio_rel(s: &Session, stem: &str) -> String {
     }
 }
 
+thread_local! {
+    /// Where an import running through [`load_session_file`] on this thread counts the audio it adds.
+    pub(super) static IMPORT_PROGRESS: std::cell::RefCell<Option<Arc<OpenProgress>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Register decoded audio as a new source. Resamples to the session rate if needed.
 pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Option<&str>, format: FileFormat) -> SourceId {
     let sr = s.sample_rate.hz();
@@ -51,6 +56,11 @@ pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Optio
 
 /// Register audio already at the session rate, with its peaks built, as a new source.
 fn add_source_audio(s: &mut Session, name: &str, audio: Arc<SourceAudio>, path: Option<&str>, format: FileFormat) -> SourceId {
+    IMPORT_PROGRESS.with(|p| {
+        if let Some(p) = p.borrow().as_ref() {
+            p.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
     let id = SourceId(s.alloc());
     let stem = Path::new(name).file_stem().and_then(OsStr::to_str).unwrap_or(name).to_string();
     let stored = match path {

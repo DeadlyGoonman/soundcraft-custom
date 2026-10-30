@@ -10,6 +10,7 @@ mod input;
 mod playback;
 mod plugins;
 
+pub(crate) use playback::plugin_write_due;
 #[cfg(test)]
 pub(crate) use playback::automation_step_due;
 #[cfg(test)]
@@ -76,6 +77,7 @@ impl SoundApp {
             pending_drops: Vec::new(),
             drop_flip: false,
             host_drops: Vec::new(),
+            opening: None,
             sample_reads: Vec::new(),
             synthetic_grace: 0,
             control_rx: None,
@@ -102,6 +104,9 @@ impl SoundApp {
             claim_clipboard: false,
             arrange_request: false,
             touched: std::collections::HashSet::new(),
+            editor_edit_at: None,
+            plugin_touched: std::collections::HashMap::new(),
+            pan_touched: std::collections::HashMap::new(),
             last_write_at: i64::MIN,
             editor_states: Vec::new(),
             editor_poll_due: true,
@@ -183,8 +188,15 @@ impl SoundApp {
                 self.gesture = None;
             }
             // Keep a running automation pass merged until playback stops.
-            if !self.wants_keyboard && self.touched.is_empty() {
-                self.engine.end_merge();
+            if !self.wants_keyboard && self.touched.is_empty() && self.plugin_touched.is_empty() && self.pan_touched.is_empty() {
+                const EDITOR_GAP: std::time::Duration = std::time::Duration::from_millis(300);
+                match self.editor_edit_at.map(|t| t.elapsed()) {
+                    Some(el) if el < EDITOR_GAP => ctx.request_repaint_after(EDITOR_GAP - el + std::time::Duration::from_millis(20)),
+                    _ => {
+                        self.editor_edit_at = None;
+                        self.engine.end_merge();
+                    }
+                }
             }
         }
         self.watch_output();
@@ -196,6 +208,12 @@ impl SoundApp {
             if let Some(p) = &self.player {
                 p.update_session(self.engine.session_arc());
             }
+        } else if let Some(p) = &self.player {
+            // The rest of a big session's plugins, a few per frame.
+            p.continue_loading();
+        }
+        if self.player.as_ref().is_some_and(|p| p.plugins_loading().is_some()) {
+            ctx.request_repaint();
         }
         self.open_inserted(ctx);
         self.autosave_changes();

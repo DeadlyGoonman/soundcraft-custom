@@ -1,4 +1,4 @@
-use super::automation::{lerp_gain, transport_at, volume_db_at};
+use super::automation::{lerp_gain, reads, transport_at, volume_db_at};
 use super::clips::{ClipFx, clip_fx_params, render_clip};
 use super::instances::{INSTRUMENT_SLOT, PluginFailures, PreparedInstance, create_instance, is_third_party};
 use super::midi::{chase_controllers, schedule_notes};
@@ -19,6 +19,8 @@ pub(crate) struct PluginSlot {
     pub(crate) plugin: Box<dyn Plugin>,
     /// Last values pushed to the plugin, in the insert's parameter-map order.
     applied: Vec<f32>,
+    /// The parameter ids `applied` belongs to.
+    applied_keys: Vec<String>,
     pub(crate) failed: bool,
     /// Delta monitoring: the input of this block (preallocated) and the delay that lines it up
     /// with the plugin's latency before it is subtracted from the output.
@@ -70,6 +72,7 @@ impl PluginSlot {
             ch,
             plugin,
             applied: Vec::new(),
+            applied_keys: Vec::new(),
             failed: false,
             dry: vec![vec![0.0; max_block]; ch],
             dry_delay: DelayLine::default(),
@@ -312,7 +315,7 @@ pub(crate) fn process_strip(
                 // instance and the rendered audio matches the plugin's defaults — e.g. a saved
                 // `level = -12 dB` sounds the same as `level = -6 dB`.
                 if let Some(ins) = &t.instrument {
-                    apply_params(inst, ins, t, INSTRUMENT_SLOT, pos);
+                    apply_params(s, inst, ins, t, INSTRUMENT_SLOT, pos);
                 }
                 inst.plugin.set_transport(&transport);
                 if std::mem::take(&mut strip.chase) {
@@ -352,7 +355,7 @@ pub(crate) fn process_strip(
         if !ins.active || ins.bypass || slot.failed {
             continue;
         }
-        apply_params(slot, ins, t, i, pos);
+        apply_params(s, slot, ins, t, i, pos);
         slot.plugin.set_transport(&transport);
         if !run_insert(slot, ins.delta, &mut strip.buf, frames) {
             strip.failures.record(i);
@@ -377,13 +380,13 @@ pub(crate) fn process_strip(
     // Endpoints are the first and last sample of this block. The next block starts on its own
     // first sample, so a breakpoint there does not ramp the block before it.
     let last = pos.saturating_add(frames.saturating_sub(1) as i64);
-    let mut v0 = volume_db_at(t, pos);
-    let mut v1 = volume_db_at(t, last);
+    let mut v0 = volume_db_at(s, t, pos);
+    let mut v1 = volume_db_at(s, t, last);
     // Trim automation (an offset on top of the volume curve).
     if let Some(l) = t
         .automation
         .iter()
-        .find(|l| matches!(&l.param, AutoParam::Plugin { slot: u8::MAX, param } if param == "trim"))
+        .find(|l| !s.edit.automation_suspended() && matches!(&l.param, AutoParam::Plugin { slot: u8::MAX, param } if param == "trim"))
         .filter(|l| !l.points.is_empty())
     {
         v0 += l.value_at(pos, 0.0);
@@ -393,8 +396,8 @@ pub(crate) fn process_strip(
     if let Some(vid) = t.mixer.vca
         && let Some(vca) = s.tracks.iter().find(|x| x.id.0 == vid && x.kind == TrackKind::Vca)
     {
-        v0 += volume_db_at(vca, pos);
-        v1 += volume_db_at(vca, last);
+        v0 += volume_db_at(s, vca, pos);
+        v1 += volume_db_at(s, vca, last);
         if vca.mixer.mute {
             strip.muted = true;
         }
@@ -410,7 +413,7 @@ pub(crate) fn process_strip(
     // Track mute gates the audio and its pre-fader tap without splitting processor blocks.
     // Keep the existing curve interpolation, first-lane and mode policy, and render-position
     // clock. Processor/bus age and Master/VCA automation policy are separate concerns.
-    if t.mixer.automation_mode.reads()
+    if reads(s, t)
         && let Some(lane) = t.lane(&AutoParam::Mute).filter(|lane| !lane.points.is_empty())
     {
         for i in 0..frames {
@@ -494,27 +497,27 @@ pub(crate) fn strip_format(t: &Track, n: usize) -> ChannelFormat {
 }
 
 /// Record insert latency without processing audio, so this block can compensate for it.
-pub(crate) fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples) {
+pub(crate) fn note_insert_latency(s: &Session, t: &Track, strip: &mut Strip, pos: Samples) {
     let mut latency = 0usize;
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
         if !ins.active || ins.bypass || slot.failed {
             continue;
         }
-        apply_params(slot, ins, t, i, pos);
+        apply_params(s, slot, ins, t, i, pos);
         latency = latency.saturating_add(slot.plugin.latency());
     }
     strip.latency = latency.min(MAX_LATENCY);
 }
 
-pub(crate) fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track, i: usize, pos: Samples) {
+pub(crate) fn apply_params(s: &Session, slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track, i: usize, pos: Samples) {
     // Automation lanes address insert slots; the instrument (`INSTRUMENT_SLOT`) has none, so it
     // must not pick up slot A's lanes.
     let Ok(slot_u8) = u8::try_from(i) else {
         return apply_values(slot, ins, |_, v| v);
     };
-    let automated = t.mixer.automation_mode.reads()
-        && t.automation.iter().any(|l| matches!(&l.param, AutoParam::Plugin { slot, .. } if *slot == slot_u8) && !l.points.is_empty());
+    let automated =
+        reads(s, t) && t.automation.iter().any(|l| matches!(&l.param, AutoParam::Plugin { slot, .. } if *slot == slot_u8) && !l.points.is_empty());
     apply_values(slot, ins, |k, val| {
         if automated
             && let Some(l) = t.automation.iter().find(|l| matches!(&l.param, AutoParam::Plugin { slot, param } if *slot == slot_u8 && param == k))
@@ -528,8 +531,17 @@ pub(crate) fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert
 
 /// Sends each stored param (as mapped by `value`) to the plugin when it changed since last time.
 fn apply_values(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, value: impl Fn(&str, f32) -> f32) {
-    if slot.applied.len() != ins.params.len() {
+    if slot.applied.len() != ins.params.len() || !slot.applied_keys.iter().eq(ins.params.keys()) {
+        // A value no longer stored (undoing the first edit of a parameter) goes back to the
+        // plugin's default; otherwise the plugin would keep the undone value.
+        let info = slot.plugin.info();
+        for k in slot.applied_keys.iter().filter(|k| !ins.params.contains_key(*k)) {
+            if let Some(p) = info.params.iter().find(|p| p.id == k.as_str()) {
+                slot.plugin.set_param(k, p.default);
+            }
+        }
         slot.applied = vec![f32::NAN; ins.params.len()];
+        slot.applied_keys = ins.params.keys().cloned().collect();
     }
     for ((k, v), last) in ins.params.iter().zip(slot.applied.iter_mut()) {
         let val = value(k, *v);

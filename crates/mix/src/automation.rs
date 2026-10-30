@@ -21,8 +21,13 @@ pub(crate) fn transport_at(s: &Session, pos: Samples, playing: bool, recording: 
     }
 }
 
-pub(crate) fn volume_db_at(t: &Track, pos: Samples) -> f32 {
-    if t.mixer.automation_mode.reads()
+/// Whether this track's automation lanes play: its mode reads them and Automation Suspend is off.
+pub(crate) fn reads(s: &Session, t: &Track) -> bool {
+    t.mixer.automation_mode.reads() && !s.edit.automation_suspended()
+}
+
+pub(crate) fn volume_db_at(s: &Session, t: &Track, pos: Samples) -> f32 {
+    if reads(s, t)
         && t.mixer.automation_mode != soundcraft_model::AutomationMode::Write
         && let Some(l) = t.lane(&AutoParam::Volume)
         && !l.points.is_empty()
@@ -32,9 +37,9 @@ pub(crate) fn volume_db_at(t: &Track, pos: Samples) -> f32 {
     t.mixer.volume_db
 }
 
-pub(crate) fn pan_at(t: &Track, idx: usize, pos: Samples) -> f32 {
+pub(crate) fn pan_at(s: &Session, t: &Track, idx: usize, pos: Samples) -> f32 {
     let base = t.mixer.pan.get(idx).copied().unwrap_or(if idx == 0 { 0.0 } else { 1.0 });
-    if t.mixer.automation_mode.reads()
+    if reads(s, t)
         && let Some(l) = t.lane(&AutoParam::Pan(u8::try_from(idx).unwrap_or(0)))
         && !l.points.is_empty()
     {
@@ -49,8 +54,8 @@ const PAN_STEP: Samples = 64;
 
 /// The position to read the pan at for the frames from `start` of the block at `pos`, and the end
 /// of the frames that share it. Without pan automation the whole block shares one pan.
-pub(crate) fn pan_segment(t: &Track, pos: Samples, start: usize, frames: usize) -> (Samples, usize) {
-    let automated = t.mixer.automation_mode.reads() && t.automation.iter().any(|l| matches!(l.param, AutoParam::Pan(_)) && !l.points.is_empty());
+pub(crate) fn pan_segment(s: &Session, t: &Track, pos: Samples, start: usize, frames: usize) -> (Samples, usize) {
+    let automated = reads(s, t) && t.automation.iter().any(|l| matches!(l.param, AutoParam::Pan(_)) && !l.points.is_empty());
     if !automated {
         return (pos, frames);
     }
@@ -60,8 +65,8 @@ pub(crate) fn pan_segment(t: &Track, pos: Samples, start: usize, frames: usize) 
     (at, start.saturating_add(left).min(frames))
 }
 
-pub(crate) fn send_level(t: &Track, i: usize, base: f32, pos: Samples) -> f32 {
-    if t.mixer.automation_mode.reads()
+pub(crate) fn send_level(s: &Session, t: &Track, i: usize, base: f32, pos: Samples) -> f32 {
+    if reads(s, t)
         && let Some(l) = t.lane(&AutoParam::SendLevel(u8::try_from(i).unwrap_or(0)))
         && !l.points.is_empty()
     {

@@ -78,6 +78,32 @@ impl AutoParam {
             AutoParam::Plugin { slot, param } => format!("insert {} {param}", slot_letter(*slot)),
         }
     }
+    /// The kind the Automation window enables or disables: `volume`, `pan`, `mute`, `send_level`,
+    /// `send_pan`, `send_mute` or `plugin`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AutoParam::Volume => "volume",
+            AutoParam::Pan(_) => "pan",
+            AutoParam::Mute => "mute",
+            AutoParam::SendLevel(_) => "send_level",
+            AutoParam::SendPan(_) => "send_pan",
+            AutoParam::SendMute(_) => "send_mute",
+            AutoParam::Plugin { .. } => "plugin",
+        }
+    }
+    /// The id `parse` reads back (`volume`, `pan2`, `send_a_level`, `plugin:a:13`).
+    pub fn id(&self) -> String {
+        match self {
+            AutoParam::Volume => "volume".into(),
+            AutoParam::Pan(0) => "pan".into(),
+            AutoParam::Pan(_) => "pan2".into(),
+            AutoParam::Mute => "mute".into(),
+            AutoParam::SendLevel(i) => format!("send_{}_level", char::from(b'a'.saturating_add((*i).min(25)))),
+            AutoParam::SendPan(i) => format!("send_{}_pan", char::from(b'a'.saturating_add((*i).min(25)))),
+            AutoParam::SendMute(i) => format!("send_{}_mute", char::from(b'a'.saturating_add((*i).min(25)))),
+            AutoParam::Plugin { slot, param } => format!("plugin:{}:{param}", char::from(b'a'.saturating_add((*slot).min(25)))),
+        }
+    }
     /// Parse ids like `volume`, `pan`, `pan2`, `mute`, `send_a_level`, `plugin:a:threshold`.
     pub fn parse(s: &str) -> Option<AutoParam> {
         let s = s.trim().to_ascii_lowercase();

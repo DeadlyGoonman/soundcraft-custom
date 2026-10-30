@@ -40,3 +40,21 @@ fn a_zero_history_limit_keeps_no_undo_entry_for_a_gesture() {
     e.end_merge();
     assert!(e.undo_history().is_empty(), "history: {:?}", e.undo_history());
 }
+
+#[test]
+fn many_merged_edits_then_one_end_merge_undo_to_the_original_and_keys_split_steps() {
+    let mut e = Engine::default();
+    let t = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Mono, None).0;
+    let volume = |e: &Engine| e.session().tracks.iter().find(|x| x.id.0 == t).map(|x| x.mixer.volume_db);
+    for i in 1..=30 {
+        e.execute_merged("mix.volume", &json!({"track": t, "db": -(i as f64)}), "param:a").unwrap();
+    }
+    // A different key starts a new step even without end_merge.
+    e.execute_merged("mix.volume", &json!({"track": t, "db": -50.0}), "param:b").unwrap();
+    e.end_merge();
+    assert_eq!(e.undo_history().len(), 2, "history: {:?}", e.undo_history());
+    assert!(e.undo());
+    assert_eq!(volume(&e), Some(-30.0));
+    assert!(e.undo());
+    assert_eq!(volume(&e), Some(0.0));
+}

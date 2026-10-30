@@ -1,7 +1,7 @@
 use super::bundle::save_session_bundle;
 #[cfg(test)]
 use super::import::add_source;
-use super::import::{MAX_IMPORT_SAMPLES, at_rate, relink_videos};
+use super::import::{IMPORT_PROGRESS, MAX_IMPORT_SAMPLES, at_rate, relink_videos};
 use super::*;
 
 /// Save the session to `path` (a `.scraft` file). Audio that only exists in memory is written
@@ -44,14 +44,94 @@ pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     open_session_linked(e, path, Path::new(path))
 }
 
+/// How far a [`load_session_file`] got, read by the UI while a worker thread loads.
+#[derive(Debug, Default)]
+pub struct OpenProgress {
+    /// Audio files read so far.
+    pub done: std::sync::atomic::AtomicUsize,
+    /// Audio files to read (0 until the session file is parsed).
+    pub total: std::sync::atomic::AtomicUsize,
+    /// What the import is doing besides reading audio (empty when just reading).
+    pub note: std::sync::Mutex<String>,
+}
+
+/// Tells the UI what the import running on this thread is doing, e.g. which plugin's settings it
+/// is checking (nothing happens when no [`load_session_file`] runs on this thread).
+pub(crate) fn import_note(text: &str) {
+    IMPORT_PROGRESS.with(|p| {
+        if let Some(p) = p.borrow().as_ref() {
+            *p.note.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = text.to_string();
+        }
+    });
+}
+
+/// A session read from disk but not yet installed in an [`Engine`]: everything slow (parsing,
+/// decoding) is done, so installing it ([`install_opened`]) is quick.
+#[derive(Debug)]
+pub struct Opened {
+    session: Session,
+    path: Option<String>,
+    /// Media (and for imports, plugins) that could not be found, as `open_session` returns them.
+    pub missing: Vec<String>,
+    missing_plugins: Vec<crate::ptx::MissingPlugin>,
+    messages: Vec<String>,
+}
+
+/// Reads the session (or Pro Tools / FL Studio import) at `path` without touching any engine, so
+/// it can run on a worker thread. `progress` counts the audio files decoded.
+pub fn load_session_file(path: &str, progress: &Arc<OpenProgress>) -> Result<Opened> {
+    let ext = Path::new(path).extension();
+    let import = ext.is_some_and(|x| x.eq_ignore_ascii_case("ptx") || x.eq_ignore_ascii_case("flp"));
+    if !import {
+        return load_linked(path, Path::new(path), progress);
+    }
+    // Imports build their session through an engine (messages, inserts): give them a scratch one
+    // and carry the result over. Their audio is counted as it is added; the files in `Audio Files`
+    // are the most there can be (FL Studio samples live anywhere: no total).
+    let started = std::time::Instant::now();
+    let folder = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
+    progress.total.store(if ext.is_some_and(|x| x.eq_ignore_ascii_case("ptx")) { list_dir(&folder.join("Audio Files")).len() } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+    IMPORT_PROGRESS.with(|p| *p.borrow_mut() = Some(Arc::clone(progress)));
+    let mut scratch = Engine::new(Session::default());
+    let imported = open_session(&mut scratch, path);
+    IMPORT_PROGRESS.with(|p| *p.borrow_mut() = None);
+    let missing = imported?;
+    log::info!("import read: {path}: {} audio files ({} missing) in {} ms", progress.done.load(std::sync::atomic::Ordering::Relaxed), missing.len(), started.elapsed().as_millis());
+    Ok(Opened {
+        session: scratch.session().clone(),
+        path: scratch.path.take(),
+        missing,
+        missing_plugins: std::mem::take(&mut scratch.missing_plugins),
+        messages: std::mem::take(&mut scratch.messages),
+    })
+}
+
+/// Puts a [`load_session_file`] result into `e` as the open session.
+pub fn install_opened(e: &mut Engine, o: Opened) -> Vec<String> {
+    e.replace_session(o.session);
+    e.path = o.path;
+    e.missing_plugins = o.missing_plugins;
+    for m in o.messages {
+        e.message(m);
+    }
+    o.missing
+}
+
 /// [`open_session`], following the media paths in it as if they were stored in the session file
 /// `links` (crash recovery: the session written beside the autosave, its paths from the original).
 pub(crate) fn open_session_linked(e: &mut Engine, path: &str, links: &Path) -> Result<Vec<String>> {
+    let o = load_linked(path, links, &Arc::new(OpenProgress::default()))?;
+    Ok(install_opened(e, o))
+}
+
+fn load_linked(path: &str, links: &Path, progress: &Arc<OpenProgress>) -> Result<Opened> {
+    let started = std::time::Instant::now();
     let text = read_text(path)?;
     let mut s = Session::from_json(&text).map_err(|err| EngineError::Io(err.to_string()))?;
     let dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
     let mut missing = Vec::new();
     let mut files = DecodedFiles::new();
+    progress.total.store(s.sources.len(), std::sync::atomic::Ordering::Relaxed);
     for src in &s.sources {
         let decoded =
             stored_path(&src.path, links).map_err(|why| format!("{}: {why}", src.path)).and_then(|p| decode_file(&mut files, &p, s.sample_rate.hz()));
@@ -59,16 +139,15 @@ pub(crate) fn open_session_linked(e: &mut Engine, path: &str, links: &Path) -> R
             Ok(audio) => s.pool.insert(src.id, audio),
             Err(err) => missing.push(err),
         }
+        progress.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     missing.extend(relink_videos(&mut s, links));
     s.folder = Some(dir);
-    e.replace_session(s);
-    e.path = Some(path.to_string());
-    for m in &missing {
-        e.message(format!("missing media: {m}"));
-    }
-    Ok(missing)
+    log::info!("session read: {path}: {} sources ({} distinct files, {} missing) in {} ms", s.sources.len(), files.len(), missing.len(), started.elapsed().as_millis());
+    let messages = missing.iter().map(|m| format!("missing media: {m}")).collect();
+    Ok(Opened { session: s, path: Some(path.to_string()), missing, missing_plugins: Vec::new(), messages })
 }
+
 /// File › New › Open from Template: a new, unsaved session copied from the session file at `path`
 /// (tracks, clips, inserts and their state, tempo, routing, markers). The file is only read: the
 /// copy has no path, so Save asks where to put it, and its name is "<file name> copy". Media is
@@ -118,6 +197,34 @@ pub(crate) fn decode_file(files: &mut DecodedFiles, p: &Path, rate: u32) -> std:
 #[cfg(test)]
 mod save_tests {
     use super::*;
+
+    #[test]
+    fn worker_loader_matches_open_session() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-loader-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("L.scraft").to_string_lossy().into_owned();
+        save_session(&mut with_take(0.5), &path).unwrap();
+        // One source whose file is gone: both paths report it the same way.
+        let mut gone = with_take(0.25);
+        gone.session_mut().sources[0].path = "Audio Files/nope.wav".into();
+        let gone_path = dir.join("G.scraft").to_string_lossy().into_owned();
+        std::fs::write(&gone_path, gone.session().to_json().unwrap()).unwrap();
+        for p in [&path, &gone_path] {
+            let mut old = Engine::default();
+            let old_missing = open_session(&mut old, p).unwrap();
+            let progress = Arc::new(OpenProgress::default());
+            let opened = load_session_file(p, &progress).unwrap();
+            let mut new = Engine::default();
+            let new_missing = install_opened(&mut new, opened);
+            assert_eq!(old_missing, new_missing);
+            assert_eq!(old.path, new.path);
+            assert_eq!(old.messages, new.messages);
+            assert_eq!(old.session().to_json().unwrap(), new.session().to_json().unwrap());
+            assert_eq!(old.session().sources.iter().filter(|x| old.session().pool.get(x.id).is_some()).count(), new.session().sources.iter().filter(|x| new.session().pool.get(x.id).is_some()).count());
+            assert_eq!(progress.done.load(std::sync::atomic::Ordering::Relaxed), progress.total.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn autosave_copy_leaves_document_untouched_and_reuses_audio() {

@@ -1,4 +1,4 @@
-use super::tracks::{click_track, folder_depth, height_targets, in_edit_window, track_context_menu, view_label, view_menu};
+use super::tracks::{click_track, folder_depth, height_targets, in_edit_window, lane_label, track_context_menu, view_label, view_menu};
 use super::*;
 
 /// Draw one track header: resize edge, selection and context menu, folder/options control, automation-lane toggle,
@@ -56,24 +56,14 @@ pub(super) fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head:
     } else {
         egui::Popup::menu(&rresp.on_hover_text("Track options")).show(|ui| track_context_menu(app, ui, id));
     }
-    if h >= 40.0 && track.kind.has_playlist() {
+    if h >= 40.0 && track.kind != TrackKind::Folder {
         let ar = at(3.0, h - 12.0, 9.0, 9.0);
         let aresp = ui.interact(ar, ui.scope_id().with(("auto_lane", id.0)), Sense::click());
-        let showing = AutoParam::parse(&track.view).is_some();
+        let showing = track.lanes_open;
         ui.painter().rect_filled(ar, 1.5, shade(strip, if aresp.hovered() || showing { 0.6 } else { 0.45 }));
-        let (a, b) = (ar.min + vec2(2.5, 2.5), ar.max - vec2(2.5, 2.5));
-        ui.painter().line_segment([a, b], Stroke::new(1.0, ink));
-        ui.painter().circle_filled(a, 1.3, ink);
-        ui.painter().circle_filled(b, 1.3, ink);
-        if aresp.on_hover_text(if showing { "Hide automation" } else { "Show volume automation" }).clicked() {
-            let view = if !showing {
-                "volume"
-            } else if track.kind.is_midi() {
-                "notes"
-            } else {
-                "waveform"
-            };
-            let _ = app.run("track.view", json!({"track": id.0, "view": view}));
+        arrow(ui.painter(), ar.center(), showing, ink);
+        if aresp.on_hover_text(if showing { "Hide automation lanes" } else { "Show automation lanes" }).clicked() {
+            let _ = app.run("track.lanes_toggle", json!({"track": id.0}));
         }
     }
     // Name, highlighted when the track is selected, and the playlist menu beside it.
@@ -170,7 +160,7 @@ pub(super) fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head:
             ui,
             at(17.0, 39.0, 105.0, 17.0),
             ui.scope_id().with(("view", id.0)),
-            &view_label(&track.view),
+            &AutoParam::parse(&track.view).map_or_else(|| view_label(&track.view), |p| lane_label(track, &p)),
             t.text,
             true,
             &format!("Track view for {}", track.name),

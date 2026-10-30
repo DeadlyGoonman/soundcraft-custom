@@ -141,6 +141,8 @@ impl SoundApp {
             "audio_silent": self.player.as_ref().is_some_and(|p| p.silent),
             "audio_trouble": self.player.as_ref().and_then(|p| p.trouble()).map(|t| format!("{t:?}")),
             "status": self.ui.status,
+            "opening": self.opening.as_ref().map(|o| o.path()),
+            "plugins_loading": self.player.as_ref().and_then(|p| p.plugins_loading()).map(|l| format!("{}/{}", l.done, l.total)),
         })
     }
 }

@@ -370,6 +370,24 @@ impl MixEngine {
         }
     }
 
+    /// While nothing renders (transport stopped), hands changed insert parameters to the
+    /// plugins, so a value set in the session (an undo) reaches the plugin and its editor.
+    pub fn flush_params(&mut self, s: &Session, pos: Samples) {
+        self.ensure_synced(s);
+        for t in s.tracks.iter().filter(|t| !t.inactive) {
+            let Some(strip) = self.strips.get_mut(&t.id) else { continue };
+            for (i, ins) in t.mixer.inserts.iter().enumerate() {
+                if let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i))
+                    && ins.active
+                    && !slot.failed
+                {
+                    apply_params(s, slot, ins, t, i, pos);
+                    slot.plugin.flush_params();
+                }
+            }
+        }
+    }
+
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
@@ -426,7 +444,7 @@ impl MixEngine {
         if pdc {
             for t in s.tracks.iter().filter(|t| is_aux(t) && !t.inactive) {
                 if let Some(st) = self.strips.get_mut(&t.id) {
-                    note_insert_latency(t, st, pos);
+                    note_insert_latency(s, t, st, pos);
                 }
             }
         }
@@ -436,7 +454,7 @@ impl MixEngine {
         if pdc {
             for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
                 if let Some(st) = self.strips.get_mut(&t.id) {
-                    note_insert_latency(t, st, pos);
+                    note_insert_latency(s, t, st, pos);
                     lmax_m = lmax_m.saturating_add(st.latency);
                 }
             }
@@ -477,7 +495,7 @@ impl MixEngine {
         }
         for (i, st) in work.iter_mut() {
             if let Some(t) = s.tracks.get(*i) {
-                self.route_strip(t, st, pos, frames);
+                self.route_strip(s, t, st, pos, frames);
             }
         }
         for (i, st) in work.drain(..) {
@@ -499,7 +517,7 @@ impl MixEngine {
             st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
             st.align.process(&mut st.buf, frames);
             st.out_extra.set(0, ch);
-            self.route_strip(t, &mut st, pos, frames);
+            self.route_strip(s, t, &mut st, pos, frames);
             self.strips.insert(t.id, st);
         }
         self.order = order;
@@ -518,7 +536,7 @@ impl MixEngine {
                         && !ins.bypass
                         && !slot.failed
                     {
-                        apply_params(slot, ins, t, i, pos);
+                        apply_params(s, slot, ins, t, i, pos);
                         slot.plugin.set_transport(&transport);
                         if !run_insert(slot, ins.delta, &mut strip.buf, frames) {
                             strip.failures.record(i);
@@ -527,8 +545,8 @@ impl MixEngine {
                 }
                 // Match track faders: the next block's first sample must not ramp this one.
                 let last = pos.saturating_add(frames.saturating_sub(1) as i64);
-                let v0 = volume_db_at(t, pos);
-                let v1 = volume_db_at(t, last);
+                let v0 = volume_db_at(s, t, pos);
+                let v1 = volume_db_at(s, t, last);
                 for (ch, src) in strip.buf.iter().enumerate().take(self.main.len()) {
                     if let Some(m) = self.main.get_mut(ch) {
                         for i in 0..frames {
@@ -589,7 +607,7 @@ impl MixEngine {
     }
 
     /// Send, meter and pan a processed strip into the busses / main mix.
-    fn route_strip(&mut self, t: &Track, strip: &mut Strip, pos: Samples, frames: usize) {
+    fn route_strip(&mut self, s: &Session, t: &Track, strip: &mut Strip, pos: Samples, frames: usize) {
         let m = self.meters.entry(t.id).or_default();
         m.measure(&strip.buf, frames, strip.gr);
         m.plugin_failures = strip.failures;
@@ -600,7 +618,7 @@ impl MixEngine {
             if snd.mute || strip.muted {
                 continue;
             }
-            let lvl = send_level(t, i, snd.level_db, pos);
+            let lvl = send_level(s, t, i, snd.level_db, pos);
             let gain = db_to_gain(lvl);
             let src = if snd.pre_fader { &strip.pre } else { &strip.buf };
             let Route::Bus(b) = &snd.target else { continue };
@@ -638,8 +656,8 @@ impl MixEngine {
         };
         let mut start = 0;
         while start < frames {
-            let (at, end) = pan_segment(t, pos, start, frames);
-            let spec = PanSpec { stereo: [pan_at(t, 0, at), pan_at(t, 1, at)], surround: t.mixer.surround.as_ref() };
+            let (at, end) = pan_segment(s, t, pos, start, frames);
+            let spec = PanSpec { stereo: [pan_at(s, t, 0, at), pan_at(s, t, 1, at)], surround: t.mixer.surround.as_ref() };
             let m = build_matrix(src_fmt, src.len(), dst_fmt, dst.len(), &spec, law);
             apply_matrix_span(src, start..end, dst, &m, 1.0);
             start = end;

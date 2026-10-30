@@ -1,9 +1,34 @@
 use super::*;
+use super::layout::AUTO_LANE_H;
+use super::tracks::plugin_menu_items;
 use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable};
 
 /// The painted header selectors are interactive controls; their accessible name is the field
 /// they edit, not the short value text ("Read", "Waveform") painted inside them.
+#[test]
+fn plugin_menu_items_add_undescribed_ids_once() {
+    let stored = vec!["42".to_string(), "42".to_string()];
+    let v = plugin_menu_items(1, None, &stored);
+    assert_eq!(v, vec![("plugin:b:42".to_string(), "42".to_string())]);
+    let info = soundcraft_dsp::plugins().iter().find(|p| !p.params.is_empty()).unwrap();
+    let id = info.params[0].id.to_string();
+    let v = plugin_menu_items(0, Some(info), &[id.clone(), "zz99".into()]);
+    assert_eq!(v.len(), info.params.len() + 1);
+    assert_eq!(v[0].0, format!("plugin:a:{id}"));
+    assert_eq!(v.last().unwrap().1, "zz99");
+}
+
+#[test]
+fn lanes_add_to_the_track_height() {
+    let mut t = Track::new(TrackId(1), "a", TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, [0, 0, 0]);
+    let base = track_height(&t);
+    t.shown_lanes = vec!["volume".into(), "pan".into()];
+    assert_eq!(track_height(&t), base);
+    t.lanes_open = true;
+    assert_eq!(track_height(&t), base + 2.0 * AUTO_LANE_H);
+}
+
 #[test]
 fn track_header_selectors_have_accessible_names() {
     let mut h = Harness::builder().with_context_setup(crate::fonts::install).build_ui(|ui| {

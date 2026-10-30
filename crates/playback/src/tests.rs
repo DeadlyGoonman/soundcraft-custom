@@ -594,6 +594,107 @@ fn instances_arrive_with_the_session_and_leave_through_the_return_channel() {
     st.fill(&mut out, 2);
     assert_eq!(grx.try_recv().unwrap().len(), 1);
 }
+/// A session with `n` audio tracks, each with a (fake) CLAP plugin in insert slot 1.
+fn session_with_plugins(n: usize) -> Arc<soundcraft_model::Session> {
+    use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+    let mut s = soundcraft_model::Session::default();
+    for _ in 0..n {
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        if let Some(t) = s.track_mut(t) {
+            t.mixer.inserts[1] = Some(Insert::new("clap:test.fake"));
+        }
+    }
+    Arc::new(s)
+}
+
+fn fake_instance(made: &mut usize) -> Option<soundcraft_mix::NewInstance> {
+    *made += 1;
+    Some(soundcraft_mix::NewInstance { plugin: soundcraft_dsp::create("gain")?, refused_state: false })
+}
+
+#[test]
+fn budgeted_prepare_delivers_every_instance_across_calls() {
+    let (_gtx, grx) = channel();
+    let mut side = Side::new(48_000.0, grx);
+    let s = session_with_plugins(5);
+    let mut made = 0;
+    let mut create = |_: &str, _: Option<&[u8]>, _: f32, _: usize, _: usize| fake_instance(&mut made);
+    // A zero budget still makes progress: one instance per call.
+    let mut slots = Vec::new();
+    let mut calls = 0;
+    loop {
+        let (got, more) = side.prepare_within(&s, Some(std::time::Duration::ZERO), &mut create);
+        calls += 1;
+        assert!(got.len() <= 1, "one instance per call under a zero budget");
+        slots.extend(got.iter().map(|i| (i.track, i.slot)));
+        let progress = side.loading.clone();
+        if !more {
+            assert_eq!((progress.0, progress.1), (5, 5));
+            break;
+        }
+        assert_eq!(progress.1, 5);
+        assert!(progress.0 < 5 && calls < 10);
+    }
+    assert_eq!(calls, 5);
+    slots.sort_unstable();
+    slots.dedup();
+    assert_eq!(slots.len(), 5, "every slot got exactly one instance");
+    // Nothing is created twice once it exists.
+    let (again, more) = side.prepare_within(&s, Some(std::time::Duration::ZERO), &mut create);
+    assert!(again.is_empty() && !more);
+    assert_eq!(made, 5);
+}
+
+#[test]
+fn unbudgeted_prepare_creates_everything_at_once() {
+    let (_gtx, grx) = channel();
+    let mut side = Side::new(48_000.0, grx);
+    let s = session_with_plugins(4);
+    let mut made = 0;
+    let mut create = |_: &str, _: Option<&[u8]>, _: f32, _: usize, _: usize| fake_instance(&mut made);
+    let (got, more) = side.prepare_within(&s, None, &mut create);
+    assert_eq!((got.len(), more), (4, false));
+}
+
+#[test]
+fn old_instances_are_all_released_before_the_next_session_creates_any() {
+    let shared = Arc::new(Shared {
+        position: AtomicI64::new(0),
+        playing: AtomicBool::new(false),
+        speed: AtomicU32::new(1000),
+        meters: Mutex::new(MeterSnapshot::default()),
+    });
+    let (tx, rx) = channel();
+    let (gtx, grx) = channel();
+    let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
+    let mut side = Side::new(48_000.0, grx);
+    let a = session_with_plugins(3);
+    let mut made = 0;
+    let mut create = |_: &str, _: Option<&[u8]>, _: f32, _: usize, _: usize| fake_instance(&mut made);
+    let (first, _) = side.prepare_within(&a, None, &mut create);
+    tx.send(Cmd::Session(Arc::clone(&a), first)).unwrap();
+    let mut out = vec![0.0f32; 256];
+    st.fill(&mut out, 2);
+    // The "audio thread" keeps asking for blocks while the UI side unloads.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = Arc::clone(&stop);
+    let audio = std::thread::spawn(move || {
+        let mut out = vec![0.0f32; 256];
+        while !stop2.load(Ordering::Relaxed) {
+            st.fill(&mut out, 2);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+    let (gone, live) = side.release_all(&tx);
+    stop.store(true, Ordering::Relaxed);
+    assert!(audio.join().is_ok());
+    assert_eq!((gone, live), (3, 3), "all of session A's instances were handed back and dropped before B is prepared");
+    assert!(side.shadow.is_empty());
+    let (second, _) = side.prepare_within(&session_with_plugins(2), None, &mut create);
+    assert_eq!(second.len(), 2);
+    assert_eq!(made, 5);
+}
+
 #[test]
 fn instances_handed_back_for_a_new_device_leave_with_their_slots() {
     use soundcraft_model::{ChannelFormat, Insert, TrackKind};

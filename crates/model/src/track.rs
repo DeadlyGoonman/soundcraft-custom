@@ -290,6 +290,12 @@ pub struct Track {
     /// Pinned to top in the Edit window.
     #[serde(default)]
     pub pinned: bool,
+    /// Automation lanes are shown under the track.
+    #[serde(default)]
+    pub lanes_open: bool,
+    /// Ids (`AutoParam::id`) of the lanes shown under the track, top to bottom.
+    #[serde(default)]
+    pub shown_lanes: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -329,7 +335,20 @@ impl Track {
             ticks_timebase: kind.is_midi(),
             elastic: None,
             pinned: false,
+            lanes_open: false,
+            shown_lanes: Vec::new(),
         }
+    }
+
+    /// Ids of the lanes that hold points, in lane order.
+    pub fn lanes_with_data(&self) -> Vec<String> {
+        self.automation.iter().filter(|l| !l.points.is_empty()).map(|l| l.param.id()).collect()
+    }
+
+    /// The lanes to show when opening with none configured: every one with data, else volume.
+    pub fn default_lanes(&self) -> Vec<String> {
+        let v = self.lanes_with_data();
+        if v.is_empty() { vec![AutoParam::Volume.id()] } else { v }
     }
 
     pub fn channels(&self) -> usize {

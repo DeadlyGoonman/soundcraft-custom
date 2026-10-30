@@ -1,6 +1,21 @@
 use super::{Services, SoundApp, automation_step_due};
+use crate::app::plugin_write_due;
 use serde_json::json;
 use soundcraft_model::TrackId;
+
+#[test]
+fn plugin_write_decision_per_mode() {
+    use soundcraft_model::AutomationMode as M;
+    use std::time::Duration as D;
+    let (held, idle) = (D::from_millis(10), D::from_millis(400));
+    assert!(plugin_write_due(M::Touch, held) && !plugin_write_due(M::Touch, idle));
+    for m in [M::Write, M::Latch, M::TouchLatch] {
+        assert!(plugin_write_due(m, held) && plugin_write_due(m, idle));
+    }
+    for m in [M::Off, M::Read, M::Trim] {
+        assert!(!plugin_write_due(m, held));
+    }
+}
 
 #[test]
 fn new_session_stops_playback_and_the_old_clock() {

@@ -20,6 +20,7 @@ mod event_more;
 mod file;
 mod health;
 mod instrument;
+mod lanes;
 mod midi;
 mod mix;
 mod more_util;
@@ -162,6 +163,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(zoom_toggle::specs());
         #[cfg(test)]
         v.extend(panic_probe::specs());
+        v.extend(lanes::specs());
         v
     })
 }

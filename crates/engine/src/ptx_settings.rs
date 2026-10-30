@@ -50,7 +50,12 @@ pub fn set_probe_exe(exe: PathBuf) {
 pub fn convert(id: &str, data: &[u8], templates: &mut HashMap<String, Option<Vec<u8>>>) -> Option<Vec<u8>> {
     let template = templates
         .entry(id.to_string())
-        .or_insert_with(|| soundcraft_mix::create_instance(id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state()));
+        .or_insert_with(|| {
+            crate::io::import_note("Preparing plugin settings");
+            let t = soundcraft_mix::create_instance(id, None, 48_000.0, 512, 2).and_then(|mut n| n.plugin.save_state());
+            crate::io::import_note("");
+            t
+        });
     let template = template.as_deref()?;
     let data = juce_state(data).unwrap_or(data);
     if data.starts_with(b"<PresetChunkXMLTree") {
@@ -381,17 +386,25 @@ fn state_loads_in_child(id: &str, state: &[u8]) -> bool {
         return v;
     }
     let ok = PROBE_EXE.get().is_some_and(|exe| {
+        let vst3: Vec<_> = soundcraft_vst3_host::cached().unwrap_or_default().into_iter().filter(|d| d.id == id).collect();
+        crate::io::import_note(&format!("Checking plugin settings: {}", vst3.first().map_or(id, |d| d.name.as_str())));
         let job = StateJob {
             id: id.to_string(),
-            vst3: soundcraft_vst3_host::cached().unwrap_or_default().into_iter().filter(|d| d.id == id).collect(),
+            vst3,
             state: soundcraft_model::b64::encode(state),
         };
         // The job goes on the child's standard input: no file to write or clean up.
         let ran =
             serde_json::to_vec(&job).ok().map(|j| crate::plugin_scan::run_child(exe, &[STATE_PROBE_ARG.as_ref()], Some(j), STATE_PROBE_TIMEOUT));
+        crate::io::import_note("");
         let ok = matches!(ran, Some(Ok((ref text, _))) if text.lines().any(|l| l.trim_end() == format!("{STATE_PROBE_MARK}ok")));
         if !ok {
-            log::warn!("{id}: the session's settings failed the check in a child process; it starts from its defaults");
+            let how = match &ran {
+                Some(Ok((_, Some(s)))) if !s.success() => crate::plugin_scan::exit_text(s),
+                Some(Ok((_, None))) => "timed out".to_string(),
+                _ => "refused".to_string(),
+            };
+            log::warn!("{id}: the session's settings failed the check in a child process ({how}); it starts from its defaults");
         }
         ok
     });
@@ -406,6 +419,7 @@ pub fn state_probe_command_line(args: &[String]) -> Option<i32> {
     if args.first().map(String::as_str) != Some(STATE_PROBE_ARG) {
         return None;
     }
+    soundcraft_vst3_host::quiet_crash_dialogs();
     let mut text = String::new();
     let read = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).is_ok();
     let job = read.then(|| serde_json::from_str::<StateJob>(&text).ok()).flatten();

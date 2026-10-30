@@ -57,6 +57,8 @@ mod registry;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use plugin::Vst3Plugin;
+#[cfg(not(target_arch = "wasm32"))]
+pub use ffi::quiet_crash_dialogs;
 
 use soundcraft_dsp::{Category, Plugin, PluginInfo};
 use std::path::{Path, PathBuf};

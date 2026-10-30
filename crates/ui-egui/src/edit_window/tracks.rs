@@ -1,8 +1,8 @@
-use super::automation::draw_automation;
+use super::automation::{auto_value, breakpoint_at, draw_automation, lane_range};
 use super::clips::{draw_clip, draw_live_take, draw_strip_silence, grid_lines};
-use super::header::{header_column, track_header};
-use super::input::lane_interaction;
-use super::layout::{Column, HEADER_W, LANE_H, STRIP_W, lane_rect, sample_at, x_of};
+use super::header::{header_column, header_selector, track_header};
+use super::input::{lane_interaction, place_insertion, snap};
+use super::layout::{AUTO_LANE_H, Column, HEADER_W, LANE_H, STRIP_W, lane_rect, lanes_h, sample_at, x_of};
 use super::*;
 
 pub(super) fn in_edit_window(s: &Session, t: &Track) -> bool {
@@ -64,7 +64,7 @@ pub(super) fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect,
     let (head_bg, lane_bg) = crate::theme::track_backgrounds(track.color, selected, app.ui.track_tint);
     let mut x = head.max.x;
     for &(col, _, _, w) in cols {
-        header_column(app, ui, track, col, Rect::from_min_size(pos2(x, row.min.y), vec2(w, row.height())), head_bg);
+        header_column(app, ui, track, col, Rect::from_min_size(pos2(x, row.min.y), vec2(w, row.height() - lanes_h(track))), head_bg);
         x += w;
     }
     let main_h = track.height.points();
@@ -73,7 +73,7 @@ pub(super) fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect,
     ui.painter().rect_filled(Rect::from_min_size(head.min, vec2(STRIP_W, head.height())), 0.0, rgb(track.color));
     ui.painter().line_segment([pos2(head.min.x, row.max.y + 0.5), pos2(tl.max.x, row.max.y + 0.5)], Stroke::new(1.0, t.border));
     ui.painter().hline(head.min.x + STRIP_W..=head.max.x, head.min.y + 0.5, Stroke::new(1.0, t.edge_light));
-    track_header(app, ui, track, head, selected, head_bg);
+    track_header(app, ui, track, Rect::from_min_size(head.min, vec2(head.width(), head.height() - lanes_h(track))), selected, head_bg);
     // Audio files dropped from outside on the header: the sampler (instrument) or the edit cursor.
     if track.kind == TrackKind::Instrument {
         crate::sampler_window::drop_target(app, ui.ctx(), head, id);
@@ -127,7 +127,167 @@ pub(super) fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect,
     if track.view == "playlists" {
         playlist_lanes(app, ui, track, row, main_h, tl);
     }
+    auto_lanes(app, ui, track, row, tl, head_bg, lane_bg, selected);
 }
+
+/// The automation lanes under a track: a header with the lane's parameter selector, add and remove
+/// buttons, and a body that draws and edits the lane like the track's own automation view.
+fn auto_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, tl: Rect, head_bg: Color32, lane_bg: Color32, selected: bool) {
+    let t = Tokens::current();
+    let s = app.engine.session_arc();
+    let id = track.id;
+    for (i, lid) in track.shown_lanes.iter().enumerate().filter(|_| track.lanes_open) {
+        let Some(param) = AutoParam::parse(lid) else { continue };
+        let y = row.max.y - lanes_h(track) + i as f32 * AUTO_LANE_H;
+        let head = Rect::from_min_max(pos2(row.min.x + STRIP_W, y), pos2(tl.min.x, y + AUTO_LANE_H));
+        let lane = Rect::from_min_max(pos2(tl.min.x, y), pos2(tl.max.x, y + AUTO_LANE_H));
+        ui.painter().rect_filled(head, 0.0, head_bg);
+        ui.painter().hline(row.min.x + STRIP_W..=tl.max.x, y + 0.5, Stroke::new(1.0, t.border));
+        let sel = Rect::from_min_size(pos2(head.min.x + 6.0, y + 5.0), vec2(105.0, 17.0));
+        let resp = header_selector(ui, sel, ui.scope_id().with(("lane_sel", id.0, i)), &lane_label(track, &param), t.text, true, &format!("Automation lane for {}", track.name));
+        let mut picked = None;
+        egui::Popup::menu(&resp).show(|ui| picked = automation_menu(ui, track));
+        if let Some(v) = picked {
+            let _ = app.run("track.lane_set", json!({"track": id.0, "lane": lid, "param": v}));
+        }
+        for (k, (text, tip, cmd, params)) in [
+            ("+", "Add automation lane below this one", "track.lane_add", json!({"track": id.0, "after": lid})),
+            ("-", "Remove this automation lane", "track.lane_remove", json!({"track": id.0, "param": lid})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = Rect::from_min_size(pos2(sel.max.x + 4.0 + k as f32 * 19.0, y + 5.0), vec2(17.0, 17.0));
+            if header_selector(ui, r, ui.scope_id().with(("lane_btn", id.0, i, k)), text, t.text, false, tip).on_hover_text(tip).clicked() {
+                let _ = app.run(cmd, params);
+            }
+        }
+        let painter = ui.painter().with_clip_rect(lane.intersect(ui.clip_rect()));
+        painter.rect_filled(lane, 0.0, lane_bg);
+        grid_lines(&painter, &s, tl, lane);
+        draw_automation(&painter, &s, track, &param, tl, lane);
+        let sel_r = s.edit.selection;
+        if selected && !sel_r.is_empty() {
+            let (x0, x1) = (x_of(&s, tl, sel_r.start).max(lane.min.x), x_of(&s, tl, sel_r.end).min(lane.max.x));
+            if x1 > x0 {
+                painter.rect_filled(Rect::from_min_max(pos2(x0, lane.min.y), pos2(x1, lane.max.y)), 0.0, t.selection);
+            }
+        }
+        auto_lane_interaction(app, ui, track, &param, lane, tl, i);
+    }
+}
+
+/// Pointer editing on a lane under the track: breakpoints, pencil, and the selection.
+fn auto_lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, param: &AutoParam, lane: Rect, tl: Rect, n: usize) {
+    let resp = ui.interact(lane, ui.scope_id().with(("alane", track.id.0, n)), Sense::click_and_drag());
+    let s = app.engine.session_arc();
+    let tool = s.edit.tool;
+    let mods = ui.input(|i| i.modifiers);
+    let Some(p) = resp.interact_pointer_pos().or_else(|| resp.hover_pos()) else { return };
+    let at = sample_at(&s, tl, p.x).max(0);
+    let origin = if resp.drag_started() { ui.input(|i| i.pointer.press_origin()).unwrap_or(p) } else { p };
+    let at_origin = sample_at(&s, tl, origin.x).max(0);
+    let point_hit = if matches!(tool, Tool::Smart | Tool::Grabber | Tool::Pencil) { breakpoint_at(&s, tl, lane, track, param, origin) } else { None };
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(match (point_hit, tool) {
+            (Some(_), _) => egui::CursorIcon::Grab,
+            (_, Tool::Pencil) => egui::CursorIcon::Crosshair,
+            (_, Tool::Zoom) => egui::CursorIcon::ZoomIn,
+            _ => egui::CursorIcon::Text,
+        });
+    }
+    let selecting = matches!(tool, Tool::Selector | Tool::Smart) && point_hit.is_none();
+    if selecting && resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
+        place_insertion(app, ui, &s, track.id, at, mods.shift);
+    }
+    if resp.drag_started() {
+        app.gesture = match (point_hit, tool) {
+            (Some(at), _) => Some(Gesture::Breakpoint { track: track.id, param: param.clone(), at }),
+            (_, Tool::Pencil) => Some(Gesture::Pencil { track: track.id, points: Vec::new(), param: Some(param.clone()) }),
+            (_, Tool::Selector | Tool::Smart) => Some(Gesture::Select { track: track.id, anchor: snap(&s, at_origin), tracks: vec![track.id] }),
+            (_, Tool::Scrubber) => Some(Gesture::Scrub { last: at }),
+            (_, Tool::Zoom) => Some(Gesture::ZoomBox { start: origin.x }),
+            _ => None,
+        };
+    }
+    if resp.clicked() {
+        match (point_hit, tool) {
+            // Alt-click deletes a breakpoint, as in Pro Tools.
+            (Some(at), _) if mods.alt => {
+                let _ = app.run("automation.clear", json!({"track": track.id.0, "param": param.id(), "start": at, "end": at.saturating_add(1)}));
+            }
+            (None, Tool::Pencil) => {
+                let value = auto_value(lane, lane_range(track, param), p.y);
+                let _ = app.run("automation.set_point", json!({"track": track.id.0, "param": param.id(), "at": at, "value": value}));
+            }
+            (None, Tool::Zoom) => {
+                let _ = app.run(if mods.alt { "view.zoom_out" } else { "view.zoom_in" }, json!({}));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The parameter menu of an automation lane: volume, pan, mute, the sends, then a submenu per
+/// insert listing all its parameters by name. Returns the automation id picked.
+fn automation_menu(ui: &mut Ui, track: &Track) -> Option<String> {
+    let mut picked = None;
+    for o in ["volume", "pan", "mute"] {
+        if ui.button(view_label(o)).clicked() {
+            picked = Some(o.to_string());
+        }
+    }
+    for (i, send) in track.mixer.sends.iter().enumerate() {
+        let (Some(_), Ok(i)) = (send, u8::try_from(i)) else { continue };
+        for p in [AutoParam::SendLevel(i), AutoParam::SendPan(i), AutoParam::SendMute(i)] {
+            if ui.button(p.label()).clicked() {
+                picked = Some(p.id());
+            }
+        }
+    }
+    for (slot, ins) in track.mixer.inserts.iter().enumerate() {
+        let (Some(ins), Ok(slot8)) = (ins, u8::try_from(slot)) else { continue };
+        let info = crate::mix_window::plugin_info(&ins.plugin);
+        // Stored values and existing lanes cover params the plugin did not describe.
+        let mut stored: Vec<String> = ins.params.keys().cloned().collect();
+        for l in &track.automation {
+            if let AutoParam::Plugin { slot: s, param } = &l.param
+                && *s == slot8
+            {
+                stored.push(param.clone());
+            }
+        }
+        let items = plugin_menu_items(slot8, info, &stored);
+        if items.is_empty() {
+            continue;
+        }
+        ui.menu_button(info.map_or(ins.plugin.as_str(), |i| i.name), |ui| {
+            egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                for (v, name) in &items {
+                    if ui.button(name).clicked() {
+                        picked = Some(v.clone());
+                    }
+                }
+            });
+        });
+    }
+    picked
+}
+
+/// Lane menu entries (automation id, label) for one insert: the plugin's described params, then
+/// any stored or automated id it did not describe (labelled with the id).
+pub(super) fn plugin_menu_items(slot: u8, info: Option<&soundcraft_dsp::PluginInfo>, stored: &[String]) -> Vec<(String, String)> {
+    let view = |p: &str| AutoParam::Plugin { slot, param: p.to_string() }.id();
+    let mut out: Vec<(String, String)> = info.map_or_else(Vec::new, |i| i.params.iter().map(|p| (view(p.id), p.name.to_string())).collect());
+    for k in stored {
+        let v = view(k);
+        if !out.iter().any(|(o, _)| *o == v) {
+            out.push((v, k.clone()));
+        }
+    }
+    out
+}
+
 
 /// Alternate playlists as lanes under the main one; clicking a clip promotes it (comping).
 fn playlist_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, main_h: f32, tl: Rect) {
@@ -173,6 +333,18 @@ pub(super) fn view_label(v: &str) -> String {
         Some(p) => p.label(),
         None => v.to_string(),
     }
+}
+
+/// A plugin lane's label: "<plugin> <param name>", else the raw label.
+pub(super) fn lane_label(track: &Track, p: &AutoParam) -> String {
+    if let AutoParam::Plugin { slot, param } = p
+        && let Some(Some(ins)) = track.mixer.inserts.get(usize::from(*slot))
+        && let Some(info) = crate::mix_window::plugin_info(&ins.plugin)
+        && let Some(pi) = info.param(param)
+    {
+        return format!("{} {}", info.short_name, pi.name);
+    }
+    p.label()
 }
 
 pub(super) fn view_menu(app: &mut SoundApp, ui: &mut Ui, track: &Track) {

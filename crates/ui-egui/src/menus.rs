@@ -523,6 +523,15 @@ pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
         app.ui.audiosuite = p.get("process").and_then(Value::as_str).map(str::to_string);
         return;
     }
+    // Open Session goes straight to the system file picker, no prompt of its own first.
+    if id == "session.open"
+        && let Some(picked) = app.services.pick_open.as_ref().map(|pick| pick(id, &[]))
+    {
+        if let Some(file) = picked {
+            crate::dialogs::open_session_with_progress(app, file);
+        }
+        return;
+    }
     if wants_dialog(id) && app.dialogs.open_for_command(&app.engine, id) {
         return;
     }

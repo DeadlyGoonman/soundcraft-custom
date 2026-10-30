@@ -17,7 +17,7 @@ mod strip_silence;
 #[cfg(test)]
 use audiosuite::SPEED_RAMP_CHOICES;
 use audiosuite::audiosuite_window;
-use files::{OPEN_PENDING, default_dir, open_pending_session, path_dialog};
+use files::{OPEN_PENDING, default_dir, open_pending_session, path_dialog, run_or_open};
 pub use files::{ask_to_save, open_session_bytes, run_or_ask, takes_path};
 use strip_silence::{AUTO_NAME_LABELS, STRIP_NAME_LABELS, StripRectangles, auto_rename_action, strip_name_fields, strip_silence_action};
 pub use strip_silence::{StripRects, strip_silence_rectangles};
@@ -378,8 +378,145 @@ pub fn join_save_path(dir: &str, name: &str, ext: &str) -> String {
     if dir.is_empty() { file } else { std::path::Path::new(dir).join(file).to_string_lossy().into_owned() }
 }
 
+/// Opens the session picked in the file picker: asks to save a modified one first, else opens it
+/// behind a progress window ([`start_open`]).
+pub fn open_session_with_progress(app: &mut SoundApp, path: String) {
+    if ask_to_save(app, "session.open", &json!({ "path": path })) {
+        return;
+    }
+    start_open(app, path);
+}
+
+/// A session being opened: read on a worker thread, then installed, then its plugins created a few
+/// per frame ([`soundcraft_playback::Player::continue_loading`]). Nothing here blocks the UI.
+pub struct Opening {
+    path: String,
+    progress: std::sync::Arc<soundcraft_engine::io::OpenProgress>,
+    stage: OpenStage,
+}
+
+impl Opening {
+    /// The session file being opened.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+enum OpenStage {
+    #[cfg(not(target_arch = "wasm32"))]
+    Reading(std::thread::JoinHandle<Result<soundcraft_engine::io::Opened, String>>),
+    /// Read; the old session's plugins are released when it is installed, on the next frame, so
+    /// this stage is drawn first.
+    Unloading(Box<soundcraft_engine::io::Opened>),
+    /// Installed; waiting for the audio engine to hold every plugin.
+    Plugins,
+}
+
+/// Opens `path` as the session without blocking the UI. Where there are no threads (the browser)
+/// it opens at once.
+pub fn start_open(app: &mut SoundApp, path: String) {
+    if app.opening.is_some() {
+        app.ui.status = "A session is already opening".into();
+        return;
+    }
+    if crate::bounce::refuses_session_switch(app) {
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let progress = std::sync::Arc::new(soundcraft_engine::io::OpenProgress::default());
+        let (p2, path2) = (std::sync::Arc::clone(&progress), path.clone());
+        let spawned = std::thread::Builder::new()
+            .name("open-session".into())
+            .spawn(move || soundcraft_engine::io::load_session_file(&path2, &p2).map_err(|e| e.to_string()));
+        match spawned {
+            Ok(h) => {
+                log::info!("opening session {path}");
+                app.ui.status = "Opening…".into();
+                app.opening = Some(Opening { path, progress, stage: OpenStage::Reading(h) });
+                return;
+            }
+            Err(e) => log::warn!("cannot start the open-session thread: {e}"),
+        }
+    }
+    if let Err(e) = app.run("session.open", json!({ "path": path })) {
+        app.ui.status = e;
+    }
+}
+
+/// Advances the session being opened and draws its progress window.
+fn opening_window(app: &mut SoundApp, ctx: &egui::Context) {
+    let Some(mut o) = app.opening.take() else { return };
+    let started = std::time::Instant::now();
+    o.stage = match std::mem::replace(&mut o.stage, OpenStage::Plugins) {
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenStage::Reading(h) if !h.is_finished() => OpenStage::Reading(h),
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenStage::Reading(h) => match h.join() {
+            Ok(Ok(opened)) => OpenStage::Unloading(Box::new(opened)),
+            Ok(Err(e)) => {
+                log::warn!("open {}: {e}", o.path);
+                app.ui.status = e;
+                return;
+            }
+            Err(_) => {
+                log::warn!("open {}: the reader stopped unexpectedly", o.path);
+                app.ui.status = "Could not open the session".into();
+                return;
+            }
+        },
+        // Seen here, it was drawn on an earlier frame: now the old plugins can go.
+        OpenStage::Unloading(opened) => {
+            app.install_opened(*opened, &o.path);
+            OpenStage::Plugins
+        }
+        OpenStage::Plugins => OpenStage::Plugins,
+    };
+    let loading = app.player.as_ref().and_then(|p| p.plugins_loading());
+    // The new session's plugins are requested on the frame after it is installed.
+    let waiting = app.engine.revision != app.last_rev;
+    if matches!(o.stage, OpenStage::Plugins) && !waiting && loading.is_none() {
+        log::info!("opened {}", o.path);
+        if app.ui.status == "Opening…" {
+            app.ui.status.clear();
+        }
+        return;
+    }
+    let name = std::path::Path::new(&o.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let ord = std::sync::atomic::Ordering::Relaxed;
+    let (done, total) = (o.progress.done.load(ord), o.progress.total.load(ord));
+    let note = o.progress.note.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    // Reading is most of the wait, unloading is brief, creating plugins is the rest.
+    let (fraction, stage) = match &o.stage {
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenStage::Reading(_) if !note.is_empty() => (0.7 * (done as f32 / total.max(1) as f32).min(1.0), note.clone()),
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenStage::Reading(_) if total == 0 && done == 0 => (0.0, "Reading session…".to_string()),
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenStage::Reading(_) if total == 0 => (0.0, format!("Reading audio {done}")),
+        #[cfg(not(target_arch = "wasm32"))]
+        OpenStage::Reading(_) => (0.7 * (done as f32 / total as f32).min(1.0), format!("Reading audio {done}/{total}")),
+        OpenStage::Unloading(_) => (0.7, "Unloading plugins".to_string()),
+        OpenStage::Plugins => match loading {
+            Some(l) => (0.75 + 0.25 * l.done as f32 / l.total.max(1) as f32, format!("Loading plugins {}/{} — {}", l.done, l.total, l.last)),
+            None => (0.75, "Loading plugins".to_string()),
+        },
+    };
+    egui::Modal::new(egui::Id::unique("opening_session")).show(ctx, |ui| {
+        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+        ui.set_width(360.0);
+        ui.label(egui::RichText::new("Opening Session").font(bold(13.0)));
+        ui.label(&name);
+        ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).animate(true));
+        ui.label(egui::RichText::new(stage).color(Tokens::current().text_dim));
+    });
+    app.opening = Some(o);
+    ctx.request_repaint_after(std::time::Duration::from_millis(30).saturating_sub(started.elapsed()));
+}
+
 /// Show the open dialog, if any.
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
+    opening_window(app, ctx);
     audiosuite_window(app, ctx);
     crate::bounce::show(app, ctx);
     crate::import::show(app, ctx);
@@ -646,6 +783,10 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         });
                         if let Some(p) = picked {
                             *path = p;
+                            // Choosing a file in the picker is the answer: open/import it right away.
+                            if opening {
+                                action = Some((cmd.clone(), json!({ key.as_str(): path })));
+                            }
                         } else if !folder && !opening && (dir != old_dir || name != old_name) {
                             *path = join_save_path(&dir, &name, &ext);
                         }
@@ -945,7 +1086,7 @@ fn run_then(app: &mut SoundApp, cmd: &str, params: Value) -> Result<Value, Strin
         open_pending_session(app);
         return Ok(Value::Null);
     }
-    app.run(cmd, params)
+    run_or_open(app, cmd, params)
 }
 
 /// Cancel/OK row; returns true when OK was pressed (or Enter).

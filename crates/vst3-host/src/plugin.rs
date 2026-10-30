@@ -321,6 +321,21 @@ impl Plugin for Vst3Plugin {
         self.values.get(i).copied()
     }
 
+    fn flush_params(&mut self) {
+        if self.pending.is_empty() || !self.inst.is_active() || self.max_block == 0 {
+            return;
+        }
+        // A short block of silence carries the changes; its output is dropped.
+        let n = self.max_block.min(32);
+        for c in 0..self.inputs.channels(0) {
+            if let Some(d) = self.inputs.channel_mut(0, c).and_then(|d| d.get_mut(..n)) {
+                d.fill(0.0);
+            }
+        }
+        let _ = self.inst.process(n, &mut self.inputs, &mut self.outputs, &self.pending, &[], &[], 0, self.position, None);
+        self.pending.clear();
+    }
+
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
         if self.mirror.dirty.swap(false, Ordering::Acquire) {
             for (slot, a) in self.values.iter_mut().zip(self.mirror.values.iter()) {

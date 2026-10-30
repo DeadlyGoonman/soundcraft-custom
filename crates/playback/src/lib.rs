@@ -50,7 +50,8 @@ mod stream;
 
 #[cfg(all(windows, feature = "asio"))]
 use callback::AsioCallback;
-use callback::{AudioState, Fault, Side, take_meter_snapshot};
+use callback::{AudioState, Fault, LOAD_BUDGET, Side, take_meter_snapshot};
+pub use callback::PluginLoading;
 #[cfg(test)]
 use callback::{STALL, copy_meter_snapshot};
 #[cfg(not(target_arch = "wasm32"))]
@@ -117,6 +118,9 @@ pub type EditorEdit = (TrackId, usize, String, f32);
 enum Cmd {
     /// A new snapshot plus the third-party instances it needs (created on the UI thread).
     Session(Arc<Session>, Vec<PreparedInstance>),
+    /// More third-party instances for the current session, created in later UI frames
+    /// ([`Player::continue_loading`]).
+    Adopt(Vec<PreparedInstance>),
     /// Where the callback sends the snapshots it replaces (freeing one takes thousands of frees).
     OldSessions(SyncSender<Arc<Session>>),
     Input(Arc<record::InputRing>),
@@ -654,30 +658,53 @@ impl Player {
     /// shells (Waves') crash when instances of two sessions are alive together. Waits briefly
     /// for the audio thread to hand them back. Call on the UI thread.
     pub fn release_all(&self) {
-        let mut side = self.side();
-        let keys: Vec<(TrackId, usize)> = side.shadow.keys().copied().collect();
-        for k in keys {
-            side.forget(k);
-        }
-        let _ = self.tx.send(Cmd::Session(Arc::new(Session::default()), Vec::new()));
-        // The audio thread retires the old instances on its next callback and sends them back.
-        if let Ok(g) = side.garbage.recv_timeout(std::time::Duration::from_millis(500)) {
-            drop(g);
-        }
-        side.collect_garbage();
+        self.side().release_all(&self.tx);
     }
 
     /// Sends a new session snapshot to the audio thread, with freshly created (state-restored,
     /// prepared) instances of any third-party plugin it newly needs. Call on the UI thread.
+    ///
+    /// Creating plugins is slow, so about [`LOAD_BUDGET`] worth is created per call; the rest
+    /// follows from [`Player::continue_loading`], called each frame while
+    /// [`Player::plugins_loading`] says so.
     pub fn update_session(&self, s: Arc<Session>) {
         let (instances, gone) = {
             let mut side = self.side();
-            (side.prepare(&s), side.gone_tracks(&s))
+            let (instances, more) = side.prepare_within(&s, Some(LOAD_BUDGET), &mut soundcraft_mix::create_instance);
+            side.pending = more.then(|| Arc::clone(&s));
+            (instances, side.gone_tracks(&s))
         };
         let _ = self.tx.send(Cmd::Session(s, instances));
         if !gone.is_empty() {
             let _ = self.tx.send(Cmd::Forget(gone));
         }
+    }
+
+    /// Creates the next batch of the session's plugins and hands it to the audio thread. UI thread.
+    pub fn continue_loading(&self) {
+        let mut side = self.side();
+        let Some(s) = side.pending.take() else { return };
+        let (instances, more) = side.prepare_within(&s, Some(LOAD_BUDGET), &mut soundcraft_mix::create_instance);
+        side.pending = more.then_some(s);
+        drop(side);
+        if !instances.is_empty() {
+            let _ = self.tx.send(Cmd::Adopt(instances));
+        }
+    }
+
+    /// Creates every plugin the last session still lacks, now (before playing or opening an editor).
+    pub fn finish_loading(&self) {
+        while self.side().pending.is_some() {
+            self.continue_loading();
+        }
+    }
+
+    /// How far the last session's plugins are created, while some are still missing.
+    pub fn plugins_loading(&self) -> Option<PluginLoading> {
+        let side = self.side();
+        side.pending.as_ref()?;
+        let (done, total, last) = side.loading.clone();
+        Some(PluginLoading { done, total, last })
     }
 
     /// Reads the state of every live third-party plugin, for saving the session.

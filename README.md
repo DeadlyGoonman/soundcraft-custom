@@ -5,7 +5,7 @@
 <h1 align="center">SoundCraft — DeadlyGoonman's fork</h1>
 
 <p align="center">
-  <b>A personal fork of the open-source SoundCraft DAW, adding native ASIO support, custom themes, and scalable plugin editors.</b>
+  <b>A personal fork of the open-source SoundCraft DAW: native ASIO, a plugin scanner, MP3/FLAC export, session import, custom themes, and plugin editors that behave like they should.</b>
 </p>
 
 <p align="center">
@@ -24,7 +24,8 @@
 
 <p align="center">
   <a href="https://github.com/storytold/soundcraft"><b>Upstream: storytold/soundcraft</b></a> ·
-  <a href="#this-fork">This fork's changes</a>
+  <a href="#this-fork">This fork's changes</a> ·
+  <a href="https://github.com/DeadlyGoonman/soundcraft-custom/releases/latest"><b>Download for Windows</b></a>
 </p>
 
 <p align="center">
@@ -55,6 +56,17 @@ was written by **Claude** (Anthropic's Claude Code). **This fork's changes are 1
   focus; off by default), **Bypass** and **Δ Delta** (hear only what the plugin changes: wet minus the
   latency-aligned dry signal; a listening aid that is never saved). Closing a plugin window no longer pulls the main
   window to the front.
+- **Plugin editors that keep up** — dragging a knob in a plugin's own window is one undo step, and undo/redo move
+  the knob back in the open editor, also for plugins whose window follows their audio side (Waves). Upscaled editors
+  put the plugin's pixel right under the real cursor, so a click no longer nudges the knob (UADx, Softube).
+- **Plugin scanner** — scans VST3 and CLAP folders in separate processes, so a plugin that crashes on load is listed
+  under *Failed to load* instead of taking the app down; new plugins are picked up with a quick scan at launch.
+- **Smooth session opening** — sessions load on a worker thread behind a progress window, old plugins are released
+  first and new ones created in small batches, so the UI never freezes on a big session.
+- **MP3 and FLAC export** — Bounce Mix writes WAV, AIFF, FLAC or MP3, with optional title/artist/album tags.
+- **Session import** — opens `.ptx` sessions and FL Studio projects (`.flp`) as SoundCraft sessions.
+- **Clip look and gain grip** — clips drawn with a coloured name bar and a draggable clip-gain handle.
+- **Update check** — tells you when a newer release of this fork is out; installs as its own app next to upstream.
 - **Custom themes** — an OLED Black theme (pure-black surfaces) and a Custom theme shaded from any colour you pick,
   alongside the built-in Dark/Light/System options.
 - **Track-colour tint + insert drag-swap** — inserts, sends and I/O rows pick up a faint tint from their track's
@@ -75,9 +87,23 @@ was written by **Claude** (Anthropic's Claude Code). **This fork's changes are 1
   </tr>
   <tr>
     <td><b>Edit window.</b></td>
-    <td><b>Mix window.</b></td>
+    <td><b>Mix window.</b> Third-party inserts (UADx, Softube, Waves) next to the built-in ones.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img alt="The Plugin Scanner window: 954 VST3 and 14 CLAP plugins found, Scan for New Plugins and Full Rescan buttons, and the quick scan at launch option" src="docs/images/fork/plugin-scanner.png"></td>
+    <td width="50%"><img alt="The Bounce Mix dialog with the format menu open: WAV, AIFF, FLAC and MP3" src="docs/images/fork/bounce-formats.png"></td>
+  </tr>
+  <tr>
+    <td><b>Plugin scanner.</b> Every plugin probed in its own process; crashes are listed, not fatal.</td>
+    <td><b>Bounce formats.</b> WAV, AIFF, FLAC and MP3, with tags.</td>
   </tr>
 </table>
+
+<p align="center">
+  <img alt="The Tube-Tech CL 1B plugin window, with SoundCraft's Keys, Bypass and Delta header strip on top" src="docs/images/fork/plugin-window.png" width="90%">
+  <br>
+  <sub>A plugin's own editor with the fork's header strip: Keys, Bypass and Δ Delta.</sub>
+</p>
 
 <p align="center">
   <img alt="The Custom Theme colour picker, with a pink colour chosen and swatches for Soft Pink, Dark Pink, Grey (Dark) and OLED Black" src="docs/images/fork/custom-theme-picker.png" width="60%">

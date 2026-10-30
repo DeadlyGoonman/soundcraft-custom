@@ -485,6 +485,7 @@ pub fn probe_command_line(args: &[String]) -> Option<i32> {
     if args.first().map(String::as_str) != Some(PROBE_ARG) {
         return None;
     }
+    soundcraft_vst3_host::quiet_crash_dialogs();
     let result = match (args.get(1).and_then(|f| Format::from_arg(f)), args.get(2)) {
         (Some(format), Some(path)) => probe_in_process(format, Path::new(path)),
         _ => Err(format!("usage: {PROBE_ARG} vst3|clap <path>")),
@@ -514,6 +515,16 @@ fn probe_child(exe: &Path, format: Format, path: &Path, timeout: Duration) -> Re
         (Some(r), _) => r,
         (None, None) => Err(format!("timed out after {} s", timeout.as_secs())),
         (None, Some(s)) => Err(format!("crashed while loading ({s})")),
+    }
+}
+
+/// An exit status as text: a Windows crash code as hex (`0xC0000005`), else the code or signal.
+pub(crate) fn exit_text(s: &std::process::ExitStatus) -> String {
+    match s.code() {
+        #[allow(clippy::cast_sign_loss)]
+        Some(c) if !(0..=0xFFFF).contains(&c) => format!("exit code 0x{:08X}", c as u32),
+        Some(c) => format!("exit code {c}"),
+        None => s.to_string(),
     }
 }
 
@@ -565,6 +576,13 @@ pub(crate) fn run_child(
             Err(e) => return Err(format!("scanner process: {e}")),
         }
     };
+    if let Some(s) = status.filter(|s| !s.success()) {
+        // 1 is the probes' own "refused" code; anything else (0xC0000005, a signal...) is a crash.
+        if s.code() != Some(1) {
+            let what: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
+            log::warn!("child process died abnormally ({}): {} {}", exit_text(&s), exe.display(), what.join(" "));
+        }
+    }
     // A plugin that left a process of its own holding the pipe must not hang the scan.
     Ok((rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default(), status))
 }

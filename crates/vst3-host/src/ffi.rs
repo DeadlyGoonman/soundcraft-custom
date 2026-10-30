@@ -124,6 +124,49 @@ mod window;
 #[path = "ffi/window/other.rs"]
 mod window;
 
+/// For probe child processes only: a crash must not raise the Windows "Application Error" dialog,
+/// the just-in-time debugger chooser or a Windows Error Reporting window (the parent treats the
+/// death as a refused verdict). Plugins may reset the error mode while loading, so the process
+/// also joins a job that kills it on an unhandled exception and installs a filter that ends it
+/// without UI. No-op elsewhere. Never call it in the main app, whose crash dumps we want.
+#[cfg(windows)]
+pub fn quiet_crash_dialogs() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        EXCEPTION_POINTERS, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX, SetErrorMode, SetUnhandledExceptionFilter,
+    };
+    use windows_sys::Win32::System::ErrorReporting::{WER_FAULT_REPORTING_NO_UI, WerSetFlags};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe extern "system" fn die_quietly(_: *const EXCEPTION_POINTERS) -> i32 {
+        1 // EXCEPTION_EXECUTE_HANDLER: end the process, no dialog
+    }
+    // SAFETY: these calls only change this process's error-reporting behaviour; the structure is
+    // zeroed plain data of the size passed, and the job handle is intentionally kept open for the
+    // life of the process.
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+        let _ = WerSetFlags(WER_FAULT_REPORTING_NO_UI);
+        SetUnhandledExceptionFilter(Some(die_quietly));
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if !job.is_null() {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+            let set = SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const info).cast(), size);
+            if set != 0 {
+                let _ = AssignProcessToJobObject(job, GetCurrentProcess());
+            }
+        }
+    }
+}
+
+/// See the Windows version: nothing to do on other systems.
+#[cfg(not(windows))]
+pub fn quiet_crash_dialogs() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

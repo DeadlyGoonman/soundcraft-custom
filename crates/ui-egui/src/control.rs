@@ -9,6 +9,8 @@
 //! - `ui.click {x,y,button?,count?,mods?}`, `ui.move {x,y}`, `ui.drag {x,y,to_x,to_y,steps?}`
 //! - `ui.scroll {x,y,dx?,dy?,unit?,steps?,mods?}` (trackpad swipe or wheel), `ui.zoom {x,y,factor,steps?}` (pinch)
 //! - `ui.key {key, cmd?, shift?, alt?, ctrl?}`, `ui.text {text}`
+//! - `ui.open_session {path}`: what the file picker does: opens behind the progress window and returns at once (poll `ui.inspect`: `opening`)
+//! - `ui.open_editor {track, slot?}`: open the plugin editor window of an insert
 //! - `ui.screenshot {path?}` (PNG; base64 when no path), `ui.set {...UiState fields}`
 //! - `app.quit`
 //!
@@ -455,6 +457,21 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
         "engine.parity" => ok(crate::menus::parity()),
         "session.inspect" | "document.inspect" => {
             ok(soundcraft_engine::inspect::session(&app.engine, p.get("detail").and_then(Value::as_str) == Some("full")))
+        }
+        "ui.open_session" => {
+            let Some(path) = p.get("path").and_then(Value::as_str) else { return Some(err("`path` required")) };
+            crate::dialogs::open_session_with_progress(app, path.to_string());
+            ok(json!({"opening": app.opening.is_some()}))
+        }
+        "ui.open_editor" => {
+            // The plugin's own editor window for a track (name) and insert slot, as the insert's Edit button does.
+            let name = p.get("track").and_then(Value::as_str).unwrap_or("");
+            let slot = p.get("slot").and_then(Value::as_u64).map_or(0, |v| v as usize);
+            let Some(track) = app.engine.session().track_by_name(name).map(|t| t.id) else { return Some(err(format!("no track {name:?}"))) };
+            match app.open_slot_editor(track, slot) {
+                Ok(()) => ok(json!({})),
+                Err(e) => err(e),
+            }
         }
         "ui.inspect" => {
             let mut v = app.inspect(ctx);

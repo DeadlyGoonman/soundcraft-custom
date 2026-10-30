@@ -25,8 +25,8 @@ pub(crate) use import::{MAX_IMPORT_SAMPLES, at_rate, place_decoded};
 pub use midi::{export_midi, import_midi_bytes};
 pub use record::{Recording, Take, add_recording, live_span, place_recording};
 pub use render::{commit_track, consolidate, refuse_longer, render_clip_gain, render_limit, sanitize_name};
-pub(crate) use session::{DecodedFiles, decode_file, open_session_linked};
-pub use session::{open_session, open_template, save_copy, save_session, save_session_copy};
+pub(crate) use session::{DecodedFiles, decode_file, import_note, open_session_linked};
+pub use session::{OpenProgress, Opened, install_opened, load_session_file, open_session, open_template, save_copy, save_session, save_session_copy};
 pub use strip::{StripMode, StripNames, StripScan, bounded_to_track, name_stripped_clips, strip_silence, strip_silence_ranges, transients_in};
 
 /// Creates the folder `path` goes in when it is missing (after the write check).
@@ -810,7 +810,7 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
         }
         let exists_rel = same_dir && !Path::new(&src.path).is_absolute() && dir.join(&src.path).exists();
         let shared = shared_paths.get(i).copied().unwrap_or(false);
-        if exists_rel && !src.unsaved && !shared {
+        if exists_rel && !src.unsaved && !shared && Path::new(&src.path).starts_with("Audio Files") {
             continue;
         }
         let in_folder = Path::new(&src.path).strip_prefix(&audio_dir).ok().and_then(Path::to_str).map(str::to_string);
@@ -818,7 +818,21 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
             src.path = format!("Audio Files/{f}");
             continue;
         }
-        let Some(audio) = s.pool.get(src.id) else { continue };
+        let Some(audio) = s.pool.get(src.id) else {
+            // Not decoded (never played or lost): still gather the file into Audio Files/.
+            let from_file = if Path::new(&src.path).is_absolute() { PathBuf::from(&src.path) } else { dir.join(&src.path) };
+            if src.unsaved || !from_file.is_file() {
+                continue;
+            }
+            make_dir(&audio_dir)?;
+            let ext = from_file.extension().and_then(|x| x.to_str()).unwrap_or("wav").to_string();
+            let stem = sanitize_name(&src.name);
+            let bytes = read_file(&from_file)?;
+            let name = copy_into(&audio_dir, &stem, &ext, &bytes)?;
+            src.path = format!("Audio Files/{name}");
+            written += 1;
+            continue;
+        };
         if let Some(path) = files.get(&Arc::as_ptr(audio)) {
             src.path.clone_from(path);
             src.unsaved = false;
@@ -1091,6 +1105,23 @@ pub fn plan_takes(e: &Engine, unsaved_dir: &Path, input_channels: usize) -> Vec<
             (t.id, inputs, path)
         })
         .collect()
+}
+
+/// Copy `bytes` into `dir` as the first free `<stem>.<ext>`, `<stem>_01.<ext>`, … (or one already
+/// holding the same bytes); returns the file name.
+fn copy_into(dir: &Path, stem: &str, ext: &str, bytes: &[u8]) -> Result<String> {
+    for k in 0..10_000u32 {
+        let name = if k == 0 { format!("{stem}.{ext}") } else { format!("{stem}_{k:02}.{ext}") };
+        let path = dir.join(&name);
+        if !path.exists() {
+            write_path(&path, bytes)?;
+            return Ok(name);
+        }
+        if read_file(&path).is_ok_and(|b| b == bytes) {
+            return Ok(name);
+        }
+    }
+    Err(EngineError::Io(format!("{}: no free file name for {stem}", dir.display())))
 }
 
 #[cfg(test)]

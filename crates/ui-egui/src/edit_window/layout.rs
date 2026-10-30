@@ -93,7 +93,27 @@ pub fn sample_at(s: &Session, tl: Rect, x: f32) -> Samples {
 
 pub const LANE_H: f32 = 46.0;
 
+/// Height of one automation lane shown under a track.
+pub const AUTO_LANE_H: f32 = 40.0;
+
+/// Height of the automation lanes under a track, 0 when they are hidden.
+pub(super) fn lanes_h(t: &Track) -> f32 {
+    if t.lanes_open { t.shown_lanes.len() as f32 * AUTO_LANE_H } else { 0.0 }
+}
+
 pub fn track_height(t: &Track) -> f32 {
     let alt = if t.view == "playlists" { t.playlists.len().saturating_sub(1) as f32 * LANE_H } else { 0.0 };
-    t.height.points() + alt
+    t.height.points() + alt + lanes_h(t)
+}
+
+/// Where the lane for `param` is drawn: the main lane when it is what the track shows, else its row under the track.
+pub(super) fn auto_lane_rect(t: &Track, param: &AutoParam, row: Rect, tl: Rect) -> Rect {
+    if super::automation::shown_automation(t).as_ref() != Some(param)
+        && t.lanes_open
+        && let Some(i) = t.shown_lanes.iter().position(|l| *l == param.id())
+    {
+        let y = row.max.y - lanes_h(t) + i as f32 * AUTO_LANE_H;
+        return Rect::from_min_max(pos2(tl.min.x, y), pos2(tl.max.x, y + AUTO_LANE_H));
+    }
+    lane_rect(t, row, tl)
 }

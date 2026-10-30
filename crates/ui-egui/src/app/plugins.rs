@@ -69,6 +69,7 @@ impl SoundApp {
         let Some(p) = &self.player else { return };
         p.forget_instance(track, slot);
         p.update_session(self.engine.session_arc());
+        p.finish_loading();
         if let Err(e) = self.open_slot_editor(track, slot) {
             self.ui.status = format!("Reload: {e}");
         }
@@ -189,6 +190,13 @@ impl SoundApp {
                 continue;
             }
             let key = format!("param:{}:{slot}:{param}", t.0);
+            let now = std::time::Instant::now();
+            self.editor_edit_at = Some(now);
+            if let (true, Ok(slot8)) = (self.is_playing(), u8::try_from(slot))
+                && self.engine.session().track(t).is_some_and(|tr| plugin_write_due(tr.mixer.automation_mode, std::time::Duration::ZERO))
+            {
+                self.plugin_touched.insert((t, slot8, param.clone()), (now, value));
+            }
             let _ = self.engine.execute_merged("mix.insert_param", &json!({"track": t.0, "slot": slot, "param": param, "value": value}), &key);
         }
         let Some(p) = &self.player else {

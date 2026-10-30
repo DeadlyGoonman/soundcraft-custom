@@ -309,6 +309,8 @@ pub enum Gesture {
     Pencil {
         track: TrackId,
         points: Vec<(Samples, f32)>,
+        /// The automation the pencil draws: the track's automation view, or a lane under it.
+        param: Option<soundcraft_model::AutoParam>,
     },
     Breakpoint {
         track: TrackId,
@@ -426,6 +428,8 @@ pub struct SoundApp {
     /// Where a dropped audio file loads into a track's sampler (last frame's rects).
     pub sample_drop_targets: Vec<(egui::Rect, TrackId)>,
     pub audio_drop_lanes: Vec<(egui::Rect, egui::Rect, TrackId)>,
+    /// The session being opened off the UI thread, behind a progress window.
+    pub(crate) opening: Option<dialogs::Opening>,
     pub(crate) drop_preview: file_drop::DropPreview,
     /// Files dropped on the window, captured at the start of the UI pass before the font gate.
     pending_drops: Vec<(egui::DroppedFileHandle, Option<egui::Pos2>)>,
@@ -481,6 +485,12 @@ pub struct SoundApp {
     pub arrange_request: bool,
     /// Tracks whose automation was touched during this pass (Touch/Latch writing).
     touched: std::collections::HashSet<TrackId>,
+    /// Last plugin-editor param edit; native editors hide the pointer from egui, so keep the merge open across a quiet gap.
+    editor_edit_at: Option<std::time::Instant>,
+    /// Plugin params moved in the editor during this pass: (track, slot, param) -> (last edit, latest value).
+    plugin_touched: std::collections::HashMap<(TrackId, u8, String), (std::time::Instant, f32)>,
+    /// Pan knobs moved during a pass, by (track, pan index): when, and the value.
+    pan_touched: std::collections::HashMap<(TrackId, u8), (std::time::Instant, f32)>,
     /// The pass's last point; `i64::MIN` after a stop or a jump, so the next point erases nothing it skipped.
     last_write_at: Samples,
     /// Plugins changed in their editors whose state the session hasn't taken yet (see `editor_states_due`).

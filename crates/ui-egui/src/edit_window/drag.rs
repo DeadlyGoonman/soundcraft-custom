@@ -1,6 +1,6 @@
 use super::automation::{auto_value, automation_id, lane_range, plugin_range};
 use super::input::{new_midi_clip, snap};
-use super::layout::{lane_rect, rect, sample_at};
+use super::layout::{auto_lane_rect, rect, sample_at};
 use super::*;
 
 /// The same bounded range drives the preview and the committed fade.
@@ -95,7 +95,7 @@ pub(super) fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
                 && let Some(points) = t.lane(param).map(|l| l.points.as_slice())
                 && let Some(i) = points.iter().position(|pt| pt.at == *from)
             {
-                let lane = lane_rect(t, rect(*row), tl);
+                let lane = auto_lane_rect(t, param, rect(*row), tl);
                 let after = i.checked_sub(1).and_then(|j| points.get(j)).map_or(0, |pt| pt.at.saturating_add(1));
                 let before = points.get(i + 1).map_or(Samples::MAX, |pt| pt.at.saturating_sub(1));
                 let to = snap(&s, at).clamp(after, before.max(after));
@@ -112,17 +112,17 @@ pub(super) fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
                 }
             }
         }
-        Some(Gesture::Pencil { track, points }) => {
+        Some(Gesture::Pencil { track, points, param }) => {
             if let Some(t) = s.track(*track)
-                && let Some(param) = AutoParam::parse(&t.view)
+                && let Some(param) = param.as_ref()
                 && let Some((_, row)) = rows.iter().find(|(i, _)| *i == t.id.0)
             {
-                let lane = lane_rect(t, rect(*row), tl);
+                let lane = auto_lane_rect(t, param, rect(*row), tl);
                 let (lo, hi, _) = param.range();
                 let (lo, hi) = if matches!(param, AutoParam::Volume | AutoParam::SendLevel(_)) {
                     (-60.0, 12.0)
                 } else if matches!(param, AutoParam::Plugin { .. }) {
-                    plugin_range(t, &param)
+                    plugin_range(t, param)
                 } else {
                     (lo, hi)
                 };
@@ -182,12 +182,10 @@ fn finish_drag(app: &mut SoundApp, s: &Session, tl: Rect, p: Option<Pos2>) {
         Some(Gesture::TrimStart { clip, to, .. }) => trim_clip(app, clip, to, true),
         Some(Gesture::TrimEnd { clip, to, .. }) => trim_clip(app, clip, to, false),
         Some(Gesture::MidiClip { track, from, to }) => new_midi_clip(app, s, track, from, to),
-        Some(Gesture::Pencil { track, points }) => {
-            if let Some(param) = s.track(track).and_then(|t| AutoParam::parse(&t.view)) {
-                let pid = automation_id(&param);
-                for (a, v) in points {
-                    let _ = app.run("automation.set_point", json!({"track": track.0, "param": pid, "at": a, "value": v}));
-                }
+        Some(Gesture::Pencil { track, points, param: Some(param) }) => {
+            let pid = automation_id(&param);
+            for (a, v) in points {
+                let _ = app.run("automation.set_point", json!({"track": track.0, "param": pid, "at": a, "value": v}));
             }
         }
         Some(Gesture::ZoomBox { start }) => {

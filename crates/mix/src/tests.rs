@@ -24,6 +24,19 @@ fn synth_session(level_db: f32) -> Session {
 }
 
 #[test]
+fn automation_suspend_makes_playback_read_static_values() {
+    let mut s = Session::default();
+    let id = s.add_track(TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, Some("a"));
+    let t = s.track_mut(id).unwrap();
+    t.mixer.automation_mode = soundcraft_model::AutomationMode::Read;
+    t.mixer.volume_db = 0.0;
+    t.lane_mut(&AutoParam::Volume).set_point(0, -20.0);
+    assert!((crate::automation::volume_db_at(&s, s.track(id).unwrap(), 0) + 20.0).abs() < 1e-3);
+    s.edit.set_flag(soundcraft_model::AUTOMATION_SUSPEND, true);
+    assert_eq!(crate::automation::volume_db_at(&s, s.track(id).unwrap(), 0), 0.0);
+}
+
+#[test]
 fn delay_line_change_keeps_buffers_and_history() {
     // #889: a latency change must not reallocate or zero the delay line in the callback.
     let mut d = DelayLine::default();
