@@ -399,6 +399,9 @@ pub struct PtxRoute {
     pub output: Option<String>,
     /// The level (dB) of the output path: the track's fader.
     pub fader_db: Option<f32>,
+    /// The output path's two panners (left, right), -100 to 100: a mono track uses the first
+    /// (the second is 0), a stereo track's are -100 and 100 until moved.
+    pub pan: Option<(i32, i32)>,
     /// Each send's destination and level (dB), in send order.
     pub sends: Vec<(String, f32)>,
 }
@@ -521,6 +524,16 @@ fn bus_paths(b: &[u8]) -> Vec<PtxPath> {
         .collect()
 }
 
+/// The panners in a mixer path's level block (a u8, then i32s: level in tenths of a dB, two
+/// words that are 0 in sessions seen, the first panner, six words on, the second panner). A
+/// block with those two words set is a layout not understood: none.
+fn mixer_pan(level: &[u8]) -> Option<(i32, i32)> {
+    let word = |i: usize| level.get(1 + 4 * i..5 + 4 * i).map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+    let (left, right) = (word(3)?, word(10)?);
+    let sane = |v: i32| (-100..=100).contains(&v);
+    (word(1)? == 0 && word(2)? == 0 && sane(left) && sane(right)).then_some((left, right))
+}
+
 /// A track's routing: the destination (and level) of each of its mixer paths, and the input
 /// named after its blocks (`01`, a flag, u16 n, n u32s, 9 bytes, then the name).
 fn track_route(b: &[u8], track: usize, end: usize) -> PtxRoute {
@@ -529,13 +542,14 @@ fn track_route(b: &[u8], track: usize, end: usize) -> PtxRoute {
         let inner = children(b, m + 9, m_end);
         let dest = inner.iter().find(|c| c.2 == DESTINATION).and_then(|c| name_at(b, c.0 + 9 + 36)).map(|(n, _)| n).filter(|n| !n.is_empty())?;
         let tenths = inner.iter().find(|c| c.2 == LEVEL).and_then(|c| b.get(c.0 + 10..c.0 + 14)?.try_into().ok()).map_or(0, i32::from_le_bytes);
-        Some((dest, tenths as f32 / 10.0))
+        let pan = inner.iter().find(|c| c.2 == LEVEL).and_then(|c| mixer_pan(b.get(c.0 + 9..c.1)?));
+        Some((dest, tenths as f32 / 10.0, pan))
     });
-    let (output, fader_db) = match paths.next().flatten() {
-        Some((n, db)) => (Some(n), Some(db)),
-        None => (None, None),
+    let (output, fader_db, pan) = match paths.next().flatten() {
+        Some((n, db, pan)) => (Some(n), Some(db), pan),
+        None => (None, None, None),
     };
-    let sends = paths.flatten().collect();
+    let sends = paths.flatten().map(|(n, db, _)| (n, db)).collect();
     // The input follows the last mixer path; some tracks have two more bytes before it.
     let last = kids.iter().filter(|c| c.2 == MIXER_PATH).map(|c| c.1).max().unwrap_or(track + 9);
     let input = [last, last + 2].into_iter().find_map(|q| {
@@ -545,7 +559,7 @@ fn track_route(b: &[u8], track: usize, end: usize) -> PtxRoute {
         let n = usize::try_from(uint(b, q + 2, 2)?).ok().filter(|&n| n <= 64)?;
         name_at(b, q + 4 + 4 * n + 9).filter(|(_, e)| *e <= end).map(|(name, _)| name)
     });
-    PtxRoute { input: input.filter(|n| !n.is_empty()), output, fader_db, sends }
+    PtxRoute { input: input.filter(|n| !n.is_empty()), output, fader_db, pan, sends }
 }
 
 /// Each track's routing, in track order (the tracks that carry an insert container, as
@@ -866,6 +880,8 @@ fn place_routes(s: &mut Session, ptx: &Ptx, tracks: &HashMap<String, (TrackId, S
         if ids.is_empty() {
             continue;
         }
+        // A stereo track that came in as two mono tracks keeps its hard left and right.
+        let single = ids.len() == 1;
         let mut to = |n: &str| path_route(s, &ptx.paths, main.as_deref(), &mut busses, n);
         let output = route.output.as_deref().and_then(&mut to);
         let input = route.input.as_deref().and_then(&mut to).filter(|r| matches!(r, Route::Bus(_)));
@@ -889,10 +905,25 @@ fn place_routes(s: &mut Session, ptx: &Ptx, tracks: &HashMap<String, (TrackId, S
             if let Some(db) = route.fader_db {
                 t.mixer.volume_db = db.clamp(-144.0, 12.0);
             }
+            if let (Some(pan), true) = (route.pan, single) {
+                t.mixer.pan = pan_for(pan, t.mixer.pan.len());
+            }
             for (slot, send) in t.mixer.sends.iter_mut().zip(&sends) {
                 *slot = Some(send.clone());
             }
         }
+    }
+}
+
+/// SoundCraft panners (-1 to 1) for a track with `n` of them from Pro Tools' two panners. A
+/// mono Pro Tools track has only the first; a stereo one squeezed onto a mono track pans to the
+/// middle of its two.
+fn pan_for((left, right): (i32, i32), n: usize) -> Vec<f32> {
+    let unit = |v: i32| v as f32 / 100.0;
+    match (n, right) {
+        (1, 0) => vec![unit(left)],
+        (1, _) => vec![unit(left + right) / 2.0],
+        _ => vec![unit(left), unit(right)],
     }
 }
 
@@ -1326,6 +1357,31 @@ mod tests {
     }
 
     #[test]
+    fn mixer_path_panners_are_read() {
+        let mut level = vec![1u8];
+        let mut words = [0i32; 37];
+        words[3] = -100;
+        words[10] = 40;
+        for w in words {
+            level.extend_from_slice(&w.to_le_bytes());
+        }
+        assert_eq!(mixer_pan(&level), Some((-100, 40)));
+        words[1] = 1;
+        let odd: Vec<u8> = std::iter::once(1u8).chain(words.iter().flat_map(|w| w.to_le_bytes())).collect();
+        assert_eq!(mixer_pan(&odd), None, "unknown layout");
+        assert_eq!(mixer_pan(&level[..20]), None, "too short");
+    }
+
+    #[test]
+    fn panners_fit_the_track() {
+        assert_eq!(pan_for((-100, 0), 1), vec![-1.0]);
+        assert_eq!(pan_for((100, 0), 1), vec![1.0]);
+        assert_eq!(pan_for((-100, 100), 1), vec![0.0]);
+        assert_eq!(pan_for((-100, 100), 2), vec![-1.0, 1.0]);
+        assert_eq!(pan_for((-50, 50), 2), vec![-0.5, 0.5]);
+    }
+
+    #[test]
     fn busses_and_outputs_come_from_the_bus_list() {
         let mut list = path("A 1-2", 2, true, 1, None);
         list.extend(path("A 1", 1, false, 2, Some(1)));
@@ -1497,6 +1553,7 @@ mod tests {
             input: input.map(str::to_string),
             output: Some(output.to_string()),
             fader_db: None,
+            pan: None,
             sends: Vec::new(),
         };
         let ptx = Ptx {
