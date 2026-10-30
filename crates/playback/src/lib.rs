@@ -448,6 +448,7 @@ impl AudioState {
         let channels = channels.max(1);
         let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
         if !self.playing && !monitoring {
+            self.mix.flush_params(&self.session, self.pos);
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
                 m.main = StripMeter::default();

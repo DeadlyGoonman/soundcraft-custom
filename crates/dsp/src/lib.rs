@@ -201,6 +201,10 @@ pub trait Plugin: Send {
     fn param(&self, id: &str) -> Option<f32>;
     /// In-place processing of `channels` planar buffers each `frames` long.
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize);
+    /// Hands queued parameter changes to the plugin while nothing is processed (transport
+    /// stopped). Plugins whose editor mirrors the processor (Waves) show a host-set value, such
+    /// as an undo, only once it got there.
+    fn flush_params(&mut self) {}
     /// Processing latency in samples (for delay compensation).
     fn latency(&self) -> usize {
         0

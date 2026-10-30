@@ -212,6 +212,8 @@ struct PluginSlot {
     plugin: Box<dyn Plugin>,
     /// Last values pushed to the plugin, in the insert's parameter-map order.
     applied: Vec<f32>,
+    /// The parameter ids `applied` belongs to.
+    applied_keys: Vec<String>,
     failed: bool,
     /// Delta monitoring: the input of this block (preallocated) and the delay that lines it up
     /// with the plugin's latency before it is subtracted from the output.
@@ -262,6 +264,7 @@ impl PluginSlot {
             ch,
             plugin,
             applied: Vec::new(),
+            applied_keys: Vec::new(),
             failed: false,
             dry: vec![vec![0.0; max_block]; ch],
             dry_delay: DelayLine::default(),
@@ -653,6 +656,24 @@ impl MixEngine {
             self.sync(s);
             self.order = processing_order(s);
             self.synced = key;
+        }
+    }
+
+    /// While nothing renders (transport stopped), hands changed insert parameters to the
+    /// plugins, so a value set in the session (an undo) reaches the plugin and its editor.
+    pub fn flush_params(&mut self, s: &Session, pos: Samples) {
+        self.ensure_synced(s);
+        for t in s.tracks.iter().filter(|t| !t.inactive) {
+            let Some(strip) = self.strips.get_mut(&t.id) else { continue };
+            for (i, ins) in t.mixer.inserts.iter().enumerate() {
+                if let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i))
+                    && ins.active
+                    && !slot.failed
+                {
+                    apply_params(slot, ins, t, i, pos);
+                    slot.plugin.flush_params();
+                }
+            }
         }
     }
 
@@ -1824,8 +1845,17 @@ fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track
 
 /// Sends each stored param (as mapped by `value`) to the plugin when it changed since last time.
 fn apply_values(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, value: impl Fn(&str, f32) -> f32) {
-    if slot.applied.len() != ins.params.len() {
+    if slot.applied.len() != ins.params.len() || !slot.applied_keys.iter().eq(ins.params.keys()) {
+        // A value no longer stored (undoing the first edit of a parameter) goes back to the
+        // plugin's default; otherwise the plugin would keep the undone value.
+        let info = slot.plugin.info();
+        for k in slot.applied_keys.iter().filter(|k| !ins.params.contains_key(*k)) {
+            if let Some(p) = info.params.iter().find(|p| p.id == k.as_str()) {
+                slot.plugin.set_param(k, p.default);
+            }
+        }
         slot.applied = vec![f32::NAN; ins.params.len()];
+        slot.applied_keys = ins.params.keys().cloned().collect();
     }
     for ((k, v), last) in ins.params.iter().zip(slot.applied.iter_mut()) {
         let val = value(k, *v);

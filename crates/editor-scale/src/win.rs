@@ -539,11 +539,29 @@ impl State {
         POINT { x: origin.x + p.x, y: origin.y + p.y }
     }
 
+    /// Moves the source so the plugin pixel under a canvas point sits right under the real cursor,
+    /// and returns that screen point. Plugins that read `GetCursorPos` (most knob drags) then see
+    /// the same position as the posted message; otherwise a plain click looks like a small drag
+    /// and nudges the knob.
+    fn under_cursor(&self, client: POINT) -> POINT {
+        let p = map_to_native(client, self.canvas_size(), self.native);
+        let cursor = to_screen(self.canvas, client);
+        let origin = POINT { x: cursor.x - p.x, y: cursor.y - p.y };
+        let now = to_screen(self.source, POINT { x: 0, y: 0 });
+        if (now.x, now.y) != (origin.x, origin.y) {
+            // SAFETY: the source is a live window owned by this object.
+            unsafe {
+                let _ = SetWindowPos(self.source, None, origin.x, origin.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        cursor
+    }
+
     /// Mouse input: maps the point to the deepest child under it (or the captured one) and posts
     /// the message with child-client coordinates.
     fn forward_mouse(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) {
         let client = POINT { x: lparam_x(lp), y: lparam_y(lp) };
-        let screen = self.source_screen(client);
+        let screen = self.under_cursor(client);
         let is_down = matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN);
         let is_up = matches!(msg, WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP);
         let target = match self.drag {
