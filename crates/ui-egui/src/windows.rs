@@ -120,7 +120,8 @@ fn automation(app: &mut SoundApp, ctx: &egui::Context) {
             let on = app.engine.session().edit.automation_enabled(&kind);
             // Enabled parameters show red, as armed automation does.
             let mut v = on;
-            let text = egui::RichText::new(f).color(if on { crate::theme::Tokens::current().auto_write } else { crate::theme::Tokens::current().text_dim });
+            let text =
+                egui::RichText::new(f).color(if on { crate::theme::Tokens::current().auto_write } else { crate::theme::Tokens::current().text_dim });
             if crate::widgets::checkbox(ui, &mut v, text).changed() {
                 let _ = app.run("automation.enable", json!({"kind": kind, "enabled": v}));
             }

@@ -1830,8 +1830,8 @@ fn apply_params(s: &Session, slot: &mut PluginSlot, ins: &soundcraft_model::Inse
     let Ok(slot_u8) = u8::try_from(i) else {
         return apply_values(slot, ins, |_, v| v);
     };
-    let automated = reads(s, t)
-        && t.automation.iter().any(|l| matches!(&l.param, AutoParam::Plugin { slot, .. } if *slot == slot_u8) && !l.points.is_empty());
+    let automated =
+        reads(s, t) && t.automation.iter().any(|l| matches!(&l.param, AutoParam::Plugin { slot, .. } if *slot == slot_u8) && !l.points.is_empty());
     apply_values(slot, ins, |k, val| {
         if automated
             && let Some(l) = t.automation.iter().find(|l| matches!(&l.param, AutoParam::Plugin { slot, param } if *slot == slot_u8 && param == k))

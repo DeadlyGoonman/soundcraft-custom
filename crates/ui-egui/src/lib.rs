@@ -951,7 +951,8 @@ impl SoundApp {
             let now = std::time::Instant::now();
             self.editor_edit_at = Some(now);
             if let (true, Ok(slot8)) = (self.is_playing(), u8::try_from(slot))
-                && self.engine.session().track(t).is_some_and(|tr| plugin_write_due(tr.mixer.automation_mode, std::time::Duration::ZERO)) {
+                && self.engine.session().track(t).is_some_and(|tr| plugin_write_due(tr.mixer.automation_mode, std::time::Duration::ZERO))
+            {
                 self.plugin_touched.insert((t, slot8, param.clone()), (now, value));
             }
             let _ = self.engine.execute_merged("mix.insert_param", &json!({"track": t.0, "slot": slot, "param": param, "value": value}), &key);
@@ -1484,7 +1485,9 @@ impl SoundApp {
     /// A pan knob moved: during a Write/Touch/Latch pass the move is written to the pan lane.
     pub(crate) fn note_pan_edit(&mut self, track: TrackId, index: usize, value: f32) {
         let Ok(i) = u8::try_from(index) else { return };
-        if self.is_playing() && self.engine.session().track(track).is_some_and(|t| plugin_write_due(t.mixer.automation_mode, std::time::Duration::ZERO)) {
+        if self.is_playing()
+            && self.engine.session().track(track).is_some_and(|t| plugin_write_due(t.mixer.automation_mode, std::time::Duration::ZERO))
+        {
             self.pan_touched.insert((track, i), (std::time::Instant::now(), value));
         }
     }

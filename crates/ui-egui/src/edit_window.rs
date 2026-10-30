@@ -1321,7 +1321,14 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
         }
     }
     if h >= 58.0 {
-        let vresp = header_selector(ui, at(17.0, 39.0, 105.0, 17.0), ui.id().with(("view", id.0)), &AutoParam::parse(&track.view).map_or_else(|| view_label(&track.view), |p| lane_label(track, &p)), t.text, true);
+        let vresp = header_selector(
+            ui,
+            at(17.0, 39.0, 105.0, 17.0),
+            ui.id().with(("view", id.0)),
+            &AutoParam::parse(&track.view).map_or_else(|| view_label(&track.view), |p| lane_label(track, &p)),
+            t.text,
+            true,
+        );
         egui::Popup::menu(&vresp).show(|ui| view_menu(app, ui, track));
     }
     if h >= 76.0 {
@@ -2612,14 +2619,20 @@ fn gain_text_edit(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, tl
     let Some(label) = track.clips().iter().find(|c| c.id == id).and_then(|c| clip_gain_label(&s, tl, lane, c)) else { return };
     let r = Rect::from_min_size(label.min, vec2(label.width().max(64.0), label.height()));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
-    let edit = egui::TextEdit::singleline(&mut text).desired_width(r.width()).font(regular(9.5)).margin(vec2(3.0, 1.0)).id(egui::Id::new("clip_gain_edit_box"));
+    let edit = egui::TextEdit::singleline(&mut text)
+        .desired_width(r.width())
+        .font(regular(9.5))
+        .margin(vec2(3.0, 1.0))
+        .id(egui::Id::new("clip_gain_edit_box"));
     let resp = child.put(r, edit);
     if fresh {
         resp.request_focus();
         child.ctx().data_mut(|d| d.insert_temp::<ClipGainEdit>(clip_gain_edit_id(), (id, text.clone(), false)));
         // Select the old value so typing replaces it.
         if let Some(mut state) = egui::TextEdit::load_state(child.ctx(), resp.id) {
-            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()))));
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()))));
             state.store(child.ctx(), resp.id);
         }
         return;
@@ -2834,12 +2847,10 @@ fn finish_drag(app: &mut SoundApp, s: &Session, tl: Rect, p: Option<Pos2>) {
         Some(Gesture::TrimStart { clip, to, .. }) => trim_clip(app, clip, to, true),
         Some(Gesture::TrimEnd { clip, to, .. }) => trim_clip(app, clip, to, false),
         Some(Gesture::MidiClip { track, from, to }) => new_midi_clip(app, s, track, from, to),
-        Some(Gesture::Pencil { track, points, param }) => {
-            if let Some(param) = param {
-                let pid = automation_id(&param);
-                for (a, v) in points {
-                    let _ = app.run("automation.set_point", json!({"track": track.0, "param": pid, "at": a, "value": v}));
-                }
+        Some(Gesture::Pencil { track, points, param: Some(param) }) => {
+            let pid = automation_id(&param);
+            for (a, v) in points {
+                let _ = app.run("automation.set_point", json!({"track": track.0, "param": pid, "at": a, "value": v}));
             }
         }
         Some(Gesture::ZoomBox { start }) => {

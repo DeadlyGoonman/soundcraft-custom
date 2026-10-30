@@ -36,7 +36,15 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             enable
         ),
-        cmd!("automation.suspend", "Suspend Automation", [], None, "{on?: bool (default: toggle)} — playback ignores all automation lanes and nothing records", always, suspend),
+        cmd!(
+            "automation.suspend",
+            "Suspend Automation",
+            [],
+            None,
+            "{on?: bool (default: toggle)} — playback ignores all automation lanes and nothing records",
+            always,
+            suspend
+        ),
         cmd!("track.show_automated_lanes", "Show Lanes with Automation", ["Track"], None, "{tracks?}", has_selection, show_automated),
     ]
 }
@@ -44,7 +52,9 @@ pub fn specs() -> Vec<CommandSpec> {
 const KINDS: [&str; 7] = ["volume", "pan", "mute", "send_level", "send_pan", "send_mute", "plugin"];
 
 fn enable(e: &mut Engine, p: &Value) -> Result<Value> {
-    let kind = str_param(p, "kind").filter(|k| KINDS.contains(k)).ok_or_else(|| bad("automation.enable", format!("`kind` must be one of {}", KINDS.join(", "))))?;
+    let kind = str_param(p, "kind")
+        .filter(|k| KINDS.contains(k))
+        .ok_or_else(|| bad("automation.enable", format!("`kind` must be one of {}", KINDS.join(", "))))?;
     let ed = &mut e.session_mut().edit;
     let on = p.get("enabled").and_then(Value::as_bool).unwrap_or_else(|| !ed.automation_enabled(kind));
     ed.set_flag(&format!("automation.enable.{kind}.off"), !on);
