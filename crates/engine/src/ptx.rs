@@ -675,7 +675,8 @@ fn chunk_inserts(b: &[u8], active: &[String]) -> Vec<PtxInsert> {
             // exact, where the insert's plugin index isn't in older sessions.
             let by_ids = chunk.and_then(|c| c.get(8..20)).and_then(|ids| {
                 let key: Vec<u8> = ids.chunks(4).flat_map(|w| w.iter().rev().copied()).collect();
-                plugins.iter().find(|(_, p)| *p == key).map(|(n, _)| n.clone())
+                // Auto-Tune Live's chunk ids end `ATLv` where its list entry has `ZTat`: manufacturer and product still name it.
+                plugins.iter().find(|(_, p)| *p == key).or_else(|| plugins.iter().find(|(_, p)| p.get(..8) == key.get(..8))).map(|(n, _)| n.clone())
             });
             // Past Pro Tools' 56-byte chunk header (size, version, four ids, a 32-byte name) is the
             // plugin's own data, which is what its VST3 / CLAP version reads. Only kept when the
