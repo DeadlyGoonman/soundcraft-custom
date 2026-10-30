@@ -454,12 +454,6 @@ pub struct SoundApp {
     _palette_lock: theme::TestPaletteGuard,
 }
 
-/// Whether another automation-write pass is due: the transport moved at least
-/// `step` since `last` in either direction. `last == i64::MIN` marks "never
-/// written", so the first pass after (re)start is always due. Saturating
-/// arithmetic keeps restarts and loop wraps overflow-free: the previous
-/// `(pos - last).abs()` panicked in debug builds on the first playing frame,
-/// when `last` is still `i64::MIN`.
 /// How long after the last editor edit a plugin param still counts as held (Touch).
 const PLUGIN_RELEASE: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -474,6 +468,12 @@ fn plugin_write_due(mode: soundcraft_model::AutomationMode, since_edit: std::tim
     }
 }
 
+/// Whether another automation-write pass is due: the transport moved at least
+/// `step` since `last` in either direction. `last == i64::MIN` marks "never
+/// written", so the first pass after (re)start is always due. Saturating
+/// arithmetic keeps restarts and loop wraps overflow-free: the previous
+/// `(pos - last).abs()` panicked in debug builds on the first playing frame,
+/// when `last` is still `i64::MIN`.
 fn automation_step_due(pos: Samples, last: Samples, step: Samples) -> bool {
     last == i64::MIN || pos.saturating_sub(last) >= step || last.saturating_sub(pos) >= step
 }
