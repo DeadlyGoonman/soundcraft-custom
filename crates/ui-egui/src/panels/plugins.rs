@@ -159,8 +159,16 @@ fn eq_curve(ui: &mut Ui, id: &str, ins: &soundcraft_model::Insert) {
 }
 
 /// Folder for a plugin's user presets.
-fn preset_dir(app: &SoundApp, plugin: &str) -> Option<std::path::PathBuf> {
-    app.preset_dir.as_ref().map(|d| d.join(crate::preset_folder_name(plugin)))
+/// `<Presets>/<exact plugin name>`. Presets an older version kept in the folder named after the
+/// plugin id are copied there once (the old folder stays).
+fn preset_dir(app: &SoundApp, info: &soundcraft_dsp::PluginInfo) -> Option<std::path::PathBuf> {
+    let presets = app.preset_dir.as_ref()?;
+    let dir = crate::data_dirs::preset_folder(presets, info.name);
+    let legacy = presets.join(crate::legacy_preset_folder_name(info.id));
+    if legacy != dir && legacy.is_dir() && !dir.exists() {
+        let _ = crate::data_dirs::copy_missing(&legacy, &dir);
+    }
+    Some(dir)
 }
 
 /// Factory default plus user presets for a plugin insert; user presets need a desktop preset directory.
@@ -177,7 +185,7 @@ fn preset_menu(
         let _ = app.run("mix.insert_params", json!({"track": tid.0, "slot": slot, "params": defaults, "preset": "<factory default>"}));
         ui.close();
     }
-    let Some(dir) = preset_dir(app, info.id) else {
+    let Some(dir) = preset_dir(app, info) else {
         ui.label("User presets need the desktop app.");
         return;
     };

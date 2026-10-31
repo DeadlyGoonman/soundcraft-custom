@@ -26,6 +26,12 @@ pub struct Prefs {
     pub edit_views: Option<Vec<String>>,
     /// Show a short description when the pointer rests on an Appearance option.
     pub hover_hints: bool,
+    /// The SoundCraft data folder (see [`crate::data_dirs`]); empty means `Documents/Soundcraft`.
+    pub data_root: String,
+    #[serde(skip)]
+    pub root_edit: String,
+    #[serde(skip)]
+    pub root_status: String,
     #[serde(skip)]
     pub show: bool,
     #[serde(skip)]
@@ -40,6 +46,9 @@ impl Default for Prefs {
             bounce_folder: DEFAULT_BOUNCE_FOLDER.into(),
             edit_views: None,
             hover_hints: true,
+            data_root: String::new(),
+            root_edit: String::new(),
+            root_status: String::new(),
             show: false,
             page: Page::General,
         }
@@ -83,12 +92,11 @@ impl Page {
     }
 }
 
-/// `Documents/SoundCraft` in the user's home folder (empty in the browser, which has no folders).
+/// `Documents/Soundcraft/Projects` in the user's home folder (empty in the browser, which has no folders).
 pub fn platform_projects_dir() -> String {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into());
-        Path::new(&home).join("Documents").join("SoundCraft").to_string_lossy().into_owned()
+        crate::data_dirs::DataDirs::new(crate::data_dirs::default_root()).projects.to_string_lossy().into_owned()
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -259,6 +267,39 @@ fn open_button(app: &mut SoundApp, ui: &mut egui::Ui, label: &str, cmd: &str) {
     }
 }
 
+/// The SoundCraft data folder: a field and Browse… that move the folder (nothing is deleted).
+fn data_folder(app: &mut SoundApp, ui: &mut egui::Ui) {
+    ui.label("SoundCraft data folder");
+    let Some(dirs) = app.data_dirs.clone() else {
+        note(ui, "Not used here: the settings folder is set by portable mode or SOUNDCRAFT_CONFIG_DIR.");
+        return;
+    };
+    let mut edit = std::mem::take(&mut app.ui.preferences.root_edit);
+    if edit.is_empty() {
+        edit = dirs.root.to_string_lossy().into_owned();
+    }
+    crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(&mut edit).desired_width(420.0)), "SoundCraft data folder");
+    let mut apply = ui.button("Apply").clicked();
+    if let Some(pick) = &app.services.pick_folder
+        && ui.button("Browse…").clicked()
+        && let Some(dir) = pick(&dirs.root)
+    {
+        edit = dir.to_string_lossy().into_owned();
+        apply = true;
+    }
+    if apply {
+        app.ui.preferences.root_status = app.change_data_root(&edit).unwrap_or_else(|e| e);
+    }
+    app.ui.preferences.root_edit = edit;
+    note(
+        ui,
+        "Projects, Presets, Templates, Settings, Autosave, Cache and Logs live in this folder. Changing it copies presets, templates and settings over; nothing is deleted.",
+    );
+    if !app.ui.preferences.root_status.is_empty() {
+        note(ui, &app.ui.preferences.root_status);
+    }
+}
+
 fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
     match app.ui.preferences.page {
         Page::General => {
@@ -276,6 +317,9 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
             }
             crate::widgets::checkbox(ui, &mut prefs.project_subfolder, "Create a folder for each new project");
             note(ui, "A new project called “hello” is saved as <folder>/hello/hello.scraft. Save Session As can pick another folder each time.");
+            ui.add_space(10.0);
+            ui.separator();
+            data_folder(app, ui);
         }
         Page::Audio => {
             note(ui, "Audio device, buffer size and sample rate are set in the Playback Engine window.");

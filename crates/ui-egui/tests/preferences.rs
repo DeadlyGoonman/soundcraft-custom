@@ -83,7 +83,10 @@ fn project_defaults_persist_and_older_ui_json_loads() {
     assert!(!back.preferences.project_subfolder);
     let old: UiState = serde_json::from_value(json!({"theme": "dark"})).unwrap();
     assert!(old.preferences.project_subfolder);
-    assert!(old.preferences.default_projects_dir.ends_with("SoundCraft"));
+    assert!(
+        old.preferences.default_projects_dir.ends_with("Soundcraft/Projects")
+            || old.preferences.default_projects_dir.ends_with(r"Soundcraft\Projects")
+    );
 }
 
 #[test]

@@ -17,6 +17,8 @@ pub struct PluginScanner {
     pub cache: PluginCache,
     /// The settings folder holding the cache and preferences (`None`: nothing is saved).
     dir: Option<PathBuf>,
+    /// Where the scanner preferences are kept (`None`: [`dir`](Self::dir)).
+    settings_dir: Option<PathBuf>,
     list: ListFn,
     /// How files are probed (`None`: scanning is not available, e.g. tests and the web).
     probe: Option<ProbeFn>,
@@ -33,6 +35,7 @@ impl Default for PluginScanner {
             settings: ScanSettings::default(),
             cache: PluginCache::default(),
             dir: None,
+            settings_dir: None,
             list: Arc::new(list_candidates),
             probe: None,
             job: None,
@@ -58,9 +61,14 @@ impl PluginScanner {
 
     /// [`startup`](Self::startup) with another way to list plugin files (tests).
     pub fn startup_with(dir: Option<PathBuf>, list: ListFn, probe: Option<ProbeFn>) -> Self {
-        let settings = dir.as_deref().map(|d| ScanSettings::load(&d.join(SETTINGS_FILE))).unwrap_or_default();
+        Self::startup_in(dir.clone(), dir, list, probe)
+    }
+
+    /// [`startup_with`](Self::startup_with) with the cache in `dir` and the preferences in `settings_dir`.
+    pub fn startup_in(dir: Option<PathBuf>, settings_dir: Option<PathBuf>, list: ListFn, probe: Option<ProbeFn>) -> Self {
+        let settings = settings_dir.as_deref().map(|d| ScanSettings::load(&d.join(SETTINGS_FILE))).unwrap_or_default();
         let saved = dir.as_deref().and_then(|d| PluginCache::load(&d.join(CACHE_FILE)));
-        let mut s = Self { settings, dir, list, probe, ..Self::default() };
+        let mut s = Self { settings, dir, settings_dir, list, probe, ..Self::default() };
         match saved {
             Some(cache) => {
                 cache.apply_to_hosts();
@@ -148,7 +156,7 @@ impl PluginScanner {
     }
 
     fn save_settings(&self) {
-        if let Some(d) = &self.dir
+        if let Some(d) = self.settings_dir.as_ref().or(self.dir.as_ref())
             && let Err(e) = self.settings.save(&d.join(SETTINGS_FILE))
         {
             log::warn!("plugin scanner settings: {e}");

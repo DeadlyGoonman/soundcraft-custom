@@ -53,6 +53,8 @@ impl SoundApp {
             leftovers: Vec::new(),
             panic_rev: 0,
             preset_dir: None,
+            template_dir: None,
+            data_dirs: None,
             last_autosave: None,
             dialogs: dialogs::Dialogs::default(),
             meters: HashMap::new(),
