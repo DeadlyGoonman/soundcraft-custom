@@ -33,6 +33,34 @@ pub(crate) fn route_popup(app: &mut SoundApp, resp: &egui::Response, id: TrackId
 /// (the open recorder's channel count, else 8). A
 /// stereo track also gets the pairs (`In 1-2`, `In 3-4`, …) first, labelled with both names. The
 /// values are the routes the engine maps: `In N` is channel N, `In N-M` a stereo pair from N.
+/// The "new bus..." row of a bus menu. A click turns it into a name field that takes the keyboard
+/// in place. Enter returns the typed name (when unused); Escape or clicking away cancels.
+pub(super) fn new_bus_row(ui: &mut Ui, salt: egui::Id, taken: &[String]) -> Option<String> {
+    let key = salt.with("name");
+    let Some(mut text) = ui.data(|d| d.get_temp::<String>(key)) else {
+        if ui.button("new bus...").clicked() {
+            ui.data_mut(|d| d.insert_temp(key, String::new()));
+        }
+        return None;
+    };
+    let field = ui.add(egui::TextEdit::singleline(&mut text).hint_text("Bus name").desired_width(160.0));
+    let field = crate::widgets::named_text_field(field, "New bus name");
+    field.request_focus();
+    let name = text.trim().to_string();
+    let clash = taken.iter().any(|t| t.eq_ignore_ascii_case(&name));
+    if clash {
+        ui.label(egui::RichText::new("Name taken").small());
+    }
+    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    if escape || field.lost_focus() {
+        ui.data_mut(|d| d.remove::<String>(key));
+    } else {
+        ui.data_mut(|d| d.insert_temp(key, text));
+    }
+    (enter && !name.is_empty() && !clash).then_some(name)
+}
+
 fn input_entries(names: &[String], count: usize, stereo: bool) -> Vec<(String, String)> {
     let count = if names.is_empty() { count.max(1) } else { names.len() };
     let name = |n: usize| n.checked_sub(1).and_then(|i| names.get(i)).cloned();
@@ -92,8 +120,9 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
         let _ = app.run(cmd, json!({"track": id.0, key: visible[i]}));
         ui.close();
     }
-    if ui.button("new bus...").clicked() {
-        app.dialogs.open_new_bus(Some((cmd.to_string(), json!({"track": id.0}), key.to_string())));
+    if let Some(name) = new_bus_row(ui, egui::Id::unique(("route-new-bus", id.0, input)), &busses) {
+        let _ = app.run("mix.new_bus", json!({"name": name.clone()}));
+        let _ = app.run(cmd, json!({"track": id.0, key: name}));
         ui.close();
     }
 }

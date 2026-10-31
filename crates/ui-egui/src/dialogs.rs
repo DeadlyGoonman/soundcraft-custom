@@ -62,118 +62,31 @@ impl BounceMetadata {
 
 #[derive(Debug, Clone)]
 pub enum Dialog {
-    NewTracks {
-        count: u32,
-        format: String,
-        kind: String,
-        timebase: String,
-        name: String,
-    },
-    NewSession {
-        name: String,
-        sample_rate: u32,
-        demo: bool,
-    },
-    Bounce {
-        path: String,
-        format: String,
-        bit_depth: String,
-        bitrate: u32,
-        flac_level: u8,
-        normalize: bool,
-        dither: bool,
-        metadata: BounceMetadata,
-    },
-    RenameTrack {
-        id: TrackId,
-        name: String,
-    },
-    /// A bus name the user must type. `then` runs after the bus exists, with its name put under `key`.
-    NewBus {
-        name: String,
-        then: Option<(String, Value, String)>,
-    },
-    RenameClip {
-        id: ClipId,
-        name: String,
-    },
-    RenameMarker {
-        id: soundcraft_model::MarkerId,
-        name: String,
-    },
-    ClearClips {
-        clips: Vec<ClipId>,
-        sources: Vec<SourceId>,
-        message: String,
-    },
-    PathPrompt {
-        cmd: String,
-        title: String,
-        path: String,
-        key: String,
-    },
-    Number {
-        cmd: String,
-        title: String,
-        key: String,
-        value: f64,
-        suffix: String,
-    },
-    TempoChange {
-        at: Samples,
-        bpm: f64,
-    }, // from double-clicking the tempo ruler
+    NewTracks { count: u32, format: String, kind: String, timebase: String, name: String },
+    NewSession { name: String, sample_rate: u32, demo: bool },
+    Bounce { path: String, format: String, bit_depth: String, bitrate: u32, flac_level: u8, normalize: bool, dither: bool, metadata: BounceMetadata },
+    RenameTrack { id: TrackId, name: String },
+    RenameClip { id: ClipId, name: String },
+    RenameMarker { id: soundcraft_model::MarkerId, name: String },
+    ClearClips { clips: Vec<ClipId>, sources: Vec<SourceId>, message: String },
+    PathPrompt { cmd: String, title: String, path: String, key: String },
+    Number { cmd: String, title: String, key: String, value: f64, suffix: String },
+    TempoChange { at: Samples, bpm: f64 }, // from double-clicking the tempo ruler
     Spot(crate::spot::Spot),
-    Fades {
-        shape: String,
-    },
-    StripSilence {
-        threshold: f64,
-        min_ms: f64,
-        pre_ms: f64,
-        post_ms: f64,
-    },
+    Fades { shape: String },
+    StripSilence { threshold: f64, min_ms: f64, pre_ms: f64, post_ms: f64 },
     // Strip Silence › Rename: `strip` holds the Strip Silence values to return to.
-    StripSilenceRename {
-        strip: [f64; 4],
-        names: StripNames,
-    },
+    StripSilenceRename { strip: [f64; 4], names: StripNames },
     // Clip List › Auto Rename: the names that editing gives the clips it separates from `clips`.
-    AutoRename {
-        clips: Vec<ClipId>,
-        names: StripNames,
-    },
+    AutoRename { clips: Vec<ClipId>, names: StripNames },
     // `id: None` creates (Track › Group…); `id: Some` modifies that group (Groups list › Modify Group…).
-    Group {
-        id: Option<GroupId>,
-        name: String,
-        edit: bool,
-        mix: bool,
-        members: Vec<(u64, String, bool)>,
-    },
-    Session {
-        frame_rate: String,
-        bit_depth: String,
-    },
+    Group { id: Option<GroupId>, name: String, edit: bool, mix: bool, members: Vec<(u64, String, bool)> },
+    Session { frame_rate: String, bit_depth: String },
     // Clip › Loop…: `length` is typed in `format`, measured from `start` (the first selected clip's).
     // `filled` is the text the field opened with and the exact length it stands for.
-    Loop {
-        by: LoopBy,
-        count: u32,
-        length: String,
-        format: soundcraft_time::TimeFormat,
-        start: Samples,
-        filled: (String, Samples),
-    },
-    ScoreSetup {
-        title: String,
-        composer: String,
-        bars_per_system: u32,
-        show_track_names: bool,
-    },
-    SaveChanges {
-        then: (String, Value),
-    },
+    Loop { by: LoopBy, count: u32, length: String, format: soundcraft_time::TimeFormat, start: Samples, filled: (String, Samples) },
+    ScoreSetup { title: String, composer: String, bars_per_system: u32, show_track_names: bool },
+    SaveChanges { then: (String, Value) },
 }
 
 /// The Clip Looping dialog's choice of how far a clip is looped.
@@ -194,8 +107,6 @@ pub struct Dialogs {
     after_save: Option<(String, Value)>,
     /// A session the browser read while the open one had changes, waiting for `SaveChanges`.
     pending_session: Option<(String, Vec<u8>)>,
-    /// Follow-up for a bus created by `NewBus`: run after `mix.new_bus` succeeds.
-    bus_then: Option<(String, Value, String)>,
     /// Where Save Session As starts (Setup › Preferences…), and the open project save prompt's fields.
     pub project_defaults: crate::preferences::ProjectDefaults,
     pub project: Option<crate::preferences::ProjectSave>,
@@ -206,18 +117,12 @@ pub struct Dialogs {
 }
 
 impl Dialogs {
-    /// Ask for a bus name before creating it; `then` (command, params, key) runs once it exists.
-    pub fn open_new_bus(&mut self, then: Option<(String, Value, String)>) {
-        self.open = Some(Dialog::NewBus { name: String::new(), then });
-    }
-
     pub fn open_name(&self) -> Option<&'static str> {
         self.open.as_ref().map(|d| match d {
             Dialog::NewTracks { .. } => "new_tracks",
             Dialog::NewSession { .. } => "new_session",
             Dialog::Bounce { .. } => "bounce",
             Dialog::RenameTrack { .. } => "rename_track",
-            Dialog::NewBus { .. } => "new_bus",
             Dialog::RenameClip { .. } => "rename_clip",
             Dialog::RenameMarker { .. } => "rename_marker",
             Dialog::ClearClips { .. } => "clear_clips",
@@ -978,7 +883,6 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         Dialog::NewSession { .. } => "New Session",
         Dialog::Bounce { .. } => "Bounce Mix",
         Dialog::RenameTrack { .. } => "Rename Track",
-        Dialog::NewBus { .. } => "New Bus",
         Dialog::RenameClip { .. } => "Rename Clip",
         Dialog::RenameMarker { .. } => "Rename Marker",
         Dialog::ClearClips { .. } => "Clear",
@@ -1033,18 +937,6 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     let form = BounceForm { path, format, bit_depth, bitrate, flac_level, normalize, dither, metadata };
                     if bounce_form(app, ui, form, enter) {
                         keep = false;
-                    }
-                }
-                Dialog::NewBus { name, then } => {
-                    name_field(ui, name);
-                    let trimmed = name.trim();
-                    let taken = app.engine.session().busses.iter().any(|b| b.name.eq_ignore_ascii_case(trimmed));
-                    if taken {
-                        ui.label("A bus with this name already exists.");
-                    }
-                    if buttons_enabled(ui, "OK", enter, !trimmed.is_empty() && !taken) {
-                        app.dialogs.bus_then = then.clone();
-                        action = Some(("mix.new_bus".into(), json!({"name": trimmed})));
                     }
                 }
                 Dialog::RenameTrack { id, name } => {
@@ -1298,18 +1190,11 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
             // Decoded in the background so a long file doesn't freeze the app (#597).
             crate::import::start(app, params);
         } else {
-            let bus_name = params["name"].clone();
-            let bus_then = if cmd == "mix.new_bus" { app.dialogs.bus_then.take() } else { None };
             match run_then(app, &cmd, params) {
                 Ok(v) if cmd == "file.export_clips" => {
                     app.ui.status = format!("Exported {} clip(s) to {}", v["written"], v["dir"].as_str().unwrap_or_default());
                 }
-                Ok(_) => {
-                    if let Some((follow, mut follow_params, key)) = bus_then {
-                        follow_params[key.as_str()] = bus_name;
-                        let _ = run_then(app, &follow, follow_params);
-                    }
-                }
+                Ok(_) => {}
                 Err(e) => app.ui.status = e,
             }
         }

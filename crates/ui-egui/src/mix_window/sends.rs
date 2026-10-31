@@ -351,7 +351,7 @@ fn send_level_scale(ui: &mut Ui, db: f32) {
 
 /// What the send menu's footer was used for.
 enum SendFooter {
-    NewBus,
+    NewBus(String),
     RemoveSend,
 }
 
@@ -360,6 +360,7 @@ enum SendFooter {
 /// `current` is the send's destination and its name, if the slot has a send.
 fn send_route_menu(app: &mut SoundApp, ui: &Ui, field: &egui::Response, id: TrackId, slot: usize, current: Option<(Route, String)>) {
     let busses = app.engine.session().busses.clone();
+    let bus_names: Vec<String> = busses.iter().map(|b| b.name.clone()).collect();
     let which = (b'A' + slot as u8) as char;
     let has_send = current.is_some();
     let header = |ui: &mut Ui| {
@@ -400,9 +401,9 @@ fn send_route_menu(app: &mut SoundApp, ui: &Ui, field: &egui::Response, id: Trac
             })
         },
         |ui| {
-            if ui.button("new bus...").clicked() {
+            if let Some(name) = super::routing::new_bus_row(ui, egui::Id::unique(("send-new-bus", id.0, slot)), &bus_names) {
                 ui.close();
-                return Some(SendFooter::NewBus);
+                return Some(SendFooter::NewBus(name));
             }
             if has_send && ui.button("Remove send").clicked() {
                 ui.close();
@@ -416,8 +417,10 @@ fn send_route_menu(app: &mut SoundApp, ui: &Ui, field: &egui::Response, id: Trac
         let _ = app.run("mix.send", json!({"track": id.0, "slot": slot, "bus": bus}));
     }
     match footer {
-        Some(SendFooter::NewBus) => {
-            app.dialogs.open_new_bus(Some(("mix.send".into(), json!({"track": id.0, "slot": slot}), "bus".into())));
+        Some(SendFooter::NewBus(name)) => {
+            if app.run("mix.new_bus", json!({"name": name.clone()})).is_ok() {
+                let _ = app.run("mix.send", json!({"track": id.0, "slot": slot, "bus": name}));
+            }
         }
         Some(SendFooter::RemoveSend) => {
             let _ = app.run("mix.send_remove", json!({"track": id.0, "slot": slot}));
