@@ -1507,10 +1507,41 @@ fn send_route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, cu
         ui.close();
     }
     ui.separator();
-    if ui.button("new bus...").clicked() {
-        app.dialogs.open_new_bus(Some(("mix.send".into(), json!({"track": id.0, "slot": slot}), "bus".into())));
+    let bus_names: Vec<String> = busses.iter().map(|b| b.name.clone()).collect();
+    if let Some(name) = new_bus_row(ui, egui::Id::new(("send-new-bus", id.0, slot)), &bus_names) {
+        if app.run("mix.new_bus", json!({"name": name.clone()})).is_ok() {
+            let _ = app.run("mix.send", json!({"track": id.0, "slot": slot, "bus": name}));
+        }
         ui.close();
     }
+}
+
+/// The "new bus..." row of a bus menu. A click turns it into a name field that takes the keyboard
+/// in place. Enter returns the typed name (when unused); Escape or clicking away cancels.
+fn new_bus_row(ui: &mut Ui, salt: egui::Id, taken: &[String]) -> Option<String> {
+    let key = salt.with("name");
+    let Some(mut text) = ui.data(|d| d.get_temp::<String>(key)) else {
+        if ui.button("new bus...").clicked() {
+            ui.data_mut(|d| d.insert_temp(key, String::new()));
+        }
+        return None;
+    };
+    let field = ui.add(egui::TextEdit::singleline(&mut text).hint_text("Bus name").desired_width(160.0));
+    field.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "New bus name"));
+    field.request_focus();
+    let name = text.trim().to_string();
+    let clash = taken.iter().any(|t| t.eq_ignore_ascii_case(&name));
+    if clash {
+        ui.label(egui::RichText::new("Name taken").small());
+    }
+    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    if escape || field.lost_focus() {
+        ui.data_mut(|d| d.remove::<String>(key));
+    } else {
+        ui.data_mut(|d| d.insert_temp(key, text));
+    }
+    (enter && !name.is_empty() && !clash).then_some(name)
 }
 
 /// The input choices for a track: `(label, route value)`. With the interface's channel `names`, each
@@ -1577,8 +1608,9 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
         let _ = app.run(cmd, json!({"track": id.0, key: visible[i]}));
         ui.close();
     }
-    if ui.button("new bus...").clicked() {
-        app.dialogs.open_new_bus(Some((cmd.to_string(), json!({"track": id.0}), key.to_string())));
+    if let Some(name) = new_bus_row(ui, egui::Id::new(("route-new-bus", id.0, input)), &busses) {
+        let _ = app.run("mix.new_bus", json!({"name": name.clone()}));
+        let _ = app.run(cmd, json!({"track": id.0, key: name}));
         ui.close();
     }
 }
