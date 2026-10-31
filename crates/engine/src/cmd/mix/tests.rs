@@ -249,6 +249,24 @@ fn copy_to_send_rejects_an_invalid_send_slot() {
 }
 
 #[test]
+fn a_new_bus_and_its_send_undo_as_one_step() {
+    let mut e = Engine::default();
+    e.execute("track.new", &json!({"count": 1, "name": "Gtr", "format": "mono"})).unwrap();
+    let send_set = |e: &Engine| e.session().tracks[0].mixer.sends[0].is_some();
+    e.execute_as_one_step(&[("mix.new_bus", json!({"name": "Verb"})), ("mix.send", json!({"track": "Gtr", "slot": 0, "bus": "Verb"}))]).unwrap();
+    assert!(e.session().bus_by_name("Verb").is_some() && send_set(&e));
+    // A later edit undoes first and leaves the bus alone.
+    e.execute("mix.volume", &json!({"track": "Gtr", "db": -6.0})).unwrap();
+    assert!(e.undo());
+    assert!(e.session().bus_by_name("Verb").is_some() && send_set(&e), "only the volume undid");
+    // The next undo removes the bus and its send together.
+    assert!(e.undo());
+    assert!(e.session().bus_by_name("Verb").is_none(), "undo deletes the bus");
+    assert!(!send_set(&e), "undo clears the send");
+    assert!(e.session().tracks[0].mixer.sends[0].is_none());
+}
+
+#[test]
 fn retargeting_a_send_keeps_its_settings() {
     let mut e = Engine::default();
     e.execute("track.new", &json!({"count": 1, "name": "Gtr", "format": "mono"})).unwrap();
