@@ -1263,7 +1263,28 @@ fn send_window_contents(app: &mut SoundApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             ui.set_width(150.0);
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new(route_name(app, &send.target)).color(t.counter_text));
+                if let Route::Bus(bus) = send.target
+                    && let Some(old) = app.engine.session().bus(bus).map(|b| b.name.clone())
+                {
+                    // The bus's own name: Enter or leaving the field renames it everywhere (I/O setup too).
+                    let key = egui::Id::new(("send_bus_name", bus));
+                    let mut edit: String = ui.data(|d| d.get_temp(key)).unwrap_or_else(|| old.clone());
+                    let r = ui.add(egui::TextEdit::singleline(&mut edit).desired_width(140.0));
+                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, format!("Bus name: {old}")));
+                    if r.lost_focus() {
+                        ui.data_mut(|d| d.remove::<String>(key));
+                        let new = edit.trim();
+                        if !new.is_empty() && new != old {
+                            let _ = app.run("setup.io", json!({"action": "rename_bus", "name": old, "new_name": new}));
+                        }
+                    } else if r.has_focus() {
+                        ui.data_mut(|d| d.insert_temp(key, edit));
+                    } else {
+                        ui.data_mut(|d| d.remove::<String>(key));
+                    }
+                } else {
+                    ui.label(egui::RichText::new(route_name(app, &send.target)).color(t.counter_text));
+                }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     ui.add_space(((ui.available_width() - 62.0) / 2.0).max(0.0));
@@ -1487,15 +1508,7 @@ fn send_route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, cu
     }
     ui.separator();
     if ui.button("new bus...").clicked() {
-        let mut n = busses.len() + 1;
-        while busses.iter().any(|bus| bus.name.eq_ignore_ascii_case(&format!("Bus {n}")))
-            || app.engine.session().track_by_name(&format!("Bus {n}")).is_some()
-        {
-            n += 1;
-        }
-        if app.run("mix.new_bus", json!({"name": format!("Bus {n}")})).is_ok() {
-            let _ = app.run("mix.send", json!({"track": id.0, "slot": slot, "bus": format!("Bus {n}")}));
-        }
+        app.dialogs.open_new_bus(Some(("mix.send".into(), json!({"track": id.0, "slot": slot}), "bus".into())));
         ui.close();
     }
 }
@@ -1565,11 +1578,7 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
         ui.close();
     }
     if ui.button("new bus...").clicked() {
-        let mut n = busses.len() + 1;
-        while busses.contains(&format!("Bus {n}")) || app.engine.session().track_by_name(&format!("Bus {n}")).is_some() {
-            n += 1;
-        }
-        let _ = app.run(cmd, json!({"track": id.0, key: format!("Bus {n}")}));
+        app.dialogs.open_new_bus(Some((cmd.to_string(), json!({"track": id.0}), key.to_string())));
         ui.close();
     }
 }

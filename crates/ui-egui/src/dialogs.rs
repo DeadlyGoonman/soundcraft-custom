@@ -47,6 +47,8 @@ pub enum Dialog {
     NewSession { name: String, sample_rate: u32, demo: bool },
     Bounce { path: String, format: String, bit_depth: String, bitrate: u32, flac_level: u8, normalize: bool, metadata: BounceMetadata },
     RenameTrack { id: TrackId, name: String },
+    /// A bus name the user must type. `then` runs after the bus exists, with its name put under `key`.
+    NewBus { name: String, then: Option<(String, Value, String)> },
     RenameClip { id: ClipId, name: String },
     RenameMarker { id: soundcraft_model::MarkerId, name: String },
     ClearClips { clips: Vec<ClipId>, sources: Vec<SourceId>, message: String },
@@ -70,18 +72,26 @@ pub struct Dialogs {
     after_save: Option<(String, Value)>,
     /// A session the browser read while the open one had changes, waiting for `SaveChanges`.
     pending_session: Option<(String, Vec<u8>)>,
+    /// Follow-up for a bus created by `NewBus`: run after `mix.new_bus` succeeds.
+    bus_then: Option<(String, Value, String)>,
     /// Where Save Session As starts (Setup › Preferences…), and the open project save prompt's fields.
     pub project_defaults: crate::preferences::ProjectDefaults,
     pub project: Option<crate::preferences::ProjectSave>,
 }
 
 impl Dialogs {
+    /// Ask for a bus name before creating it; `then` (command, params, key) runs once it exists.
+    pub fn open_new_bus(&mut self, then: Option<(String, Value, String)>) {
+        self.open = Some(Dialog::NewBus { name: String::new(), then });
+    }
+
     pub fn open_name(&self) -> Option<&'static str> {
         self.open.as_ref().map(|d| match d {
             Dialog::NewTracks { .. } => "new_tracks",
             Dialog::NewSession { .. } => "new_session",
             Dialog::Bounce { .. } => "bounce",
             Dialog::RenameTrack { .. } => "rename_track",
+            Dialog::NewBus { .. } => "new_bus",
             Dialog::RenameClip { .. } => "rename_clip",
             Dialog::RenameMarker { .. } => "rename_marker",
             Dialog::ClearClips { .. } => "clear_clips",
@@ -616,6 +626,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         Dialog::NewSession { .. } => "New Session",
         Dialog::Bounce { .. } => "Bounce Mix",
         Dialog::RenameTrack { .. } => "Rename Track",
+        Dialog::NewBus { .. } => "New Bus",
         Dialog::RenameClip { .. } => "Rename Clip",
         Dialog::RenameMarker { .. } => "Rename Marker",
         Dialog::ClearClips { .. } => "Clear",
@@ -792,6 +803,18 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         }
                         crate::bounce::start(app, &params);
                         keep = false;
+                    }
+                }
+                Dialog::NewBus { name, then } => {
+                    name_field(ui, name);
+                    let trimmed = name.trim();
+                    let taken = app.engine.session().busses.iter().any(|b| b.name.eq_ignore_ascii_case(trimmed));
+                    if taken {
+                        ui.label("A bus with this name already exists.");
+                    }
+                    if buttons_enabled(ui, "OK", enter, !trimmed.is_empty() && !taken) {
+                        app.dialogs.bus_then = then.clone();
+                        action = Some(("mix.new_bus".into(), json!({"name": trimmed})));
                     }
                 }
                 Dialog::RenameTrack { id, name } => {
@@ -1039,11 +1062,18 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     let saving = action.as_ref().is_some_and(|(cmd, _)| cmd.starts_with("session.save"));
     if let Some((cmd, params)) = action {
         keep = false;
+        let bus_name = params["name"].clone();
+        let bus_then = if cmd == "mix.new_bus" { app.dialogs.bus_then.take() } else { None };
         match run_then(app, &cmd, params) {
             Ok(v) if cmd == "file.export_clips" => {
                 app.ui.status = format!("Exported {} clip(s) to {}", v["written"], v["dir"].as_str().unwrap_or_default());
             }
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some((follow, mut follow_params, key)) = bus_then {
+                    follow_params[key.as_str()] = bus_name;
+                    let _ = run_then(app, &follow, follow_params);
+                }
+            }
             Err(e) => app.ui.status = e,
         }
     }
