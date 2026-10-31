@@ -1509,9 +1509,10 @@ fn send_route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, cu
     ui.separator();
     let bus_names: Vec<String> = busses.iter().map(|b| b.name.clone()).collect();
     if let Some(name) = new_bus_row(ui, egui::Id::new(("send-new-bus", id.0, slot)), &bus_names) {
-        if app.run("mix.new_bus", json!({"name": name.clone()})).is_ok() {
-            let _ = app.run("mix.send", json!({"track": id.0, "slot": slot, "bus": name}));
-        }
+        let _ = app.engine.execute_as_one_step(&[
+            ("mix.new_bus", json!({"name": name.clone()})),
+            ("mix.send", json!({"track": id.0, "slot": slot, "bus": name})),
+        ]);
         ui.close();
     }
 }
@@ -1613,8 +1614,7 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
         ui.close();
     }
     if let Some(name) = new_bus_row(ui, egui::Id::new(("route-new-bus", id.0, input)), &busses) {
-        let _ = app.run("mix.new_bus", json!({"name": name.clone()}));
-        let _ = app.run(cmd, json!({"track": id.0, key: name}));
+        let _ = app.engine.execute_as_one_step(&[("mix.new_bus", json!({"name": name.clone()})), (cmd, json!({"track": id.0, key: name}))]);
         ui.close();
     }
 }

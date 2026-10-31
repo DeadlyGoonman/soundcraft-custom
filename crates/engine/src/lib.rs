@@ -423,6 +423,21 @@ impl Engine {
         }
     }
 
+    /// Runs `steps` as one undo step: the first pushes it and the rest join it, so one undo reverts
+    /// them all. Stops at the first failing step; the steps before it stay applied.
+    pub fn execute_as_one_step(&mut self, steps: &[(&str, Value)]) -> Result<()> {
+        let key = format!("one-step:{}", self.revision);
+        let mut result = Ok(());
+        for (id, params) in steps {
+            if let Err(e) = self.execute_merged(id, params, &key) {
+                result = Err(e);
+                break;
+            }
+        }
+        self.end_merge();
+        result
+    }
+
     /// End a gesture started with `execute_merged`.
     pub fn end_merge(&mut self) {
         self.merge_key = None;
