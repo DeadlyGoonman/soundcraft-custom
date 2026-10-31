@@ -45,15 +45,19 @@ pub(super) fn new_bus_row(ui: &mut Ui, salt: egui::Id, taken: &[String]) -> Opti
     };
     let field = ui.add(egui::TextEdit::singleline(&mut text).hint_text("Bus name").desired_width(160.0));
     let field = crate::widgets::named_text_field(field, "New bus name");
-    field.request_focus();
+    // Read before `request_focus`: re-grabbing focus clears `lost_focus()`, which Enter sets.
+    let lost_focus = field.lost_focus();
+    if !lost_focus {
+        field.request_focus();
+    }
     let name = text.trim().to_string();
     let clash = taken.iter().any(|t| t.eq_ignore_ascii_case(&name));
     if clash {
         ui.label(egui::RichText::new("Name taken").small());
     }
     let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-    if escape || field.lost_focus() {
+    let enter = lost_focus && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    if escape || lost_focus {
         ui.data_mut(|d| d.remove::<String>(key));
     } else {
         ui.data_mut(|d| d.insert_temp(key, text));

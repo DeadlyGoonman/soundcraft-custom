@@ -483,4 +483,41 @@ mod tests {
         assert_eq!(field(&h), search, "the search field stays put");
         assert!((footer(&h).top() - full.top()).abs() < 1.0, "cleared, the footer is back under the full list: {:?} vs {full:?}", footer(&h));
     }
+
+    /// "new bus..." turns into a name field; typing a name and pressing Enter creates the bus and
+    /// puts the send on it.
+    #[test]
+    fn enter_in_the_new_bus_field_creates_the_bus_and_sends_to_it() {
+        let app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+        let kick = app.engine.session().track_by_name("Kick").unwrap().id;
+        let _palette = crate::theme::lock_test_palette();
+        let mut ready = false;
+        let mut h = Harness::builder().with_size(vec2(600.0, 800.0)).build_ui_state(
+            move |ui, (app, kick): &mut (SoundApp, TrackId)| {
+                if !ready {
+                    crate::fonts::install(ui.ctx(), true);
+                    crate::theme::apply(ui.ctx(), false);
+                    ready = true;
+                    return;
+                }
+                let track = app.engine.session().track(*kick).cloned().unwrap();
+                let r = Rect::from_min_size(ui.max_rect().min + vec2(20.0, 20.0), vec2(120.0, 24.0));
+                send_slot(app, ui, &track, 0, r);
+            },
+            (app, kick),
+        );
+        h.run();
+        h.get_by_label("Send A for Kick").click();
+        h.run();
+        h.get_by_label("new bus...").click();
+        h.run();
+        h.get_by_label("New bus name").type_text("Reverb");
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let session = h.state().0.engine.session();
+        assert!(session.busses.iter().any(|b| b.name == "Reverb"), "Enter creates the bus");
+        let send = session.track(kick).and_then(|t| t.mixer.sends[0].as_ref());
+        assert!(send.is_some(), "and the send points at it");
+    }
 }
