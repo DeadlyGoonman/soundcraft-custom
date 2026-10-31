@@ -96,7 +96,30 @@ fn send_window_contents(app: &mut SoundApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             ui.set_width(150.0);
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new(route_name(app, &send.target)).color(t.counter_text));
+                if let Route::Bus(bus) = send.target
+                    && let Some(old) = app.engine.session().bus(bus).map(|b| b.name.clone())
+                {
+                    // The bus's own name: Enter or leaving the field renames it everywhere (I/O setup too).
+                    let key = egui::Id::unique(("send_bus_name", bus));
+                    let mut edit: String = ui.data(|d| d.get_temp(key)).unwrap_or_else(|| old.clone());
+                    let r = crate::widgets::named_text_field(
+                        ui.add(egui::TextEdit::singleline(&mut edit).desired_width(140.0)),
+                        &format!("Bus name: {old}"),
+                    );
+                    if r.lost_focus() {
+                        ui.data_mut(|d| d.remove::<String>(key));
+                        let new = edit.trim();
+                        if !new.is_empty() && new != old {
+                            let _ = app.run("setup.io", json!({"action": "rename_bus", "name": old, "new_name": new}));
+                        }
+                    } else if r.has_focus() {
+                        ui.data_mut(|d| d.insert_temp(key, edit));
+                    } else {
+                        ui.data_mut(|d| d.remove::<String>(key));
+                    }
+                } else {
+                    ui.label(egui::RichText::new(route_name(app, &send.target)).color(t.counter_text));
+                }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     ui.add_space(((ui.available_width() - 62.0) / 2.0).max(0.0));
