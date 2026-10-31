@@ -324,6 +324,10 @@ fn main() -> eframe::Result {
                 app.extra.update = soundcraft_ui_egui::extra_windows::update::UpdateChecker::start();
             }
             app.ui = prefs;
+            // The Untitled session the app opens with starts with the saved Edit window views.
+            if files.is_empty() && !demo {
+                app.apply_saved_edit_views();
+            }
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
                 app = app.with_control(rx);

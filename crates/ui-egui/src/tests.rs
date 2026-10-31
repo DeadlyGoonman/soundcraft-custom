@@ -1672,3 +1672,16 @@ fn edit_views_are_remembered_for_new_sessions() {
     assert!(edit.flag("edit_view.sends_ae") && edit.flag("edit_view.inserts_ae") && edit.flag("edit_view.io"));
     assert!(!edit.flag("edit_view.comments"));
 }
+
+#[test]
+fn saved_default_views_replace_the_fresh_sessions_views() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    app.run("view.edit_comments", json!({})).unwrap();
+    app.remember_edit_views();
+    // A fresh session that already shows another view: the saved default wins.
+    app.engine.session_mut().edit.set_flag("edit_view.io", true);
+    app.apply_saved_edit_views();
+    let flags = &app.engine.session().edit.flags;
+    assert!(flags.contains("edit_view.comments"));
+    assert!(!flags.contains("edit_view.io"));
+}

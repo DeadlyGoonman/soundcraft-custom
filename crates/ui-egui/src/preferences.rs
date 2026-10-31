@@ -184,10 +184,15 @@ impl SoundApp {
         }
     }
 
-    /// Turns on the saved default views in the current (fresh) session.
-    pub(crate) fn apply_saved_edit_views(&mut self) {
+    /// Sets the Edit window views of the current (fresh) session to the saved defaults. Also run
+    /// at startup, for the Untitled session the app opens with.
+    pub fn apply_saved_edit_views(&mut self) {
         let Some(saved) = self.ui.preferences.edit_views.clone() else { return };
         let edit = &mut self.engine.session_mut().edit;
+        let on: Vec<String> = edit.flags.iter().filter(|f| f.starts_with(VIEW_PREFIX)).cloned().collect();
+        for f in on.iter().filter(|f| !saved.contains(f)) {
+            edit.set_flag(f, false);
+        }
         for f in saved.iter().filter(|f| f.starts_with(VIEW_PREFIX)) {
             edit.set_flag(f, true);
         }
