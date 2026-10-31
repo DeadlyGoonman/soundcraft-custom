@@ -24,6 +24,8 @@ pub struct Prefs {
     /// The Edit window views (`edit_view.*` flags) last switched on; new sessions and imports start
     /// with them. `None` until a view is first changed.
     pub edit_views: Option<Vec<String>>,
+    /// Show a short description when the pointer rests on an Appearance option.
+    pub hover_hints: bool,
     #[serde(skip)]
     pub show: bool,
     #[serde(skip)]
@@ -37,6 +39,7 @@ impl Default for Prefs {
             project_subfolder: true,
             bounce_folder: DEFAULT_BOUNCE_FOLDER.into(),
             edit_views: None,
+            hover_hints: true,
             show: false,
             page: Page::General,
         }
@@ -327,6 +330,9 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
                 ui.end_row();
                 ui.label("Interface scale");
                 ui.add(egui::Slider::new(&mut app.extra.ui_scale, 0.75..=1.5).step_by(0.05).custom_formatter(|v, _| format!("{:.0} %", v * 100.0)));
+                ui.end_row();
+                ui.label("Hover descriptions");
+                crate::widgets::checkbox(ui, &mut app.ui.preferences.hover_hints, "Show what each option does");
                 ui.end_row();
             });
             open_button(app, ui, "More in Appearance…", "window.ui_customization");

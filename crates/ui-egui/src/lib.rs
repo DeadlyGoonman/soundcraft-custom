@@ -1959,6 +1959,15 @@ mod tests {
         assert!(!flags.contains("edit_view.io"));
     }
 
+
+    #[test]
+    fn hover_hints_default_on_and_load_from_older_ui_files() {
+        assert!(crate::preferences::Prefs::default().hover_hints);
+        let older: crate::preferences::Prefs = serde_json::from_str(r#"{"bounce_folder":"Bounce"}"#).unwrap();
+        assert!(older.hover_hints);
+        let off: crate::preferences::Prefs = serde_json::from_str(r#"{"hover_hints":false}"#).unwrap();
+        assert!(!off.hover_hints);
+    }
     #[test]
     fn new_session_stops_playback_and_the_old_clock() {
         for (command, params) in [

@@ -181,19 +181,24 @@ fn ui_customization(app: &mut SoundApp, ctx: &egui::Context) {
     egui::Window::new(egui::RichText::new("Appearance").font(bold(13.0))).open(&mut open).default_size(vec2(320.0, 180.0)).resizable(false).show(
         ctx,
         |ui| {
+            let hints = app.ui.preferences.hover_hints;
             egui::Grid::new("ui_custom").num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
                 ui.label("Interface scale");
-                ui.add(egui::Slider::new(&mut app.extra.ui_scale, 0.75..=1.5).step_by(0.05).custom_formatter(|v, _| format!("{:.0} %", v * 100.0)));
+                let scale =
+                    ui.add(egui::Slider::new(&mut app.extra.ui_scale, 0.75..=1.5).step_by(0.05).custom_formatter(|v, _| format!("{:.0} %", v * 100.0)));
+                crate::widgets::hint(hints, scale, "Enlarge or shrink all text and controls in the interface");
                 ui.end_row();
                 ui.label("Reduce motion");
-                crate::widgets::checkbox(ui, &mut app.extra.reduce_motion, "");
+                let motion = crate::widgets::checkbox(ui, &mut app.extra.reduce_motion, "");
+                crate::widgets::hint(hints, motion, "Turn off animations and smooth scrolling in the interface");
                 ui.end_row();
                 ui.label("Theme");
                 ui.horizontal(|ui| {
                     let mut chosen = None;
                     egui::ComboBox::from_id_salt("theme_mode").selected_text(app.ui.theme.label()).show_ui(ui, |ui| {
                         for mode in crate::theme::ThemeMode::ALL {
-                            if ui.selectable_label(app.ui.theme == mode, mode.label()).clicked() {
+                            let item = ui.selectable_label(app.ui.theme == mode, mode.label());
+                            if crate::widgets::hint(hints, item, mode.hint()).clicked() {
                                 chosen = Some(mode);
                             }
                         }
@@ -201,17 +206,20 @@ fn ui_customization(app: &mut SoundApp, ctx: &egui::Context) {
                     if let Some(mode) = chosen {
                         let _ = app.run("ui.theme", json!({"mode": mode.id()}));
                     }
-                    if ui.button("Custom…").clicked() {
+                    let custom = ui.button("Custom…");
+                    if crate::widgets::hint(hints, custom, "Pick the background colour the Custom theme shades its panels from").clicked() {
                         app.extra.show_custom_theme = true;
                         app.extra.custom_hex = crate::theme::format_hex(app.ui.custom_bg);
                     }
                 });
                 ui.end_row();
                 ui.label("Auto-update configuration");
-                crate::widgets::checkbox(ui, &mut app.extra.auto_update_config, "");
+                let auto = crate::widgets::checkbox(ui, &mut app.extra.auto_update_config, "");
+                crate::widgets::hint(hints, auto, "Download and apply newer configuration files automatically when they are published");
                 ui.end_row();
             });
-            if ui.button("Reset").clicked() {
+            let reset = ui.button("Reset");
+            if crate::widgets::hint(hints, reset, "Restore interface scale, reduce motion and the theme to their defaults").clicked() {
                 app.extra.ui_scale = 1.0;
                 app.extra.reduce_motion = false;
                 let _ = app.run("ui.theme", json!({"mode": crate::theme::ThemeMode::default().id()}));

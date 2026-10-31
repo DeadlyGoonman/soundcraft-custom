@@ -131,6 +131,17 @@ impl ThemeMode {
         }
     }
 
+    /// What the theme looks like, shown as hover text in the Appearance window.
+    pub const fn hint(self) -> &'static str {
+        match self {
+            Self::System => "Follow the operating system's light or dark setting",
+            Self::Light => "Light grey panels and dark text",
+            Self::Dark => "Dark grey panels; the default",
+            Self::Oled => "Pure black background for OLED screens; saves power and avoids glare in dark rooms",
+            Self::Custom => "Panels shaded from the colour chosen with Custom…",
+        }
+    }
+
     /// The id used in `ui.theme {"mode": …}` and in the saved UI prefs.
     pub const fn id(self) -> &'static str {
         match self {
