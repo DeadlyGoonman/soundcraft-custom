@@ -1947,6 +1947,19 @@ mod tests {
     }
 
     #[test]
+    fn saved_default_views_replace_the_fresh_sessions_views() {
+        let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+        app.run("view.edit_comments", json!({})).unwrap();
+        app.remember_edit_views();
+        // A fresh session that already shows another view: the saved default wins.
+        app.engine.session_mut().edit.set_flag("edit_view.io", true);
+        app.apply_saved_edit_views();
+        let flags = &app.engine.session().edit.flags;
+        assert!(flags.contains("edit_view.comments"));
+        assert!(!flags.contains("edit_view.io"));
+    }
+
+    #[test]
     fn new_session_stops_playback_and_the_old_clock() {
         for (command, params) in [
             ("session.new", json!({"name": "New project", "sample_rate": 96_000})),
