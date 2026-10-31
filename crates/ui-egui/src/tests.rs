@@ -366,6 +366,25 @@ fn plugin_states_read_during_a_drag_keep_it_one_undo_step() {
     assert_eq!(app.engine.session().track(kick).unwrap().mixer.inserts[0].as_ref().unwrap().state_bytes(), Some(vec![59, 1]));
 }
 
+#[test]
+fn two_plugin_params_dragged_together_keep_one_undo_step() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    let kick = app.engine.session().track_by_name("Kick").unwrap().id;
+    app.run("mix.insert", json!({"track": kick.0, "plugin": "compressor", "slot": 0})).unwrap();
+    let steps = app.engine.undo_history().len();
+    // A multi-parameter editor drag reports ratio and makeup alternately, frame by frame.
+    for frame in 0..60u8 {
+        let ratio = 2.0 + f32::from(frame) / 10.0;
+        let makeup = f32::from(frame) / 10.0;
+        app.store_editor_changes(vec![(kick, 0, "ratio".to_string(), ratio), (kick, 0, "makeup".to_string(), makeup)], Vec::new());
+    }
+    app.engine.end_merge();
+    assert_eq!(app.engine.undo_history().len(), steps + 1);
+    let comp = app.engine.session().track(kick).unwrap().mixer.inserts[0].as_ref().unwrap();
+    assert_eq!(comp.params.get("ratio").copied(), Some(2.0 + 59.0 / 10.0));
+    assert_eq!(comp.params.get("makeup").copied(), Some(59.0 / 10.0));
+}
+
 /// One UI frame of plugin editors: the instruments edited in theirs, the plugins that said
 /// their state changed, the editors closed, and the state every plugin has now. Returns the
 /// plugins whose state was read.

@@ -189,7 +189,9 @@ impl SoundApp {
             if slot == soundcraft_mix::INSTRUMENT_SLOT {
                 continue;
             }
-            let key = format!("param:{}:{slot}:{param}", t.0);
+            // One key per plugin, not per parameter: a gesture that moves several parameters
+            // (ratio and gain together) alternates them, and a key change starts a new undo step.
+            let key = format!("param:{}:{slot}", t.0);
             let now = std::time::Instant::now();
             self.editor_edit_at = Some(now);
             if let (true, Ok(slot8)) = (self.is_playing(), u8::try_from(slot))
