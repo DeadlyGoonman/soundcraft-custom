@@ -93,11 +93,7 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
         ui.close();
     }
     if ui.button("new bus...").clicked() {
-        let mut n = busses.len() + 1;
-        while busses.contains(&format!("Bus {n}")) || app.engine.session().track_by_name(&format!("Bus {n}")).is_some() {
-            n += 1;
-        }
-        let _ = app.run(cmd, json!({"track": id.0, key: format!("Bus {n}")}));
+        app.dialogs.open_new_bus(Some((cmd.to_string(), json!({"track": id.0}), key.to_string())));
         ui.close();
     }
 }

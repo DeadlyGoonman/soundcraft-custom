@@ -417,15 +417,7 @@ fn send_route_menu(app: &mut SoundApp, ui: &Ui, field: &egui::Response, id: Trac
     }
     match footer {
         Some(SendFooter::NewBus) => {
-            let mut n = busses.len() + 1;
-            while busses.iter().any(|bus| bus.name.eq_ignore_ascii_case(&format!("Bus {n}")))
-                || app.engine.session().track_by_name(&format!("Bus {n}")).is_some()
-            {
-                n += 1;
-            }
-            if app.run("mix.new_bus", json!({"name": format!("Bus {n}")})).is_ok() {
-                let _ = app.run("mix.send", json!({"track": id.0, "slot": slot, "bus": format!("Bus {n}")}));
-            }
+            app.dialogs.open_new_bus(Some(("mix.send".into(), json!({"track": id.0, "slot": slot}), "bus".into())));
         }
         Some(SendFooter::RemoveSend) => {
             let _ = app.run("mix.send_remove", json!({"track": id.0, "slot": slot}));
