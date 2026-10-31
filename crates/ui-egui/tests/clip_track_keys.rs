@@ -2,7 +2,7 @@
 
 use egui::{Event, Key, Modifiers, RawInput};
 use serde_json::json;
-use soundcraft_model::{ClipId, TrackId, TrackKind};
+use soundcraft_model::{ChannelFormat, ClipId, TrackId, TrackKind};
 use soundcraft_ui_egui::{Services, SoundApp, shortcuts};
 
 fn press(ctx: &egui::Context, app: &mut SoundApp, key: Key, modifiers: Modifiers) {
@@ -22,9 +22,12 @@ fn shift_arrows_move_the_selected_clip_a_track_down_and_up_keeping_its_start() {
         let ctx = egui::Context::default();
         ctx.set_os(os);
         let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+        // Every demo audio clip spans its neighbours, and a move never covers another clip, so the
+        // move needs an empty audio track below Pad (the last audio track with clips).
+        app.engine.session_mut().add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Empty"));
         let s = app.engine.session();
         let audio: Vec<TrackId> = s.tracks.iter().filter(|t| t.kind == TrackKind::Audio && !t.hidden).map(|t| t.id).collect();
-        let (top, next) = (audio[0], audio[1]);
+        let (top, next) = (audio[4], audio[5]);
         let clip = s.track(top).unwrap().clips()[0].id;
         let start = place(&app, clip).1;
 
