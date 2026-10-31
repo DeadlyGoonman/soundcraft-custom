@@ -791,7 +791,7 @@ pub fn xpitch_installed() -> bool {
 
 /// Whether the Pro Tools session at `path` has an Auto-Tune Live insert.
 pub fn uses_autotune_live(path: &str) -> bool {
-    let Ok(raw) = std::fs::read(path) else { return false };
+    let Ok(raw) = read_file(path) else { return false };
     parse(&decode(&raw)).inserts.iter().any(|i| i.plugin == "Auto-Tune Live")
 }
 

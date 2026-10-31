@@ -70,7 +70,7 @@ pub(crate) fn send_level(s: &Session, t: &Track, i: usize, base: f32, pos: Sampl
         && let Some(l) = t.lane(&AutoParam::SendLevel(u8::try_from(i).unwrap_or(0)))
         && !l.points.is_empty()
     {
-        return l.value_at(pos, base);
+        return l.value_at(pos, base).clamp(soundcraft_dsp::MIN_DB, crate::SEND_LEVEL_MAX_DB);
     }
     base
 }

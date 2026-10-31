@@ -119,6 +119,7 @@ impl SoundApp {
             editor_edit_at: None,
             plugin_touched: std::collections::HashMap::new(),
             pan_touched: std::collections::HashMap::new(),
+            touched_sends: std::collections::HashSet::new(),
             last_write_at: i64::MIN,
             editor_states: Vec::new(),
             editor_poll_due: true,
@@ -174,7 +175,7 @@ impl SoundApp {
         if hidden {
             self.pointer_down = false;
             self.wants_keyboard = false;
-            if matches!(self.gesture, Some(Gesture::Fader { .. })) {
+            if matches!(self.gesture, Some(Gesture::Fader { .. } | Gesture::SendFader { .. })) {
                 self.gesture = None;
             }
         }
@@ -194,11 +195,16 @@ impl SoundApp {
             import::step(self, ctx);
         }
         if !self.pointer_down {
-            if matches!(self.gesture, Some(Gesture::Fader { .. })) {
+            if matches!(self.gesture, Some(Gesture::Fader { .. } | Gesture::SendFader { .. })) {
                 self.gesture = None;
             }
             // Keep a running automation pass merged until playback stops.
-            if !self.wants_keyboard && self.touched.is_empty() && self.plugin_touched.is_empty() && self.pan_touched.is_empty() {
+            if !self.wants_keyboard
+                && self.touched.is_empty()
+                && self.plugin_touched.is_empty()
+                && self.pan_touched.is_empty()
+                && self.touched_sends.is_empty()
+            {
                 const EDITOR_GAP: std::time::Duration = std::time::Duration::from_millis(300);
                 match self.editor_edit_at.map(|t| t.elapsed()) {
                     Some(el) if el < EDITOR_GAP => ctx.request_repaint_after(EDITOR_GAP - el + std::time::Duration::from_millis(20)),

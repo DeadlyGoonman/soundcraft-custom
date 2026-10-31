@@ -372,3 +372,13 @@ fn flac_every_level_is_lossless_and_higher_levels_are_smaller() {
         assert!(sizes[5] <= sizes[0], "{depth:?}: level 5 ({}) must not be larger than level 0 ({})", sizes[5], sizes[0]);
     }
 }
+
+#[test]
+fn bwf_truncation_keeps_utf8_boundaries() {
+    let src = sine(48_000, 1, 10);
+    let bwf = BwfInfo { originator: format!("{}é", "a".repeat(31)), description: format!("{}é", "d".repeat(255)), ..BwfInfo::default() };
+    let bytes = encode(&src, &EncodeOptions { format: FileFormat::Wav, bwf: Some(bwf), ..EncodeOptions::default() }).unwrap();
+    let out = probe(&bytes, None).unwrap().bwf.unwrap();
+    assert_eq!(out.originator, "a".repeat(31));
+    assert_eq!(out.description, "d".repeat(255));
+}

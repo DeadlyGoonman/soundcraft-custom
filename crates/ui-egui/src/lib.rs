@@ -295,6 +295,10 @@ pub enum Gesture {
         track: TrackId,
         start_db: f32,
     },
+    SendFader {
+        track: TrackId,
+        slot: usize,
+    },
     ClipGain {
         clip: soundcraft_model::ClipId,
         track: TrackId,
@@ -495,6 +499,8 @@ pub struct SoundApp {
     plugin_touched: std::collections::HashMap<(TrackId, u8, String), (std::time::Instant, f32)>,
     /// Pan knobs moved during a pass, by (track, pan index): when, and the value.
     pan_touched: std::collections::HashMap<(TrackId, u8), (std::time::Instant, f32)>,
+    /// Sends whose level was touched during this pass (Touch/Latch writing), as (track, slot).
+    touched_sends: std::collections::HashSet<(TrackId, usize)>,
     /// The pass's last point; `i64::MIN` after a stop or a jump, so the next point erases nothing it skipped.
     last_write_at: Samples,
     /// Plugins changed in their editors whose state the session hasn't taken yet (see `editor_states_due`).
