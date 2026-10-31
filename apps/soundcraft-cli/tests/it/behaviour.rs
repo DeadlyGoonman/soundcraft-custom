@@ -85,7 +85,9 @@ fn not_found() -> std::io::Error {
 fn assert_refused(got: &Invoke, port: u16) {
     assert_eq!((got.code, got.stdout.as_str()), (1, ""));
     let prefix = format!("error: cannot reach SoundCraft at 127.0.0.1:{port}: ");
-    assert!(got.stderr.starts_with(&prefix) && got.stderr.contains(" (os error ") && got.stderr.ends_with(")\n"), "{}", got.stderr);
+    // Windows can report the 800 ms connect timeout instead of a refusal; both mean unreachable.
+    let refused = got.stderr.contains(" (os error ") && got.stderr.ends_with(")\n");
+    assert!(got.stderr.starts_with(&prefix) && (refused || got.stderr.ends_with("connection timed out\n")), "{}", got.stderr);
 }
 
 // ---- unknown flags ----
