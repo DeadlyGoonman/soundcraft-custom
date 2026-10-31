@@ -109,3 +109,21 @@ fn escape_closes_the_send_window_after_menus_and_typing() {
     assert_eq!(h.state().ui.send_window, None);
     assert_eq!(level(&h, 0), -10.0);
 }
+
+/// "new bus..." turns into a name field; typing a name and pressing Enter creates the bus and puts
+/// the send on it.
+#[test]
+fn enter_in_the_new_bus_field_creates_the_bus_and_sends_to_it() {
+    let (mut h, _vox) = harness();
+    h.get_by_label("Send C").click();
+    h.run_steps(3);
+    h.get_by_label("new bus...").click();
+    h.run_steps(3);
+    h.get_by_label("New bus name").type_text("Reverb");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    let session = h.state().engine.session();
+    assert!(session.busses.iter().any(|b| b.name == "Reverb"), "Enter creates the bus");
+    assert!(session.tracks[0].mixer.sends[2].is_some(), "and the send points at it");
+}
