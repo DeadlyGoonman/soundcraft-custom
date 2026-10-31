@@ -555,6 +555,11 @@ pub fn multi_meter(ui: &Ui, r: Rect, levels: &[f32], labels: &[String], clip: bo
     }
 }
 
+/// Hover text on `resp`, shown only while the Appearance hover descriptions are on.
+pub fn hint(on: bool, resp: Response, text: &str) -> Response {
+    if on { resp.on_hover_text(text) } else { resp }
+}
+
 /// egui's checkbox, plus drag-to-set (#399): press one box and drag over its neighbours, and each
 /// box the pointer passes takes the state the first one switched to. A click toggles one box.
 pub fn checkbox(ui: &mut Ui, on: &mut bool, label: impl Into<egui::WidgetText>) -> Response {

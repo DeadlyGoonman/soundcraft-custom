@@ -184,17 +184,21 @@ fn ui_customization(app: &mut SoundApp, ctx: &egui::Context) {
             // Each control carries its own visible label, which is also its accessible name. A
             // label in a neighbouring grid cell is only painted text: a screen reader (and the
             // kittest accessibility check) would see an unnamed slider, checkbox or combo box.
-            ui.add(
+            let hints = app.ui.preferences.hover_hints;
+            let scale = ui.add(
                 egui::Slider::new(&mut app.extra.ui_scale, 0.75..=1.5)
                     .step_by(0.05)
                     .custom_formatter(|v, _| format!("{:.0} %", v * 100.0))
                     .text("Interface scale"),
             );
-            crate::widgets::checkbox(ui, &mut app.extra.reduce_motion, "Reduce motion");
+            crate::widgets::hint(hints, scale, "Enlarge or shrink all text and controls in the interface");
+            let motion = crate::widgets::checkbox(ui, &mut app.extra.reduce_motion, "Reduce motion");
+            crate::widgets::hint(hints, motion, "Turn off animations and smooth scrolling in the interface");
             let mut chosen = None;
             craft_ui::ComboBox::from_label("Theme").selected_text(app.ui.theme.label()).show_ui(ui, |ui| {
                 for mode in crate::theme::ThemeMode::ALL {
-                    if ui.selectable_label(app.ui.theme == mode, mode.label()).clicked() {
+                    let item = ui.selectable_label(app.ui.theme == mode, mode.label());
+                    if crate::widgets::hint(hints, item, mode.hint()).clicked() {
                         chosen = Some(mode);
                     }
                 }
@@ -202,13 +206,16 @@ fn ui_customization(app: &mut SoundApp, ctx: &egui::Context) {
             if let Some(mode) = chosen {
                 let _ = app.run("ui.theme", json!({"mode": mode.id()}));
             }
-            if ui.button("Custom…").clicked() {
+            let custom = ui.button("Custom…");
+            if crate::widgets::hint(hints, custom, "Pick the background colour the Custom theme shades its panels from").clicked() {
                 app.extra.show_custom_theme = true;
                 app.extra.custom_hex = crate::theme::format_hex(app.ui.custom_bg);
             }
-            crate::widgets::checkbox(ui, &mut app.extra.auto_update_config, "Auto-update configuration");
+            let auto = crate::widgets::checkbox(ui, &mut app.extra.auto_update_config, "Auto-update configuration");
+            crate::widgets::hint(hints, auto, "Download and apply newer configuration files automatically when they are published");
             ui.add_space(4.0);
-            if ui.button("Reset").clicked() {
+            let reset = ui.button("Reset");
+            if crate::widgets::hint(hints, reset, "Restore interface scale, reduce motion and the theme to their defaults").clicked() {
                 app.extra.ui_scale = 1.0;
                 app.extra.reduce_motion = false;
                 let _ = app.run("ui.theme", json!({"mode": crate::theme::ThemeMode::default().id()}));
