@@ -7,6 +7,7 @@
 pub mod bounce;
 pub mod control;
 pub mod credits;
+pub mod data_dirs;
 pub mod dialogs;
 pub mod docking;
 pub mod edit_window;
@@ -236,8 +237,9 @@ pub fn os_pointer_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
     Some(egui::pos2(x as f32 / ppp, y as f32 / ppp) - inner.min.to_vec2())
 }
 
-/// File-system-safe folder name for a plugin id (`clap:com.x.y` → `clap_com.x.y`).
-pub fn preset_folder_name(plugin: &str) -> String {
+/// The folder presets of the plugin id `plugin` used before they were named after the plugin
+/// (`clap:com.x.y` → `clap_com.x.y`); kept to find and copy those presets.
+pub fn legacy_preset_folder_name(plugin: &str) -> String {
     plugin.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect()
 }
 
@@ -380,6 +382,10 @@ pub struct SoundApp {
     panic_rev: u64,
     /// Folder for user plugin presets (native apps set it).
     pub preset_dir: Option<std::path::PathBuf>,
+    /// Folder of saved templates, listed by File > New > Open from Template (native apps set it).
+    pub template_dir: Option<std::path::PathBuf>,
+    /// The data folder layout in use (`None`: portable or overridden settings folder, tests).
+    pub data_dirs: Option<data_dirs::DataDirs>,
     last_autosave: Option<std::time::Instant>,
     /// When the driver last asked to be reset and the device was reopened for it (see `reset_output`).
     last_reset: Option<std::time::Instant>,
@@ -511,6 +517,8 @@ impl SoundApp {
             leftovers: Vec::new(),
             panic_rev: 0,
             preset_dir: None,
+            template_dir: None,
+            data_dirs: None,
             last_autosave: None,
             dialogs: dialogs::Dialogs::default(),
             meters: HashMap::new(),

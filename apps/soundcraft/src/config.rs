@@ -60,6 +60,20 @@ fn config_dir_with(platform: Platform, env: impl Fn(&str) -> Option<OsString>, e
     }
 }
 
+/// Whether `dir` is the plain per-user settings folder (not `$SOUNDCRAFT_CONFIG_DIR`, not portable
+/// mode). Only then the data lives in the Documents data folder (see `soundcraft_ui_egui::data_dirs`);
+/// an overridden folder keeps everything in itself, as before.
+pub fn is_profile_dir(dir: &Path) -> bool {
+    let platform = if cfg!(target_os = "macos") {
+        Platform::Mac
+    } else if cfg!(windows) {
+        Platform::Windows
+    } else {
+        Platform::Other
+    };
+    config_dir_with(platform, |name| if name == "SOUNDCRAFT_CONFIG_DIR" { None } else { std::env::var_os(name) }, None).as_deref() == Some(dir)
+}
+
 /// Create `dir` if needed and prove a file can be written in it.
 fn writable(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;

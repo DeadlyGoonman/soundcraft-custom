@@ -20,6 +20,7 @@ mod logging;
 mod native_menu;
 
 use soundcraft_engine::Engine;
+use soundcraft_ui_egui::data_dirs::DataDirs;
 use soundcraft_ui_egui::{Services, SoundApp, UiState, dialogs};
 use std::sync::Arc;
 
@@ -151,10 +152,16 @@ fn prefs_path() -> Option<std::path::PathBuf> {
 /// The saved plugin scan, read from the settings folder (a first launch scans in the
 /// background, probing each plugin file in a child process of this executable). Runs without
 /// preferences keep the old behavior: each format is scanned in-process on first use.
-fn plugin_scanner() -> soundcraft_ui_egui::extra_windows::plugin_scanner::PluginScanner {
+fn plugin_scanner(dirs: Option<&DataDirs>) -> soundcraft_ui_egui::extra_windows::plugin_scanner::PluginScanner {
     use soundcraft_engine::plugin_scan::{PROBE_TIMEOUT, child_probe};
     use soundcraft_ui_egui::extra_windows::plugin_scanner::PluginScanner;
     match (prefs_enabled().then(config_dir).flatten(), std::env::current_exe()) {
+        (Some(_), Ok(exe)) if let Some(d) = dirs => PluginScanner::startup_in(
+            Some(d.cache.clone()),
+            Some(d.settings.clone()),
+            Arc::new(soundcraft_engine::plugin_scan::list_candidates),
+            Some(child_probe(exe, PROBE_TIMEOUT)),
+        ),
         (Some(dir), Ok(exe)) => PluginScanner::startup(Some(dir), Some(child_probe(exe, PROBE_TIMEOUT))),
         _ => PluginScanner::default(),
     }
@@ -188,6 +195,28 @@ fn save_prefs(ui: &UiState) {
     {
         log::warn!("{error}");
     }
+}
+
+/// The Documents data folder layout (`Projects`, `Presets`, `Templates`, ...), created here. `None`
+/// without preferences (tests, agents), in portable mode and with `SOUNDCRAFT_CONFIG_DIR`: those keep
+/// everything in the settings folder. `ui.json` itself stays in the settings folder because it holds
+/// the data folder's location. The old settings folder is copied in once (originals stay).
+fn data_layout(prefs: &mut UiState) -> Option<DataDirs> {
+    let cfg = config_dir().filter(|d| prefs_enabled() && config::is_profile_dir(d))?;
+    let dirs = DataDirs::from_pref(&prefs.preferences.data_root);
+    if let Err(e) = dirs.ensure() {
+        log::warn!("data folder {}: {e}", dirs.root.display());
+        return None;
+    }
+    if let Err(e) = dirs.migrate_from(&cfg) {
+        log::warn!("data folder migration: {e}");
+    }
+    // The projects folder older versions saved in ui.json was the data folder's own path.
+    let norm = |s: &str| s.trim().trim_end_matches(['/', '\\']).replace('\\', "/").to_lowercase();
+    if norm(&prefs.preferences.default_projects_dir) == norm(&dirs.root.to_string_lossy()) {
+        prefs.preferences.default_projects_dir = dirs.projects.to_string_lossy().into_owned();
+    }
+    Some(dirs)
 }
 
 fn services(ctx: egui::Context) -> Services {
@@ -296,10 +325,12 @@ fn main() -> eframe::Result {
     // leaves no file behind. Records logged until now are written to it first. Runs without
     // preferences (agents' test runs) log to standard error only, so they don't rotate away the
     // user's own logs.
+    let mut prefs = load_prefs().unwrap_or_default();
+    let dirs = data_layout(&mut prefs);
     if let Some(logger) = logger {
         match config_dir() {
             _ if !prefs_enabled() => logger.no_file(),
-            Some(dir) => match logger.attach_dir(&dir.join(logging::LOG_DIR)) {
+            Some(dir) => match logger.attach_dir(&dirs.as_ref().map_or_else(|| dir.join(logging::LOG_DIR), |d| d.logs.clone())) {
                 Ok(path) => log::info!("log file {}", path.display()),
                 Err(e) => log::warn!("no log file: {e}"),
             },
@@ -311,7 +342,6 @@ fn main() -> eframe::Result {
     }
 
     let engine = if demo { soundcraft_engine::demo::demo_engine() } else { Engine::default() };
-    let prefs = load_prefs().unwrap_or_default();
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SoundCraft")
@@ -335,11 +365,13 @@ fn main() -> eframe::Result {
             let player =
                 if no_audio { None } else { Some(soundcraft_playback::Player::with_config(Arc::new(engine.session().clone()), &prefs.audio)) };
             let mut app = SoundApp::new(engine, player, services(cc.egui_ctx.clone()));
-            app.autosave_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave")));
+            app.autosave_dir = dirs.as_ref().map(|d| d.autosave.clone()).or_else(|| prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave"))));
             app.leftovers = app.autosave_dir.as_deref().map(soundcraft_engine::autosave::leftovers).unwrap_or_default();
-            app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
+            app.preset_dir = dirs.as_ref().map(|d| d.presets.clone()).or_else(|| prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets"))));
+            app.template_dir = dirs.as_ref().map(|d| d.templates.clone());
+            app.data_dirs = dirs.clone();
             app.extra.ui_scale = prefs.ui_scale;
-            app.extra.plugin_scanner = plugin_scanner();
+            app.extra.plugin_scanner = plugin_scanner(dirs.as_ref());
             // Runs without preferences (tests, agents) make no network calls.
             if prefs_enabled() {
                 app.extra.update = soundcraft_ui_egui::extra_windows::update::UpdateChecker::start();

@@ -334,8 +334,39 @@ fn has_function(n: &MenuNode, extra: &[(&str, &str)]) -> bool {
     if n.children.is_empty() { command_for_path(&n.path, extra).is_some() } else { n.children.iter().any(|c| has_function(c, extra)) }
 }
 
+const OPEN_FROM_TEMPLATE: &str = "File > New > Open from Template...";
+
+/// File > New > Open from Template: a submenu (opens on hover) of the templates in the Templates
+/// folder, then Browse… for the file dialog.
+fn template_menu(app: &mut SoundApp, ui: &mut egui::Ui, n: &MenuNode, extra: &[(&str, &str)]) {
+    let (enabled, _) = item_state(app, &n.path, command_for_path(&n.path, extra).as_deref());
+    let templates = app.template_dir.as_deref().map(crate::data_dirs::list_templates).unwrap_or_default();
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.menu_button("Open from Template", |ui| {
+            if templates.is_empty() {
+                ui.add_enabled(false, egui::Button::new("No templates yet"));
+            }
+            for t in &templates {
+                if ui.button(&t.name).clicked() {
+                    let _ = crate::dialogs::run_or_ask(app, "session.new_from_template", json!({"path": t.path.to_string_lossy()}));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("Browse…").clicked() {
+                invoke_menu(app, "session.new_from_template", &n.path);
+                ui.close();
+            }
+        });
+    });
+}
+
 fn menu_node(app: &mut SoundApp, ui: &mut egui::Ui, n: &MenuNode, extra: &[(&str, &str)]) {
     if !has_function(n, extra) {
+        return;
+    }
+    if n.path == OPEN_FROM_TEMPLATE {
+        template_menu(app, ui, n, extra);
         return;
     }
     if !n.children.is_empty() {
