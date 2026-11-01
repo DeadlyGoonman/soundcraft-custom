@@ -15,7 +15,7 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Prefs {
-    /// Where new projects are saved; empty means [`platform_projects_dir`].
+    /// Older settings files' projects folder. Unused: projects now always go to the data folder's `Projects`.
     pub default_projects_dir: String,
     /// Save a new project in a folder named after it inside the chosen folder.
     pub project_subfolder: bool,
@@ -58,9 +58,36 @@ impl Default for Prefs {
 pub const DEFAULT_BOUNCE_FOLDER: &str = "Bounced Files";
 
 impl Prefs {
-    /// The projects folder in use: the chosen one, or the platform default when it is blank.
+    /// The data folder's subfolders: the chosen data folder, or `Documents/Soundcraft` when blank.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn data_dirs(&self) -> crate::data_dirs::DataDirs {
+        let root = self.data_root.trim();
+        crate::data_dirs::DataDirs::new(if root.is_empty() { crate::data_dirs::default_root() } else { root.into() })
+    }
+
+    /// The projects folder: `Projects` in the data folder, so everything SoundCraft saves lives in
+    /// one place (empty in the browser, which has no folders).
     pub fn projects_dir(&self) -> String {
-        if self.default_projects_dir.trim().is_empty() { platform_projects_dir() } else { self.default_projects_dir.trim().to_string() }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.data_dirs().projects.to_string_lossy().into_owned()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            String::new()
+        }
+    }
+
+    /// The templates folder: `Templates` in the data folder (empty in the browser).
+    pub fn templates_dir(&self) -> String {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.data_dirs().templates.to_string_lossy().into_owned()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            String::new()
+        }
     }
 
     pub fn bounce_folder(&self) -> &str {
@@ -108,14 +135,21 @@ pub fn platform_projects_dir() -> String {
 #[derive(Debug, Clone)]
 pub struct ProjectDefaults {
     pub dir: String,
+    /// Where Save As Template and Open from Template start.
+    pub templates: String,
     pub subfolder: bool,
     pub bounce_folder: String,
 }
 
+impl ProjectDefaults {
+    pub fn from_prefs(p: &Prefs) -> Self {
+        ProjectDefaults { dir: p.projects_dir(), templates: p.templates_dir(), subfolder: p.project_subfolder, bounce_folder: p.bounce_folder().into() }
+    }
+}
+
 impl Default for ProjectDefaults {
     fn default() -> Self {
-        let p = Prefs::default();
-        ProjectDefaults { dir: p.projects_dir(), subfolder: p.project_subfolder, bounce_folder: p.bounce_folder }
+        ProjectDefaults::from_prefs(&Prefs::default())
     }
 }
 
@@ -220,9 +254,7 @@ pub fn run(app: &mut SoundApp, id: &str, p: &serde_json::Value) -> Option<serde_
 }
 
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
-    let prefs = &app.ui.preferences;
-    app.dialogs.project_defaults =
-        ProjectDefaults { dir: prefs.projects_dir(), subfolder: prefs.project_subfolder, bounce_folder: prefs.bounce_folder().into() };
+    app.dialogs.project_defaults = ProjectDefaults::from_prefs(&app.ui.preferences);
     let mut open = app.ui.preferences.show;
     if !open {
         return;
@@ -304,17 +336,13 @@ fn data_folder(app: &mut SoundApp, ui: &mut egui::Ui) {
 fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
     match app.ui.preferences.page {
         Page::General => {
-            ui.label("Default projects folder");
             let prefs = &mut app.ui.preferences;
-            ui.add(egui::TextEdit::singleline(&mut prefs.default_projects_dir).desired_width(420.0));
-            if let Some(pick) = &app.services.pick_folder
-                && ui.button("Browse…").clicked()
-                && let Some(dir) = pick(&prefs.projects_dir())
-            {
-                prefs.default_projects_dir = dir;
-            }
+            ui.label(format!("Projects are saved in {}", prefs.projects_dir()));
             crate::widgets::checkbox(ui, &mut prefs.project_subfolder, "Create a folder for each new project");
-            note(ui, "A new project called “hello” is saved as <folder>/hello/hello.scraft. Save Session As can pick another folder each time.");
+            note(
+                ui,
+                "A new project called “hello” is saved as Projects/hello/hello.scraft in the data folder below; templates go to its Templates folder. Change the data folder to move them. Save Session As can pick another folder each time.",
+            );
             ui.add_space(10.0);
             ui.separator();
             data_folder(app, ui);

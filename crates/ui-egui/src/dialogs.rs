@@ -134,6 +134,16 @@ impl Dialogs {
         self.project = None;
         let home = default_dir();
         let name = e.session().name.clone();
+        // Saves and exports land in the data folder: beside the session once it has been saved,
+        // else in the Projects folder (Setup › Preferences › General).
+        let projects = if self.project_defaults.dir.is_empty() { home.clone() } else { self.project_defaults.dir.clone() };
+        let templates = if self.project_defaults.templates.is_empty() { home.clone() } else { self.project_defaults.templates.clone() };
+        let save_dir = e
+            .path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).parent())
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or(projects.clone(), |d| d.display().to_string());
         self.open = Some(match id {
             "clip.clear" => {
                 let ed = &e.session().edit;
@@ -144,12 +154,7 @@ impl Dialogs {
             }
             "session.new" => Dialog::NewSession { name: "Untitled".into(), sample_rate: 48_000, demo: false },
             "file.bounce_mix" => {
-                let dir = e
-                    .path
-                    .as_deref()
-                    .and_then(|p| std::path::Path::new(p).parent())
-                    .filter(|d| !d.as_os_str().is_empty())
-                    .map_or(home.clone(), |d| d.display().to_string());
+                let dir = save_dir.clone();
                 Dialog::Bounce {
                     path: format!("{dir}/{}/{name} Bounce.wav", self.project_defaults.bounce_folder),
                     format: "wav".into(),
@@ -162,10 +167,16 @@ impl Dialogs {
             }
             "file.import_audio" => Dialog::PathPrompt { cmd: id.into(), title: "Import Audio".into(), path: home, key: "path".into() },
             "file.import_midi" => Dialog::PathPrompt { cmd: id.into(), title: "Import MIDI".into(), path: home, key: "path".into() },
-            "session.open" => Dialog::PathPrompt { cmd: id.into(), title: "Open Session".into(), path: home, key: "path".into() },
+            "session.open" => Dialog::PathPrompt { cmd: id.into(), title: "Open Session".into(), path: format!("{projects}/"), key: "path".into() },
             "session.new_from_template" => {
-                Dialog::PathPrompt { cmd: id.into(), title: "New Session from Template".into(), path: home, key: "path".into() }
+                Dialog::PathPrompt { cmd: id.into(), title: "New Session from Template".into(), path: format!("{templates}/"), key: "path".into() }
             }
+            "session.save_template" => Dialog::PathPrompt {
+                cmd: id.into(),
+                title: "Save As Template".into(),
+                path: format!("{templates}/{name}.scraft"),
+                key: "path".into(),
+            },
             "session.save" if e.path.is_some() => return false,
             "session.save" | "session.save_as" | "session.save_copy" => Dialog::PathPrompt {
                 cmd: if id == "session.save_copy" { id } else { "session.save_as" }.into(),
@@ -210,7 +221,7 @@ impl Dialogs {
                 let Some((_, clip)) = target else { return false };
                 Dialog::RenameClip { id: clip.id, name: clip.name.clone() }
             }
-            _ => match path_dialog(id, &home, &name) {
+            _ => match path_dialog(id, &home, &save_dir, &name) {
                 Some(d) => d,
                 None => return false,
             },
@@ -303,7 +314,9 @@ fn path_key(id: &str) -> Option<&'static str> {
     }
 }
 
-fn path_dialog(id: &str, home: &str, name: &str) -> Option<Dialog> {
+/// `home` is where imports start; `save_dir` is where exports and saves start (the session's
+/// folder, or the data folder's Projects folder for an unsaved session).
+fn path_dialog(id: &str, home: &str, save_dir: &str, name: &str) -> Option<Dialog> {
     let spec = soundcraft_engine::command_specs().iter().find(|c| c.id == id)?;
     let key = path_key(id)?;
     let importing = id.contains("import") || id.contains("open");
@@ -316,7 +329,7 @@ fn path_dialog(id: &str, home: &str, name: &str) -> Option<Dialog> {
         _ if id.contains("session") => ".scraft",
         _ => "",
     };
-    let path = if importing || key == "dir" { format!("{home}/") } else { format!("{home}/{name}{ext}") };
+    let path = if importing { format!("{home}/") } else if key == "dir" { format!("{save_dir}/") } else { format!("{save_dir}/{name}{ext}") };
     let title = format!("{} — {}", spec.menu.last().copied().unwrap_or("File"), spec.label.trim_end_matches("..."));
     Some(Dialog::PathPrompt { cmd: id.into(), title, path, key: key.into() })
 }
@@ -1234,5 +1247,27 @@ mod tests {
             message(&d),
             "Remove 2 files from the session? They are used by 4 clips on the timeline, which are removed too. The files stay on disk."
         );
+    }
+
+    #[test]
+    fn saves_templates_and_exports_start_in_the_data_folder() {
+        let e = soundcraft_engine::demo::demo_engine();
+        let prefs = crate::preferences::Prefs { data_root: "D:/data/Soundcraft".into(), default_projects_dir: "C:/Desktop/Old".into(), ..Default::default() };
+        let mut d = Dialogs { project_defaults: crate::preferences::ProjectDefaults::from_prefs(&prefs), ..Dialogs::default() };
+        let path = |d: &Dialogs| match &d.open {
+            Some(Dialog::PathPrompt { path, .. }) => path.replace('\\', "/"),
+            other => panic!("{other:?}"),
+        };
+        let name = e.session().name.clone();
+        assert!(d.open_for_command(&e, "session.save_as"));
+        assert_eq!(path(&d), format!("D:/data/Soundcraft/Projects/{name}/{name}.scraft"), "an older projects folder setting is ignored");
+        assert!(d.open_for_command(&e, "session.save_template"));
+        assert_eq!(path(&d), format!("D:/data/Soundcraft/Templates/{name}.scraft"));
+        assert!(d.open_for_command(&e, "session.new_from_template"));
+        assert_eq!(path(&d), "D:/data/Soundcraft/Templates/");
+        assert!(d.open_for_command(&e, "session.open"));
+        assert_eq!(path(&d), "D:/data/Soundcraft/Projects/");
+        assert!(d.open_for_command(&e, "file.export_midi"));
+        assert_eq!(path(&d), format!("D:/data/Soundcraft/Projects/{name}.mid"), "an unsaved session exports into Projects");
     }
 }

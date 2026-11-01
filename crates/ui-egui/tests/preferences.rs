@@ -31,7 +31,9 @@ fn hello(projects: &Path, pick: Option<PathBuf>) -> Harness<'static, SoundApp> {
     let pick_folder: Option<Box<dyn Fn(&str) -> Option<String>>> =
         pick.map(|p| Box::new(move |_: &str| Some(p.to_string_lossy().into_owned())) as Box<dyn Fn(&str) -> Option<String>>);
     let mut app = SoundApp::new(engine, None, Services { pick_folder, ..Default::default() });
-    app.ui.preferences.default_projects_dir = projects.to_string_lossy().into();
+    // Projects live in the data folder: `projects` is `<data folder>/Projects`.
+    assert!(projects.ends_with("Projects"), "{}", projects.display());
+    app.ui.preferences.data_root = projects.parent().unwrap().to_string_lossy().into();
     let mut h = harness(app);
     let s = h.state_mut();
     assert!(s.dialogs.open_for_command(&s.engine, "session.save_as"));
@@ -91,7 +93,7 @@ fn project_defaults_persist_and_older_ui_json_loads() {
 
 #[test]
 fn a_new_project_is_saved_in_its_own_folder_inside_the_projects_folder() {
-    let projects = temp("default");
+    let projects = temp("default").join("Projects");
     let mut h = hello(&projects, None);
     let want = projects.join("hello").join("hello.scraft");
     assert_eq!(prompt_path(&h), want.to_string_lossy());
@@ -99,12 +101,12 @@ fn a_new_project_is_saved_in_its_own_folder_inside_the_projects_folder() {
     ok(&mut h);
     assert!(want.is_file(), "{}", want.display());
     assert_eq!(h.state().engine.path.as_deref(), Some(&*want.to_string_lossy()));
-    let _ = std::fs::remove_dir_all(&projects);
+    let _ = std::fs::remove_dir_all(projects.parent().unwrap());
 }
 
 #[test]
 fn a_custom_folder_is_honoured_and_never_nested_twice() {
-    let projects = temp("unused");
+    let projects = temp("unused").join("Projects");
     let custom = temp("custom");
     let mut h = hello(&projects, Some(custom.clone()));
     h.get_by_label("Browse…").click();
@@ -125,7 +127,7 @@ fn a_custom_folder_is_honoured_and_never_nested_twice() {
 
 #[test]
 fn without_a_project_folder_the_session_goes_straight_into_the_folder() {
-    let projects = temp("flat");
+    let projects = temp("flat").join("Projects");
     let mut h = hello(&projects, None);
     h.get_by_label("Create a folder for the project").click();
     h.run_steps(2);
@@ -134,5 +136,5 @@ fn without_a_project_folder_the_session_goes_straight_into_the_folder() {
     ok(&mut h);
     assert!(want.is_file());
     assert!(!projects.join("hello").exists());
-    let _ = std::fs::remove_dir_all(&projects);
+    let _ = std::fs::remove_dir_all(projects.parent().unwrap());
 }
