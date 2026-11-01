@@ -372,6 +372,11 @@ fn main() -> eframe::Result {
             app.data_dirs = dirs.clone();
             app.extra.ui_scale = prefs.ui_scale;
             app.extra.plugin_scanner = plugin_scanner(dirs.as_ref());
+            if prefs_enabled()
+                && let Some(d) = dirs.as_ref()
+            {
+                app.extra.editor_frame = soundcraft_ui_egui::editor_frame::EditorFrameSettings::load(&d.settings);
+            }
             // Runs without preferences (tests, agents) make no network calls.
             if prefs_enabled() {
                 app.extra.update = soundcraft_ui_egui::extra_windows::update::UpdateChecker::start();

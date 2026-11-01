@@ -15,7 +15,9 @@ use std::sync::OnceLock;
 
 use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorKey, EditorScale};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAKED, DWMWA_TEXT_COLOR, DwmGetWindowAttribute, DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::{
     BLACK_BRUSH, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DT_CENTER, DT_SINGLELINE,
     DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FW_SEMIBOLD, FillRect, GetMonitorInfoW, GetStockObject, HBRUSH, HDC, HGDIOBJ, InvalidateRect,
@@ -433,6 +435,7 @@ impl HostWindow {
             CreateWindowExW(EX_STYLE, class_frame(), &title, STYLE, CW_USEDEFAULT, CW_USEDEFAULT, 400, 300, owner, None, Some(instance), None)
         }
         .map_err(|e| format!("cannot create the editor window: {e}"))?;
+        apply_frame_colors(top, None);
         let frame = Box::into_raw(Box::new(Frame {
             header: Cell::new(HWND::default()),
             body: Cell::new(HWND::default()),
@@ -537,6 +540,9 @@ impl HostWindow {
     pub fn set_header(&self, state: EditorHeaderState) {
         let Some(f) = self.fr() else { return };
         let old = f.state.replace(state);
+        if old.color != state.color {
+            apply_frame_colors(self.top, state.color);
+        }
         if old != state {
             // SAFETY: our live header window.
             unsafe {
@@ -798,8 +804,28 @@ fn header_message(hwnd: HWND, msg: u32, lp: LPARAM) -> Option<LRESULT> {
     }
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    COLORREF(u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16))
+const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
+}
+
+/// The title bar's colour when no track colour is known, and the header strip's.
+const FRAME_CAPTION: [u8; 3] = [0x3A, 0x4A, 0x66];
+const HEADER_BG: COLORREF = rgb(0x2B, 0x31, 0x3D);
+
+/// Colours the title bar and the window border with the track's colour, so the drag area and the
+/// window's edge stand out from both the DAW behind and the plugin's dark body, and the window
+/// says which channel it belongs to. Windows 11 only; older versions refuse the attributes and
+/// keep the system colours.
+fn apply_frame_colors(top: HWND, color: Option<[u8; 3]>) {
+    let [r, g, b] = color.unwrap_or(FRAME_CAPTION);
+    let bar = rgb(r, g, b);
+    // Dark text on a light bar, white on a dark one.
+    let light = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000 > 150;
+    let text = if light { rgb(0x10, 0x10, 0x10) } else { rgb(0xFF, 0xFF, 0xFF) };
+    for (attr, value) in [(DWMWA_CAPTION_COLOR, bar), (DWMWA_TEXT_COLOR, text), (DWMWA_BORDER_COLOR, bar)] {
+        // SAFETY: `top` is our live window; `value` is a COLORREF that lives across the call.
+        let _ = unsafe { DwmSetWindowAttribute(top, attr, (&value as *const COLORREF).cast(), std::mem::size_of::<COLORREF>() as u32) };
+    }
 }
 
 fn paint_header(hwnd: HWND) {
@@ -843,7 +869,7 @@ fn draw_header(hwnd: HWND, hdc: HDC, s: &EditorHeaderState) {
     // SAFETY: GDI calls on the paint DC of our window; every object created here is selected out
     // and deleted before returning.
     unsafe {
-        let bg = CreateSolidBrush(rgb(0x24, 0x24, 0x24));
+        let bg = CreateSolidBrush(HEADER_BG);
         FillRect(hdc, &r, bg);
         let _ = DeleteObject(HGDIOBJ(bg.0));
         let font = CreateFontW(

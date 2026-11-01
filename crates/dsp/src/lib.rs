@@ -321,6 +321,8 @@ pub struct EditorHeaderState {
     /// The editor window sends SoundCraft's shortcut keys (Space = play/stop, ...) to the app
     /// instead of the plugin.
     pub keys: bool,
+    /// The colour of the track the editor is open on; the window's title bar takes it.
+    pub color: Option<[u8; 3]>,
 }
 
 /// A click in an editor window's header, for the UI to apply as a command.

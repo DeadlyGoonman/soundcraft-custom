@@ -465,6 +465,22 @@ fn plugins_page(app: &mut SoundApp, ui: &mut egui::Ui) {
     {
         s.set_quick_scan_at_launch(quick);
     }
+    ui.add_space(10.0);
+    ui.label("Plugin window title bar");
+    let mut frame = app.extra.editor_frame.clone();
+    crate::widgets::checkbox(ui, &mut frame.track_color, "Use the track's colour");
+    ui.add_enabled_ui(frame.track_color, |ui| {
+        let mut strength = u32::from(frame.strength);
+        ui.add(egui::Slider::new(&mut strength, 0..=100).suffix(" %").text("Colour strength"));
+        frame.strength = strength as u8;
+    });
+    if frame != app.extra.editor_frame {
+        if let Err(e) = frame.save() {
+            app.ui.status = e;
+        }
+        app.extra.editor_frame = frame;
+    }
+    note(ui, "Lower is fainter. Saved in Documents/Soundcraft/Settings/plugin-window.json.");
     ui.add_space(6.0);
     open_button(app, ui, "Open Plugin Scanner…", "window.plugin_scanner");
 }

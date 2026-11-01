@@ -30,6 +30,8 @@ pub struct ExtraState {
     applied: Option<(f32, bool)>,
     /// Setup › Plugin Scanner (the saved plugin scan and background scans).
     pub plugin_scanner: plugin_scanner::PluginScanner,
+    /// Plugin editor window title bar look (Setup › Preferences › Plugins).
+    pub editor_frame: crate::editor_frame::EditorFrameSettings,
     /// The update check at launch and the update dialog (see `update`).
     pub update: update::UpdateChecker,
     /// Substitutes picked for an imported session's missing plugins.
@@ -52,6 +54,7 @@ impl Default for ExtraState {
             last_auto_update: 0.0,
             applied: None,
             plugin_scanner: plugin_scanner::PluginScanner::default(),
+            editor_frame: crate::editor_frame::EditorFrameSettings::default(),
             update: update::UpdateChecker::default(),
             missing_plugins: missing_plugins::MissingPluginsState::default(),
             device_rate: device_rate::DeviceRatePrompt::default(),

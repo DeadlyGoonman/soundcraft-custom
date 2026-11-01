@@ -11,6 +11,7 @@ pub mod data_dirs;
 pub mod dialogs;
 pub mod docking;
 pub mod edit_window;
+pub mod editor_frame;
 pub mod extra_windows;
 mod ffmpeg_setup;
 mod file_drop;
@@ -1030,6 +1031,7 @@ impl SoundApp {
                         native_scaling: p.editor_native_scaling(t.id, slot),
                         can_resize: false,
                         keys: self.ui.editor_keys,
+                        color: self.extra.editor_frame.bar_color(t.color),
                     },
                 );
             }
