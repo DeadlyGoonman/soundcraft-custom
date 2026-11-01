@@ -77,12 +77,18 @@ fn pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// Process strips, in parallel on native targets when there are enough of them.
+/// Below this many frames a block is too short to share with the workers: the fork and join cost
+/// more than the mixing, and on a small device buffer (32 or 48 frames) that cost lands in the
+/// callback as dropouts. 128 frames is 2.7 ms at 48 kHz.
+pub(crate) const MIN_PARALLEL_FRAMES: usize = 128;
+
+/// Process strips, in parallel on native targets when there are enough of them and the block is
+/// long enough to be worth sharing.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
+pub(crate) fn run_strips<T: Send>(work: &mut [T], frames: usize, f: impl Fn(&mut T) + Sync + Send) {
     use rayon::prelude::*;
     match pool() {
-        Some(pool) if work.len() >= 4 && !SERIAL_STRIPS.load(std::sync::atomic::Ordering::Relaxed) => {
+        Some(pool) if work.len() >= 4 && frames >= MIN_PARALLEL_FRAMES && !SERIAL_STRIPS.load(std::sync::atomic::Ordering::Relaxed) => {
             // The workers render on behalf of this thread: on the audio thread, they are it too.
             let audio = on_audio_thread();
             pool.install(|| work.par_iter_mut().for_each(|w| as_audio_thread(audio, || f(w))));
@@ -104,7 +110,7 @@ pub fn warm_up_workers() {
 pub fn warm_up_workers() {}
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn run_strips<T: Send>(work: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
+pub(crate) fn run_strips<T: Send>(work: &mut [T], _frames: usize, f: impl Fn(&mut T) + Sync + Send) {
     work.iter_mut().for_each(f);
 }
 
@@ -134,7 +140,7 @@ mod audio_thread_tests {
                 mark_audio_thread();
             }
             let mut work = vec![None; 64];
-            run_strips(&mut work, |w| {
+            run_strips(&mut work, MIN_PARALLEL_FRAMES, |w| {
                 // Long enough that the pool's workers take part.
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 *w = Some(on_audio_thread());
@@ -149,5 +155,18 @@ mod audio_thread_tests {
     fn strips_rendered_for_the_audio_thread_count_as_the_audio_thread_and_only_then() {
         assert!(seen_by_strips(true).iter().all(|&rt| rt), "a worker rendering for the audio thread is on it");
         assert!(seen_by_strips(false).iter().all(|&rt| !rt), "the workers don't stay marked afterwards");
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod short_block_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_block_runs_its_strips_on_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let mut work = vec![None; 64];
+        run_strips(&mut work, 32, |w| *w = Some(std::thread::current().id()));
+        assert!(work.iter().all(|w| *w == Some(caller)), "32-frame block must not fork to the pool");
     }
 }
