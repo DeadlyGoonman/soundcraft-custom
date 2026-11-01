@@ -155,10 +155,14 @@ fn download(installer: &Installer) -> Result<PathBuf, String> {
 
 /// Runs the installer once this process has exited, so it can replace the running files.
 fn install_after_exit(msi: &Path) -> Result<(), String> {
+    // The installer's own log sits beside the download, so a failed update leaves a trace.
+    let log = msi.with_extension("install.log");
+    let quote = |p: &Path| p.display().to_string().replace('\'', "''");
     let script = format!(
-        "Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process msiexec.exe -ArgumentList '/i','{}','/passive' -Wait",
+        "Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process msiexec.exe -ArgumentList '/i','{}','/passive','/l*v','{}' -Wait",
         std::process::id(),
-        msi.display().to_string().replace('\'', "''")
+        quote(msi),
+        quote(&log)
     );
     std::process::Command::new("powershell")
         .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
@@ -224,7 +228,11 @@ pub fn window(app: &mut SoundApp, ctx: &egui::Context) {
     if !open || later {
         app.extra.update.available = None;
     }
-    if start && let Some(installer) = info.installer {
+    // The installer starts only after SoundCraft exits, and an unsaved session holds the exit at a
+    // save prompt the update would never answer, so save first.
+    if start && app.engine.is_dirty() {
+        app.extra.update.status = Some("Save the session first (Ctrl+S), then click Update now.".into());
+    } else if start && let Some(installer) = info.installer {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let _ = tx.send(download(&installer));
