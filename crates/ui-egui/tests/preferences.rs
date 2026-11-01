@@ -31,7 +31,8 @@ fn hello(projects: &Path, pick: Option<PathBuf>) -> Harness<'static, SoundApp> {
     let pick_folder: Option<Box<dyn Fn(&Path) -> Option<PathBuf>>> =
         pick.map(|p| Box::new(move |_: &Path| Some(p.clone())) as Box<dyn Fn(&Path) -> Option<PathBuf>>);
     let mut app = SoundApp::new(engine, None, Services { pick_folder, ..Default::default() });
-    app.ui.preferences.default_projects_dir = projects.to_string_lossy().into();
+    // Projects always live in `Projects` under the SoundCraft data folder.
+    app.ui.preferences.data_root = projects.to_string_lossy().into();
     let mut h = harness(app);
     let s = h.state_mut();
     assert!(s.dialogs.open_for_command(&s.engine, "session.save_as"));
@@ -93,7 +94,7 @@ fn project_defaults_persist_and_older_ui_json_loads() {
 fn a_new_project_is_saved_in_its_own_folder_inside_the_projects_folder() {
     let projects = temp("default");
     let mut h = hello(&projects, None);
-    let want = projects.join("hello").join("hello.scraft");
+    let want = projects.join("Projects").join("hello").join("hello.scraft");
     assert_eq!(prompt_path(&h), want.to_string_lossy());
     h.get_by_label(&format!("Will be saved to: {}", want.display()));
     ok(&mut h);
@@ -129,10 +130,10 @@ fn without_a_project_folder_the_session_goes_straight_into_the_folder() {
     let mut h = hello(&projects, None);
     h.get_by_label("Create a folder for the project").click();
     h.run_steps(2);
-    let want = projects.join("hello.scraft");
+    let want = projects.join("Projects").join("hello.scraft");
     assert_eq!(prompt_path(&h), want.to_string_lossy());
     ok(&mut h);
     assert!(want.is_file());
-    assert!(!projects.join("hello").exists());
+    assert!(!projects.join("Projects").join("hello").exists());
     let _ = std::fs::remove_dir_all(&projects);
 }

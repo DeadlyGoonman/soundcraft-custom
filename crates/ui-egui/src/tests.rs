@@ -1694,3 +1694,18 @@ fn hover_hints_default_on_and_load_from_older_ui_files() {
     let off: crate::preferences::Prefs = serde_json::from_str(r#"{"hover_hints":false}"#).unwrap();
     assert!(!off.hover_hints);
 }
+
+#[test]
+fn save_as_template_and_new_project_use_the_data_folders() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    app.ui.preferences.data_root = "D:/SC-root".into();
+    app.dialogs.template_folder = crate::data_dirs::DataDirs::from_pref("D:/SC-root").templates.to_string_lossy().into_owned();
+    app.dialogs.project_defaults.dir = app.ui.preferences.projects_dir();
+    app.dialogs.open_for_command(&app.engine, "session.save_template");
+    let Some(crate::dialogs::Dialog::PathPrompt { path, .. }) = app.dialogs.open.clone() else { panic!("template prompt") };
+    assert!(path.replace('\\', "/").starts_with("D:/SC-root/Templates/"), "{path}");
+    assert!(path.ends_with(".scraft"), "{path}");
+    app.dialogs.open_for_command(&app.engine, "session.save_as");
+    let Some(crate::dialogs::Dialog::PathPrompt { path, .. }) = app.dialogs.open.clone() else { panic!("save prompt") };
+    assert!(path.replace('\\', "/").starts_with("D:/SC-root/Projects/"), "{path}");
+}

@@ -102,6 +102,8 @@ pub enum LoopBy {
 
 #[derive(Default)]
 pub struct Dialogs {
+    /// The SoundCraft Templates folder, where Save As Template puts new templates.
+    pub template_folder: String,
     pub open: Option<Dialog>,
     /// Runs once the session has been saved from `SaveChanges`.
     after_save: Option<(String, Value)>,
@@ -229,6 +231,10 @@ impl Dialogs {
             "session.open" => Dialog::PathPrompt { cmd: id.into(), title: "Open Session".into(), path: home, key: "path".into() },
             "session.new_from_template" => {
                 Dialog::PathPrompt { cmd: id.into(), title: "New Session from Template".into(), path: home, key: "path".into() }
+            }
+            "session.save_template" => {
+                let file = std::path::Path::new(&self.template_folder).join(format!("{name}.{}", soundcraft_model::SESSION_EXTENSION));
+                Dialog::PathPrompt { cmd: id.into(), title: "Save As Template".into(), path: file.to_string_lossy().into_owned(), key: "path".into() }
             }
             "session.save" if e.path.is_some() => return false,
             "session.save" | "session.save_as" | "session.save_copy" => Dialog::PathPrompt {

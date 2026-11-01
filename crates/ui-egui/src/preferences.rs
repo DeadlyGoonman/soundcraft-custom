@@ -58,9 +58,9 @@ impl Default for Prefs {
 pub const DEFAULT_BOUNCE_FOLDER: &str = "Bounced Files";
 
 impl Prefs {
-    /// The projects folder in use: the chosen one, or the platform default when it is blank.
+    /// The projects folder in use: always `Projects` inside the SoundCraft data folder.
     pub fn projects_dir(&self) -> String {
-        if self.default_projects_dir.trim().is_empty() { platform_projects_dir() } else { self.default_projects_dir.trim().to_string() }
+        crate::data_dirs::DataDirs::from_pref(&self.data_root).projects.to_string_lossy().into_owned()
     }
 
     pub fn bounce_folder(&self) -> &str {
@@ -223,6 +223,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     let prefs = &app.ui.preferences;
     app.dialogs.project_defaults =
         ProjectDefaults { dir: prefs.projects_dir(), subfolder: prefs.project_subfolder, bounce_folder: prefs.bounce_folder().into() };
+    app.dialogs.template_folder = crate::data_dirs::DataDirs::from_pref(&prefs.data_root).templates.to_string_lossy().into_owned();
     let mut open = app.ui.preferences.show;
     if !open {
         return;
@@ -303,20 +304,15 @@ fn data_folder(app: &mut SoundApp, ui: &mut egui::Ui) {
 fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
     match app.ui.preferences.page {
         Page::General => {
-            ui.label("Default projects folder");
+            ui.label("Projects folder");
             let prefs = &mut app.ui.preferences;
-            crate::widgets::named_text_field(
-                ui.add(egui::TextEdit::singleline(&mut prefs.default_projects_dir).desired_width(420.0)),
-                "Default projects folder",
-            );
-            if let Some(pick) = &app.services.pick_folder
-                && ui.button("Browse…").clicked()
-                && let Some(dir) = pick(Path::new(&prefs.projects_dir()))
-            {
-                prefs.default_projects_dir = dir.to_string_lossy().into_owned();
-            }
+            let projects = prefs.projects_dir();
+            ui.label(egui::RichText::new(&projects).weak());
             crate::widgets::checkbox(ui, &mut prefs.project_subfolder, "Create a folder for each new project");
-            note(ui, "A new project called “hello” is saved as <folder>/hello/hello.scraft. Save Session As can pick another folder each time.");
+            note(
+                ui,
+                "Projects follow the SoundCraft data folder below. A new project called “hello” is saved as <projects folder>/hello/hello.scraft.",
+            );
             ui.add_space(10.0);
             ui.separator();
             data_folder(app, ui);
@@ -475,8 +471,8 @@ mod tests {
         let p: Prefs = serde_json::from_value(json!({"project_subfolder": false})).unwrap();
         assert!(!p.project_subfolder);
         assert_eq!(p.bounce_folder(), DEFAULT_BOUNCE_FOLDER);
-        assert_eq!(p.projects_dir(), platform_projects_dir());
-        let blank = Prefs { default_projects_dir: " ".into(), ..Prefs::default() };
-        assert_eq!(blank.projects_dir(), platform_projects_dir());
+        assert_eq!(p.projects_dir(), crate::data_dirs::DataDirs::from_pref("").projects.to_string_lossy());
+        let moved = Prefs { data_root: "D:/SC".into(), default_projects_dir: "C:/old".into(), ..Prefs::default() };
+        assert_eq!(moved.projects_dir(), crate::data_dirs::DataDirs::from_pref("D:/SC").projects.to_string_lossy());
     }
 }
