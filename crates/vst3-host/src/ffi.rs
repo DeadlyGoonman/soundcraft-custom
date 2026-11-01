@@ -2151,7 +2151,10 @@ impl EditorLink {
         // Native scaling unless the user opted into an upscaler: a plugin that can't scale itself
         // then opens at its own size.
         let upscale_mode = matches!(g.scale.mode, soundcraft_dsp::EditorScaleMode::Upscale(_));
-        let factor = if native || upscale_mode { g.scale.clamped_factor() } else { 1.0 };
+        // A resizable view owns its size (many, Pro-Q among them, remember the last one for every
+        // instance): applying the remembered factor to that size shrinks it again on each open.
+        let owns_size = !upscale_mode && EditorLink::can_resize(&view);
+        let factor = if (native && !owns_size) || upscale_mode { g.scale.clamped_factor() } else { 1.0 };
         let choice = plan(g.scale.mode, factor, native).map_err(str::to_string)?;
         let upscale = match choice {
             Choice::Upscale(filter) => Some(filter),
