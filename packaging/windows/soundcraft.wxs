@@ -55,30 +55,30 @@
         </File>
 
         <!-- .scraft: SoundCraft's own session format; SoundCraft is its default app. -->
-        <ProgId Id="SoundCraft.Session" Description="SoundCraft Session" Icon="SoundcraftExe" IconIndex="0">
+        <ProgId Id="SoundCraft.Fork.Session" Description="SoundCraft Session" Icon="SoundcraftExe" IconIndex="0">
           <Extension Id="scraft" ContentType="application/x-soundcraft-session">
             <Verb Id="open" Command="Open" TargetFile="SoundcraftExe" Argument="&quot;%1&quot;" />
           </Extension>
         </ProgId>
         <!-- .ptx: session files SoundCraft imports; double-clicking opens them in SoundCraft. -->
-        <ProgId Id="SoundCraft.Ptx" Description="Session File (import)" Icon="SoundcraftExe" IconIndex="0">
+        <ProgId Id="SoundCraft.Fork.Ptx" Description="Session File (import)" Icon="SoundcraftExe" IconIndex="0">
           <Extension Id="ptx" ContentType="application/x-soundcraft-import">
             <Verb Id="open" Command="Open" TargetFile="SoundcraftExe" Argument="&quot;%1&quot;" />
           </Extension>
         </ProgId>
         <!-- Audio and MIDI files: offered under "Open with" (imported into a session), never forced
              as the default. -->
-        <ProgId Id="SoundCraft.Audio" Description="Audio File" Icon="SoundcraftExe" IconIndex="0" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SoundCraft.Audio\shell\open\command" Value="&quot;[#SoundcraftExe]&quot; &quot;%1&quot;" Type="string" />
-        <ProgId Id="SoundCraft.Midi" Description="MIDI File" Icon="SoundcraftExe" IconIndex="0" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SoundCraft.Midi\shell\open\command" Value="&quot;[#SoundcraftExe]&quot; &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.wav\OpenWithProgids" Name="SoundCraft.Audio" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.aif\OpenWithProgids" Name="SoundCraft.Audio" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.aiff\OpenWithProgids" Name="SoundCraft.Audio" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.flac\OpenWithProgids" Name="SoundCraft.Audio" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.mp3\OpenWithProgids" Name="SoundCraft.Audio" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.mid\OpenWithProgids" Name="SoundCraft.Midi" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.midi\OpenWithProgids" Name="SoundCraft.Midi" Value="" Type="string" />
+        <ProgId Id="SoundCraft.Fork.Audio" Description="Audio File" Icon="SoundcraftExe" IconIndex="0" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\SoundCraft.Fork.Audio\shell\open\command" Value="&quot;[#SoundcraftExe]&quot; &quot;%1&quot;" Type="string" />
+        <ProgId Id="SoundCraft.Fork.Midi" Description="MIDI File" Icon="SoundcraftExe" IconIndex="0" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\SoundCraft.Fork.Midi\shell\open\command" Value="&quot;[#SoundcraftExe]&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.wav\OpenWithProgids" Name="SoundCraft.Fork.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.aif\OpenWithProgids" Name="SoundCraft.Fork.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.aiff\OpenWithProgids" Name="SoundCraft.Fork.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.flac\OpenWithProgids" Name="SoundCraft.Fork.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.mp3\OpenWithProgids" Name="SoundCraft.Fork.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.mid\OpenWithProgids" Name="SoundCraft.Fork.Midi" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.midi\OpenWithProgids" Name="SoundCraft.Fork.Midi" Value="" Type="string" />
 
         <!-- "Open with" app list and the Run dialog (Win+R "soundcraft"). -->
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\soundcraft.exe" Name="FriendlyAppName" Value="SoundCraft" Type="string" />
