@@ -297,6 +297,8 @@ pub struct Tokens {
     pub slot_empty: Color32,
     pub slot_face: [Color32; 2],
     pub slot_bypassed: [Color32; 2],
+    /// A slot that prints on record: one static red.
+    pub slot_print: [Color32; 2],
     pub slot_mark: Color32,
 }
 
@@ -383,6 +385,7 @@ impl Tokens {
         slot_empty: Color32::from_rgb(39, 39, 39),
         slot_face: [Color32::from_rgb(92, 92, 92), Color32::from_rgb(75, 75, 75)],
         slot_bypassed: [Color32::from_rgb(66, 96, 146), Color32::from_rgb(50, 76, 120)],
+        slot_print: [Color32::from_rgb(170, 48, 48), Color32::from_rgb(130, 32, 32)],
         slot_mark: Color32::from_rgb(159, 159, 159),
     };
 
@@ -502,6 +505,7 @@ impl Tokens {
         slot_empty: Color32::from_rgb(198, 200, 205),
         slot_face: [Color32::from_rgb(244, 245, 247), Color32::from_rgb(214, 216, 220)],
         slot_bypassed: [Color32::from_rgb(190, 210, 240), Color32::from_rgb(160, 186, 228)],
+        slot_print: [Color32::from_rgb(232, 150, 150), Color32::from_rgb(214, 118, 118)],
         slot_mark: Color32::from_rgb(92, 95, 102),
     };
 

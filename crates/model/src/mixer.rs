@@ -429,6 +429,9 @@ pub struct Insert {
     pub params: BTreeMap<String, f32>,
     #[serde(default)]
     pub bypass: bool,
+    /// Print on record: a record-time copy of this plugin is baked into the take's file.
+    #[serde(default)]
+    pub print: bool,
     /// Delta monitoring: the slot outputs only what the plugin changed (wet minus dry,
     /// latency-compensated). A listening aid, never saved.
     #[serde(skip)]
@@ -457,6 +460,7 @@ impl Insert {
             plugin: plugin.into(),
             params: BTreeMap::new(),
             bypass: false,
+            print: false,
             delta: false,
             active: true,
             preset: String::from("<factory default>"),

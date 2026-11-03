@@ -351,13 +351,31 @@ impl Recorder {
     /// Create each take's file and start recording into them: a track's take records the given
     /// input channels into a new file.
     pub fn arm(&mut self, takes: Vec<(TrackId, Vec<usize>, PathBuf)>, depth: RecordDepth) -> Result<(), String> {
+        self.arm_printed(takes, depth, Vec::new())
+    }
+
+    /// [`Recorder::arm`], with a print chain for some tracks ("Print on record"): that track's
+    /// file holds its raw input run through the chain, lined up with the unprocessed take.
+    pub fn arm_printed(
+        &mut self,
+        takes: Vec<(TrackId, Vec<usize>, PathBuf)>,
+        depth: RecordDepth,
+        mut chains: Vec<(TrackId, soundcraft_mix::PrintChain)>,
+    ) -> Result<(), String> {
         if self.writer.is_some() {
             return Err("already recording".into());
         }
         let takes = takes
             .into_iter()
-            .map(|(id, inputs, path)| TakeWriter::create(id, inputs, path, self.sample_rate, depth))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|(id, inputs, path)| {
+                let mut t = TakeWriter::create(id, inputs, path, self.sample_rate, depth)?;
+                if let Some(i) = chains.iter().position(|(c, _)| *c == id) {
+                    let (_, chain) = chains.swap_remove(i);
+                    t.print = Some(Print { skip: chain.latency(), chain });
+                }
+                Ok(t)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let live = takes.iter().map(|t| (t.id, Arc::clone(&t.live))).collect();
         let ring = &self.shared.ring;
         ring.tail.store(ring.head.load(Ordering::Acquire), Ordering::Release);
@@ -453,6 +471,7 @@ fn write_takes(shared: &Shared, mut takes: Vec<TakeWriter>, channels: usize) -> 
     }
     let (mut done, mut problem) = (Vec::new(), None);
     for mut t in takes {
+        t.flush_print();
         t.write_header();
         if t.frames == 0 {
             let _ = std::fs::remove_file(&t.path);
@@ -475,6 +494,44 @@ struct TakeWriter {
     frames: u64,
     error: Option<String>,
     live: Arc<Mutex<LiveTake>>,
+    print: Option<Print>,
+}
+
+/// Frames the print chain is fed at a time.
+pub const PRINT_BLOCK: usize = 1024;
+
+/// A take's print chain and the leading frames (its latency) still to drop from its output.
+struct Print {
+    chain: soundcraft_mix::PrintChain,
+    skip: usize,
+}
+
+impl Print {
+    /// Runs `data` (interleaved, `n` channels) through the chain in place, dropping the chain's
+    /// latency from the start so the output lines up with the input.
+    fn run(&mut self, data: &mut Vec<f32>, n: usize) {
+        let n = n.max(1);
+        let mut out = Vec::with_capacity(data.len());
+        let mut planar = vec![vec![0.0f32; PRINT_BLOCK]; n];
+        for chunk in data.chunks(PRINT_BLOCK * n) {
+            let frames = chunk.len() / n;
+            for (i, f) in chunk.chunks_exact(n).enumerate() {
+                for (c, x) in planar.iter_mut().zip(f) {
+                    if let Some(d) = c.get_mut(i) {
+                        *d = *x;
+                    }
+                }
+            }
+            self.chain.process(&mut planar, frames);
+            for i in 0..frames {
+                out.extend(planar.iter().map(|c| c.get(i).copied().unwrap_or(0.0)));
+            }
+        }
+        let drop = self.skip.min(out.len() / n);
+        out.drain(..drop * n);
+        self.skip -= drop;
+        *data = out;
+    }
 }
 
 impl TakeWriter {
@@ -482,7 +539,7 @@ impl TakeWriter {
         let file = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| File::create_new(&path));
         let file = file.map_err(|e| format!("{}: {e}", path.display()))?;
         let live = Arc::new(Mutex::new(vec![Vec::new(); inputs.len()]));
-        let mut take = TakeWriter { id, inputs, path, file, rate, depth, frames: 0, error: None, live };
+        let mut take = TakeWriter { id, inputs, path, file, rate, depth, frames: 0, error: None, live, print: None };
         take.write_header();
         take.error.take().map_or(Ok(take), Err)
     }
@@ -490,31 +547,47 @@ impl TakeWriter {
     /// Append this take's channels of `block` (interleaved, `channels` wide).
     fn write(&mut self, block: &[f32], channels: usize) {
         let channels = channels.max(1);
+        let mut data = Vec::with_capacity(block.len() / channels * self.inputs.len());
+        for f in block.chunks_exact(channels) {
+            data.extend(self.inputs.iter().map(|&i| f.get(i).copied().unwrap_or(0.0)));
+        }
+        self.append(data);
+    }
+
+    /// Run the rest of the print chain's tail out, so the file ends as long as the raw take.
+    fn flush_print(&mut self) {
+        let Some(lat) = self.print.as_ref().map(|p| p.chain.latency()) else { return };
+        self.append(vec![0.0; lat.saturating_mul(self.inputs.len())]);
+    }
+
+    /// Write `data` (this take's channels, interleaved), through the print chain if it has one.
+    fn append(&mut self, mut data: Vec<f32>) {
+        let n = self.inputs.len().max(1);
         if self.error.is_some() {
             return;
         }
-        let mut bytes = Vec::with_capacity(block.len() / channels * self.inputs.len() * 4);
-        for f in block.chunks_exact(channels) {
-            for &i in &self.inputs {
-                push_sample(&mut bytes, f.get(i).copied().unwrap_or(0.0), self.depth);
-            }
+        if let Some(p) = &mut self.print {
+            p.run(&mut data, n);
+        }
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for &x in &data {
+            push_sample(&mut bytes, x, self.depth);
         }
         match self.file.write_all(&bytes) {
             Ok(()) => {
-                self.summarize(block, channels);
-                self.frames += (block.len() / channels) as u64;
+                self.summarize(&data, n);
+                self.frames += (data.len() / n) as u64;
             }
             Err(e) => self.fail(e),
         }
     }
 
-    /// Add this take's channels of `block` to its live take.
-    fn summarize(&self, block: &[f32], channels: usize) {
+    /// Add `data` (this take's channels, interleaved) to its live take.
+    fn summarize(&self, data: &[f32], n: usize) {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        for (f, n) in block.chunks_exact(channels).zip(self.frames..) {
-            let at = (n / LIVE_BLOCK as u64) as usize;
-            for (blocks, &i) in live.iter_mut().zip(&self.inputs) {
-                let v = f.get(i).copied().unwrap_or(0.0);
+        for (f, at) in data.chunks_exact(n).zip(self.frames..) {
+            let at = (at / LIVE_BLOCK as u64) as usize;
+            for (blocks, &v) in live.iter_mut().zip(f) {
                 match blocks.get_mut(at) {
                     Some(b) => *b = (b.0.min(v), b.1.max(v)),
                     None if at < LIVE_BLOCKS => blocks.push((v, v)),
@@ -710,6 +783,41 @@ mod tests {
         take.write(&input[3 * 100..], 3);
         let live = take.live.lock().unwrap().clone();
         assert_eq!(live, [[(-127.0, 0.0), (-255.0, -128.0), (-299.0, -256.0)], [(0.0, 127.0), (128.0, 255.0), (256.0, 299.0)]]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_printed_take_is_the_raw_input_through_the_chain_and_lines_up() {
+        use soundcraft_model::{Insert, Session};
+        let dir = std::env::temp_dir().join(format!("soundcraft-print-take-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Session::default();
+        let t = s.add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, Some("Vox"));
+        let mut g = Insert::new("gain");
+        g.params.insert("gain".into(), -6.0);
+        g.print = true;
+        let mut lim = Insert::new("maximizer");
+        lim.print = true;
+        let unflagged = Insert::new("compressor");
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(unflagged);
+        s.track_mut(t).unwrap().mixer.inserts[1] = Some(g);
+        s.track_mut(t).unwrap().mixer.inserts[2] = Some(lim);
+        let chain = soundcraft_mix::PrintChain::new(s.track(t).unwrap(), 48_000.0, PRINT_BLOCK, 1);
+        assert_eq!(chain.ids(), ["gain", "maximizer"]);
+        let lat = chain.latency();
+        assert!(lat > 0);
+        let mut take = TakeWriter::create(t, vec![0], dir.join("Vox_01.wav"), 48_000, RecordDepth::Float32).unwrap();
+        take.print = Some(Print { skip: lat, chain });
+        let input: Vec<f32> = (0..9_000).map(|i| 0.2 * (i as f32 * 0.05).sin()).collect();
+        for part in input.chunks(700) {
+            take.write(part, 1);
+        }
+        take.flush_print();
+        take.write_header();
+        let out = decode(&take.path).remove(0);
+        assert_eq!(out.len(), input.len(), "same length as the raw take");
+        assert!(out.iter().zip(&input).any(|(o, i)| (o - i).abs() > 0.01), "the chain is in the file");
+        assert!(out.iter().all(|x| x.is_finite()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

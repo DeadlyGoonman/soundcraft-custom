@@ -642,9 +642,21 @@ pub(crate) fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: 
         None => empty_slot(ui.painter(), r, resp.hovered(), Mark::Dot, track_tint(t.slot_empty, track.color, TRACK_TINT_EMPTY)),
         Some(i) => {
             // A bypassed insert keeps its blue face: that colour means bypassed.
-            let faces = if i.bypass { t.slot_bypassed } else { track_faces(t.slot_face, track.color) };
+            // A printing insert is one static red; bypass wins when both are set.
+            let faces = if i.bypass {
+                t.slot_bypassed
+            } else if i.print {
+                t.slot_print
+            } else {
+                track_faces(t.slot_face, track.color)
+            };
             let color = if info.is_some() { t.text } else { t.text_dim };
             used_slot(ui.painter(), r, faces, Mark::Dot, name, color, None);
+            if i.print {
+                let badge = ui.painter().layout_no_wrap("P".into(), bold(8.0), t.text);
+                let at = pos2(r.max.x - badge.size().x - 3.0, r.min.y + 1.0);
+                ui.painter().galley(at, badge, t.text);
+            }
         }
     }
     // Pro Tools-style reorder: drag a used insert onto another insert of the same track to swap them.
@@ -769,6 +781,10 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
     if occupied {
         if ui.button("Bypass").clicked() {
             run_pick(app, ui, "mix.insert_bypass", json!({"track": id.0, "slot": slot}));
+        }
+        let printing = app.engine.session().track(id).and_then(|t| t.mixer.inserts.get(slot)).and_then(Option::as_ref).is_some_and(|i| i.print);
+        if ui.checkbox(&mut { printing }, "Print on record").clicked() {
+            run_pick(app, ui, "mix.insert_print", json!({"track": id.0, "slot": slot}));
         }
         if ui.button("no insert").clicked() {
             run_pick(app, ui, "mix.insert_remove", json!({"track": id.0, "slot": slot}));

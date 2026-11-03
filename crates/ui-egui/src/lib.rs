@@ -835,16 +835,27 @@ impl SoundApp {
     fn arm_recorder(&mut self) -> Result<Vec<soundcraft_engine::io::Take>, String> {
         let name = soundcraft_engine::io::sanitize_name(&self.engine.session().name);
         let unsaved_dir = self.autosave_dir.as_ref().map_or_else(std::env::temp_dir, |d| d.join(name));
+        // Hosted plugins print from their current state.
+        self.capture_plugin_states();
         let Some(r) = &mut self.recorder else { return Err("no audio input device".into()) };
         let plan = soundcraft_engine::io::plan_takes(&self.engine, &unsaved_dir, r.channels);
         if plan.is_empty() {
             return Err("no audio track is record-enabled".into());
         }
-        let takes = plan
-            .iter()
-            .map(|(track, inputs, path)| soundcraft_engine::io::Take { track: *track, path: path.clone(), channels: inputs.len() })
-            .collect();
-        r.arm(plan, self.ui.audio.record_depth)?;
+        let mut chains = Vec::new();
+        let mut takes: Vec<soundcraft_engine::io::Take> = Vec::new();
+        for (track, inputs, path) in &plan {
+            let mut printed = Vec::new();
+            if let Some(t) = self.engine.session().track(*track) {
+                let chain = soundcraft_mix::PrintChain::new(t, r.sample_rate as f32, soundcraft_playback::record::PRINT_BLOCK, inputs.len());
+                if !chain.is_empty() {
+                    printed = chain.ids();
+                    chains.push((*track, chain));
+                }
+            }
+            takes.push(soundcraft_engine::io::Take { track: *track, path: path.clone(), channels: inputs.len(), printed });
+        }
+        r.arm_printed(plan, self.ui.audio.record_depth, chains)?;
         Ok(takes)
     }
 

@@ -95,6 +95,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("mix.insert", "Insert Plugin", [], None, "{track?, slot?: 0..9 | a..j, plugin: id, params?: {id: value}}", has_selection, insert),
         cmd!("mix.insert_remove", "Remove Insert", [], None, "{track?, slot}", has_selection, insert_remove),
         cmd!("mix.insert_bypass", "Bypass Insert", [], None, "{track?, slot, value?: bool}", has_selection, insert_bypass),
+        cmd!("mix.insert_print", "Print Insert on Record", [], None, "{track?, slot, value?: bool}", has_selection, insert_print),
         cmd!(
             noundo "mix.insert_delta",
             "Delta Monitor Insert",
@@ -377,6 +378,16 @@ fn insert_bypass(e: &mut Engine, p: &Value) -> Result<Value> {
         .ok_or_else(|| bad("mix.insert_bypass", "empty slot"))?;
     ins.bypass = val.unwrap_or(!ins.bypass);
     Ok(json!({"bypass": ins.bypass}))
+}
+
+fn insert_print(e: &mut Engine, p: &Value) -> Result<Value> {
+    let (t, slot) = track_slot(e, p, "mix.insert_print", INSERT_SLOTS)?;
+    let val = p.get("value").and_then(Value::as_bool);
+    let s = e.session_mut();
+    let ins =
+        s.track_mut(t).and_then(|tr| tr.mixer.inserts.get_mut(slot)).and_then(Option::as_mut).ok_or_else(|| bad("mix.insert_print", "empty slot"))?;
+    ins.print = val.unwrap_or(!ins.print);
+    Ok(json!({"print": ins.print}))
 }
 
 fn insert_delta(e: &mut Engine, p: &Value) -> Result<Value> {

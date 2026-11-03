@@ -136,6 +136,9 @@ pub struct Clip {
     /// `clip.unloop` still recognises the loop after the source's content is edited.
     #[serde(default)]
     pub loop_id: Option<u64>,
+    /// Plugin ids baked into this clip's source when it was recorded (Print on record).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub printed: Vec<String>,
 }
 
 fn one() -> f64 {
@@ -163,6 +166,7 @@ impl Clip {
             stretch: 1.0,
             group: None,
             loop_id: None,
+            printed: Vec::new(),
         }
     }
 

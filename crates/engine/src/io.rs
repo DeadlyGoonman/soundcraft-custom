@@ -1874,18 +1874,22 @@ pub struct Take {
     pub track: TrackId,
     pub path: PathBuf,
     pub channels: usize,
+    /// Plugin ids printed into the file (Print on record).
+    #[serde(default)]
+    pub printed: Vec<String>,
 }
 
 /// Place recorded take files as `plan` says, as one undo step ("Record").
 pub fn place_recording(e: &mut Engine, plan: &Recording, takes: Vec<(TrackId, PathBuf)>) -> Vec<soundcraft_model::ClipId> {
-    add_recording_in(e, plan.start, takes, plan.pass, plan.punch)
+    let printed: Vec<_> = plan.takes.iter().filter(|t| !t.printed.is_empty()).map(|t| (t.track, t.printed.clone())).collect();
+    add_recording_in(e, plan.start, takes, plan.pass, plan.punch, &printed)
 }
 
 /// Turn recorded take files into clips at `start`, as one undo step ("Record"); each file is the
 /// source of its clips. With `pass` (loop recording), a take becomes one clip per pass (at most
 /// 1000), each pass after the first on a new playlist.
 pub fn add_recording(e: &mut Engine, start: Samples, takes: Vec<(TrackId, PathBuf)>, pass: Option<Samples>) -> Vec<soundcraft_model::ClipId> {
-    add_recording_in(e, start, takes, pass, None)
+    add_recording_in(e, start, takes, pass, None, &[])
 }
 
 /// [`add_recording`] limited to the `punch` range: each clip is cut to it before it's placed, so
@@ -1896,6 +1900,7 @@ fn add_recording_in(
     takes: Vec<(TrackId, PathBuf)>,
     pass: Option<Samples>,
     punch: Option<Range>,
+    printed: &[(TrackId, Vec<String>)],
 ) -> Vec<soundcraft_model::ClipId> {
     let before = e.session_arc();
     let mut out = Vec::new();
@@ -1933,7 +1938,11 @@ fn add_recording_in(
                 t.active_playlist = t.playlists.len() - 1;
             }
             let cid = s.new_clip_id();
-            crate::edit::place_clip(s, tid, Clip::audio(cid, name, src, offset.saturating_add(cut), clip_start, clip_len));
+            let mut clip = Clip::audio(cid, name, src, offset.saturating_add(cut), clip_start, clip_len);
+            if let Some((_, ids)) = printed.iter().find(|(t, _)| *t == tid) {
+                clip.printed.clone_from(ids);
+            }
+            crate::edit::place_clip(s, tid, clip);
             out.push(cid);
         }
     }
@@ -2031,7 +2040,7 @@ mod record_tests {
             pass: None,
             punch: Some(Range::new(1_400, 1_600)),
             rate: 48_000,
-            takes: vec![Take { track: vox, path: take.clone(), channels: 1 }],
+            takes: vec![Take { track: vox, path: take.clone(), channels: 1, printed: Vec::new() }],
         };
         place_recording(&mut e, &plan, vec![(vox, take)]);
         let clips: Vec<_> = e.session().track(vox).unwrap().clips().iter().map(|c| (c.start, c.length, c.source_offset())).collect();

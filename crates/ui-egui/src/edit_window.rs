@@ -1053,6 +1053,11 @@ fn auto_lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, param: 
             _ => None,
         };
     }
+    // Right-click puts a breakpoint exactly under the pointer (time and height); undo removes it.
+    if resp.secondary_clicked() && point_hit.is_none() {
+        let value = auto_value(lane, lane_range(track, param), p.y);
+        let _ = app.run("automation.set_point", json!({"track": track.id.0, "param": param.id(), "at": at, "value": value}));
+    }
     if resp.clicked() {
         match (point_hit, tool) {
             // Alt-click deletes a breakpoint, as in Pro Tools.
@@ -2330,7 +2335,22 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     }
     // The clip may have been removed or moved since the right-click; only use it if it still exists.
     let menu_clip = ui.ctx().data(|d| d.get_temp::<Option<ClipId>>(menu_clip_id)).flatten().filter(|c| track.clips().iter().any(|x| x.id == *c));
-    resp.context_menu(|ui| clip_context_menu(app, ui, menu_clip));
+    // While the lane shows automation, right-click places a breakpoint under the pointer instead of the clip menu.
+    let shown = shown_automation(track);
+    if let Some(param) = &shown {
+        if resp.secondary_clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            let s = app.engine.session_arc();
+            let at = sample_at(&s, tl, p.x).max(0);
+            if breakpoint_at(&s, tl, lane, track, param, p).is_none() {
+                let value = auto_value(lane, lane_range(track, param), p.y);
+                let _ = app.run("automation.set_point", json!({"track": track.id.0, "param": param.id(), "at": at, "value": value}));
+            }
+        }
+    } else {
+        resp.context_menu(|ui| clip_context_menu(app, ui, menu_clip));
+    }
     // Before the pointer-position bail-out below: the box sits over the lane, so the lane is not hovered.
     gain_text_edit(app, ui, track, lane, tl);
     // Audio files dropped from the Clip List.

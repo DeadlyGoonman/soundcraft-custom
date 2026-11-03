@@ -2409,6 +2409,59 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
     out
 }
 
+/// The record-time copy of a track's "print on record" inserts: second instances of the flagged
+/// plugins, in chain order, with the live inserts' parameters and state at creation. Raw input goes
+/// in, the take's file content comes out; unflagged inserts are not part of it. Not realtime-safe
+/// to create; `process` is for a writer thread.
+pub struct PrintChain {
+    slots: Vec<PluginSlot>,
+}
+
+impl PrintChain {
+    /// Instances for `t`'s active, unbypassed, flagged inserts, prepared for `ch` channels. A plugin
+    /// that can't be created is left out with a warning, so it is not claimed by [`PrintChain::ids`].
+    pub fn new(t: &Track, sample_rate: f32, max_block: usize, ch: usize) -> PrintChain {
+        let mut slots = Vec::new();
+        for ins in t.mixer.inserts.iter().flatten().filter(|i| i.print && i.active && !i.bypass) {
+            let state = if is_third_party(&ins.plugin) { ins.state_bytes() } else { None };
+            let Some(n) = create_instance(&ins.plugin, state.as_deref(), sample_rate, max_block, ch) else {
+                log::warn!("print on record: cannot create a second instance of {}; it is not printed", ins.plugin);
+                continue;
+            };
+            let mut slot = PluginSlot::new(ins.plugin.clone(), ch, n.plugin, max_block);
+            apply_values(&mut slot, ins, |_, v| v);
+            slot.plugin.flush_params();
+            if !is_third_party(&ins.plugin) {
+                // Built-in smoothers start at their values, not glide there from the defaults.
+                slot.plugin.prepare(sample_rate, max_block, ch);
+            }
+            slots.push(slot);
+        }
+        PrintChain { slots }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Plugin ids baked in, in chain order.
+    pub fn ids(&self) -> Vec<String> {
+        self.slots.iter().map(|s| s.id.clone()).collect()
+    }
+
+    /// Total latency of the chain in samples.
+    pub fn latency(&self) -> usize {
+        self.slots.iter().map(|s| s.plugin.latency()).sum::<usize>().min(MAX_LATENCY)
+    }
+
+    /// Runs `frames` (at most the `max_block` given to `new`) of `buf` through the chain in place.
+    pub fn process(&mut self, buf: &mut [Vec<f32>], frames: usize) {
+        for slot in self.slots.iter_mut().filter(|s| !s.failed) {
+            run_insert(slot, false, buf, frames);
+        }
+    }
+}
+
 /// A built-in plugin, else a hosted CLAP plugin (`clap:<id>`).
 fn create_plugin(id: &str) -> Option<Box<dyn Plugin>> {
     soundcraft_dsp::create(id)
@@ -3649,6 +3702,49 @@ mod tests {
         assert!(run_insert(&mut slot, false, &mut buf, 64));
         assert!(buf[0][37..].iter().all(|x| *x == 1.0));
         assert!(slot.dry_delay.bufs.iter().all(|b| b.iter().all(|x| *x == 0.0)));
+    }
+
+    #[test]
+    fn print_chain_is_raw_input_through_flagged_inserts_only() {
+        let (mut s, t) = session_with_dc(0.5, 48_000);
+        let gain = |db: f32, print: bool| {
+            let mut i = Insert::new("gain");
+            i.params.insert("gain".into(), db);
+            i.print = print;
+            Some(i)
+        };
+        s.track_mut(t).unwrap().mixer.inserts[0] = gain(12.0, false);
+        s.track_mut(t).unwrap().mixer.inserts[1] = gain(-6.0, true);
+        let raw: Vec<Vec<f32>> = vec![noise(4096, 1), noise(4096, 2)];
+        let mut chain = PrintChain::new(s.track(t).unwrap(), 48_000.0, 512, 2);
+        assert_eq!(chain.ids(), vec!["gain".to_string()]);
+        let mut printed = raw.clone();
+        for b in 0..8 {
+            let mut blk: Vec<Vec<f32>> = printed.iter().map(|c| c[b * 512..(b + 1) * 512].to_vec()).collect();
+            chain.process(&mut blk, 512);
+            for (c, o) in printed.iter_mut().zip(blk) {
+                c[b * 512..(b + 1) * 512].copy_from_slice(&o);
+            }
+        }
+        let g = 10f32.powf(-6.0 / 20.0);
+        let g_full = 10f32.powf(6.0 / 20.0);
+        for c in 0..2 {
+            for i in 2048..4096 {
+                let (x, y) = (raw[c][i], printed[c][i]);
+                assert!((y - x * g).abs() < 1e-4, "ch {c} sample {i}: {y} vs {}", x * g);
+                assert!((y - x * g_full).abs() > 1e-3 || x.abs() < 0.01, "differs from the full chain");
+                assert!((y - x).abs() > 1e-3 || x.abs() < 0.01, "differs from raw");
+            }
+        }
+        // Flag nothing, or bypass the flagged one: nothing is printed.
+        s.track_mut(t).unwrap().mixer.inserts[1].as_mut().unwrap().bypass = true;
+        assert!(PrintChain::new(s.track(t).unwrap(), 48_000.0, 512, 2).is_empty());
+        // A flagged plugin's latency is the chain's latency.
+        let mut m = Insert::new("maximizer");
+        m.print = true;
+        s.track_mut(t).unwrap().mixer.inserts[1] = Some(m);
+        let chain = PrintChain::new(s.track(t).unwrap(), 48_000.0, 512, 2);
+        assert_eq!(chain.latency(), soundcraft_dsp::create("maximizer").unwrap().latency());
     }
 
     fn with_gain(s: &mut Session, t: TrackId, delta: bool, bypass: bool) {
