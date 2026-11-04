@@ -1104,7 +1104,7 @@ impl GuiLink {
             win.move_to(pos);
         }
         let native = GuiLink::native_of(g);
-        win.set_header(EditorHeaderState { scale: g.scale, native_scaling: native, ..g.header });
+        win.set_header(EditorHeaderState { scale: g.scale, native_scaling: native, ..g.header.clone() });
         let parent = clap_window { api: api.as_ptr(), specific: clap_window_handle { win32: win.parent() } };
         // SAFETY: live plugin with a created embedded GUI; `parent` names our live window and
         // outlives the call.
@@ -1195,7 +1195,7 @@ impl GuiLink {
             return;
         }
         let mut g = self.lock();
-        g.header = state;
+        g.header = state.clone();
         if g.window.is_some() {
             let shown = EditorHeaderState { scale: g.scale, native_scaling: GuiLink::native_of(&g), ..state };
             if let Some(w) = &g.window {

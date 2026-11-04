@@ -404,6 +404,9 @@ fn page(app: &mut SoundApp, ui: &mut egui::Ui) {
                 ui.label("Interface scale");
                 ui.add(egui::Slider::new(&mut app.extra.ui_scale, 0.75..=1.5).step_by(0.05).custom_formatter(|v, _| format!("{:.0} %", v * 100.0)));
                 ui.end_row();
+                ui.label("Mix window track names");
+                crate::widgets::checkbox(ui, &mut app.ui.name_on_top, "Above Solo / Mute (instead of at the bottom)");
+                ui.end_row();
                 ui.label("Hover descriptions");
                 crate::widgets::checkbox(ui, &mut app.ui.preferences.hover_hints, "Show what each option does");
                 ui.end_row();

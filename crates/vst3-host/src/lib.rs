@@ -41,7 +41,7 @@
 //! on the processor reach the controller on the UI thread (through the editor's `idle`), and
 //! values the plugin changes itself are re-read after its `restartComponent` request.
 //!
-//! Not hosted yet: sidechain (aux buses are kept inactive) and 64-bit processing.
+//! Sidechain: the first aux audio input bus is activated (stereo where the plugin allows) and fed through `Plugin::set_sidechain`; other aux buses stay inactive. Not hosted yet: 64-bit processing.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 

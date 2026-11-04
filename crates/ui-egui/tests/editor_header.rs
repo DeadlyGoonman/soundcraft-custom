@@ -177,6 +177,6 @@ fn the_mixers_bypass_reaches_the_editor_next_frame() {
     assert!(!shared.lock().unwrap().state.bypass);
     h.state_mut().engine.execute("mix.insert_bypass", &json!({"track": 1, "slot": 0, "value": true})).unwrap();
     h.run_steps(2);
-    let s = shared.lock().unwrap().state;
+    let s = shared.lock().unwrap().state.clone();
     assert!(s.bypass && !s.delta && !s.is_instrument);
 }

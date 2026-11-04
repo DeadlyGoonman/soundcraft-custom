@@ -19,10 +19,10 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAKED, DWMWA_TEXT_COLOR, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BLACK_BRUSH, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DT_CENTER, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FW_SEMIBOLD, FillRect, GetMonitorInfoW, GetStockObject, HBRUSH, HDC, HGDIOBJ, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
-    RedrawWindow, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    BLACK_BRUSH, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, ClientToScreen, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DT_CENTER,
+    DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FW_SEMIBOLD, FillRect, GetMonitorInfoW, GetStockObject, HBRUSH,
+    HDC, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, PAINTSTRUCT, RDW_ALLCHILDREN,
+    RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -33,6 +33,9 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_MENU, VK_SHIFT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreatePopupMenu, DestroyMenu, MF_CHECKED, MF_GRAYED, MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenu,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyWindow, GA_ROOTOWNER, GW_HWNDNEXT, GWL_EXSTYLE, GWLP_USERDATA, GetAncestor,
     GetClassNameW, GetClientRect, GetForegroundWindow, GetParent, GetSystemMenu, GetWindow, GetWindowLongPtrW, GetWindowRect,
@@ -84,7 +87,7 @@ const OUR_TOP_CLASSES: [&str; 2] = ["SoundCraftEditorFrame", "SoundCraftEditorSc
 struct Frame {
     header: Cell<HWND>,
     body: Cell<HWND>,
-    state: Cell<EditorHeaderState>,
+    state: RefCell<EditorHeaderState>,
     actions: RefCell<Vec<EditorHeaderAction>>,
     /// The body's size at factor 1 (aspect ratio and drag limits); zero until set.
     native: Cell<(f64, f64)>,
@@ -308,7 +311,7 @@ fn route_key(code: u32, vk: u32, lp: u32) -> bool {
         }
         return true;
     }
-    if !f.state.get().keys {
+    if !f.state.borrow().keys {
         return false;
     }
     // SAFETY: plain key-state queries for this thread.
@@ -439,7 +442,7 @@ impl HostWindow {
         let frame = Box::into_raw(Box::new(Frame {
             header: Cell::new(HWND::default()),
             body: Cell::new(HWND::default()),
-            state: Cell::new(EditorHeaderState::default()),
+            state: RefCell::new(EditorHeaderState::default()),
             actions: RefCell::new(Vec::new()),
             native: Cell::new((0.0, 0.0)),
             dragged: Cell::new(false),
@@ -539,7 +542,7 @@ impl HostWindow {
     /// while the editor can be scaled ([`header::scalable`]: natively, or in an upscale mode).
     pub fn set_header(&self, state: EditorHeaderState) {
         let Some(f) = self.fr() else { return };
-        let old = f.state.replace(state);
+        let old = f.state.replace(state.clone());
         if old.color != state.color {
             apply_frame_colors(self.top, state.color);
         }
@@ -750,12 +753,12 @@ fn frame_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT
         WM_EXITSIZEMOVE if f.dragged.replace(false) && has_native => {
             let body = client_size(hwnd.0)?;
             let factor = header::snap_factor((body.0 / native.0) as f32);
-            let mut s = f.state.get();
+            let mut s = f.state.borrow().clone();
             let new = EditorScale { factor, mode: s.scale.mode };
             resize(hwnd.0, (native.0 * f64::from(factor)).round(), (native.1 * f64::from(factor)).round());
             if new != s.scale {
                 s.scale = new;
-                f.state.set(s);
+                f.state.replace(s);
                 f.actions.borrow_mut().push(EditorHeaderAction::SetScale(new));
                 // SAFETY: our live header window.
                 unsafe {
@@ -833,7 +836,7 @@ fn paint_header(hwnd: HWND) {
     // SAFETY: WM_PAINT of our window; `ps` is writable and ended below.
     let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
     if !hdc.0.is_null() {
-        let state = parent_frame(hwnd).map(|(_, f)| f.state.get()).unwrap_or_default();
+        let state = parent_frame(hwnd).map(|(_, f)| f.state.borrow().clone()).unwrap_or_default();
         draw_header(hwnd, hdc, &state);
     }
     // SAFETY: pairs with `BeginPaint` above.
@@ -850,7 +853,7 @@ fn draw_header(hwnd: HWND, hdc: HDC, s: &EditorHeaderState) {
     let dim = rgb(0x70, 0x70, 0x70);
     let idle = rgb(0x3C, 0x3C, 0x3C);
     let delta_on = s.delta && header::delta_enabled(s);
-    let buttons = [
+    let mut buttons = vec![
         (l.keys, "Keys".to_string(), if s.keys { rgb(0x3C, 0xB4, 0x5A) } else { idle }, if s.keys { rgb(0x10, 0x10, 0x10) } else { text }),
         (l.bypass, "Bypass".to_string(), if s.bypass { rgb(0xE6, 0xA0, 0x1E) } else { idle }, if s.bypass { rgb(0x10, 0x10, 0x10) } else { text }),
         (
@@ -866,6 +869,15 @@ fn draw_header(hwnd: HWND, hdc: HDC, s: &EditorHeaderState) {
             },
         ),
     ];
+    if let Some(m) = &s.sidechain {
+        let on = m.current.is_some();
+        buttons.push((
+            l.sidechain,
+            format!("SC: {} ▾", m.label),
+            if on { rgb(0x2E, 0x7D, 0x9A) } else { idle },
+            if on { rgb(0xFF, 0xFF, 0xFF) } else { text },
+        ));
+    }
     // SAFETY: GDI calls on the paint DC of our window; every object created here is selected out
     // and deleted before returning.
     unsafe {
@@ -897,10 +909,40 @@ fn draw_header(hwnd: HWND, hdc: HDC, s: &EditorHeaderState) {
             let _ = DeleteObject(HGDIOBJ(brush.0));
             SetTextColor(hdc, color);
             let mut wide: Vec<u16> = label.encode_utf16().collect();
-            DrawTextW(hdc, &mut wide, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(hdc, &mut wide, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
         SelectObject(hdc, old);
         let _ = DeleteObject(HGDIOBJ(font.0));
+    }
+}
+
+/// Shows the sidechain menu under the picker and returns the choice: `Some(None)` for None,
+/// `Some(Some(bus))` for a bus, `None` when dismissed.
+fn pick_sidechain(hwnd: HWND, button: header::Rect, menu: &soundcraft_dsp::SidechainMenu) -> Option<Option<u64>> {
+    const NONE_ID: usize = 1;
+    const EMPTY_ID: usize = 2;
+    const FIRST: usize = 10;
+    // SAFETY: a popup menu created, filled, shown on our live header window and destroyed here.
+    unsafe {
+        let m = CreatePopupMenu().ok()?;
+        let wide = |t: &str| -> Vec<u16> { t.encode_utf16().chain(Some(0)).collect() };
+        let flags = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let _ = AppendMenuW(m, flags(menu.current.is_none()), NONE_ID, PCWSTR(wide("None").as_ptr()));
+        if menu.choices.is_empty() {
+            let _ = AppendMenuW(m, MF_STRING | MF_GRAYED, EMPTY_ID, PCWSTR(wide("(no sends in session)").as_ptr()));
+        }
+        for (i, c) in menu.choices.iter().enumerate() {
+            let _ = AppendMenuW(m, flags(menu.current == Some(c.bus)), FIRST + i, PCWSTR(wide(&c.label).as_ptr()));
+        }
+        let mut at = POINT { x: button.left, y: button.bottom };
+        let _ = ClientToScreen(hwnd, &mut at);
+        let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, at.x, at.y, None, hwnd, None).0 as usize;
+        let _ = DestroyMenu(m);
+        match id {
+            NONE_ID => Some(None),
+            n if n >= FIRST => menu.choices.get(n - FIRST).map(|c| Some(c.bus)),
+            _ => None,
+        }
     }
 }
 
@@ -908,8 +950,23 @@ fn click_header(hwnd: HWND, x: i32, y: i32) {
     let Some((_, f)) = parent_frame(hwnd) else { return };
     let r = client_rect(hwnd);
     let l = header::layout(r.right - r.left, dpi_of(hwnd));
-    let mut s = f.state.get();
+    let mut s = f.state.borrow().clone();
     let action = match header::hit(&l, x, y) {
+        Some(Button::Sidechain) => {
+            let Some(menu) = s.sidechain.clone() else { return };
+            // The menu runs its own loop; no borrow of the frame state is held across it.
+            match pick_sidechain(hwnd, l.sidechain, &menu) {
+                Some(choice) => {
+                    if let Some(m) = s.sidechain.as_mut() {
+                        m.current = choice;
+                        m.label =
+                            choice.and_then(|b| menu.choices.iter().find(|c| c.bus == b)).map_or_else(|| "None".to_string(), |c| c.label.clone());
+                    }
+                    EditorHeaderAction::SetSidechain(choice)
+                }
+                None => return,
+            }
+        }
         Some(Button::Keys) => {
             s.keys = !s.keys;
             EditorHeaderAction::SetKeys(s.keys)
@@ -925,7 +982,7 @@ fn click_header(hwnd: HWND, x: i32, y: i32) {
         _ => return,
     };
     // Shown at once; the app's next state confirms (or reverts) it.
-    f.state.set(s);
+    f.state.replace(s);
     f.actions.borrow_mut().push(action);
     // SAFETY: our live header window.
     unsafe {
@@ -1001,8 +1058,10 @@ mod tests {
         // Keys toggles.
         click_header(header, (l.keys.left + l.keys.right) / 2, l.height / 2);
         assert_eq!(win.take_actions(), vec![EditorHeaderAction::SetKeys(true)]);
-        // The left side of the header is empty: a click there does nothing.
-        click_header(header, 10, l.height / 2);
+        // Between the picker and Keys the header is empty, and the picker does nothing unless the
+        // plugin has a sidechain: a click there queues nothing.
+        click_header(header, (l.sidechain.right + l.keys.left) / 2, l.height / 2);
+        click_header(header, (l.sidechain.left + l.sidechain.right) / 2, l.height / 2);
         assert!(win.take_actions().is_empty());
     }
 }

@@ -1430,6 +1430,8 @@ pub(crate) struct Layout {
     pub inputs: Vec<u32>,
     pub outputs: Vec<u32>,
     pub event_input: bool,
+    /// Input bus index of the activated sidechain (aux) bus, if the plugin has one.
+    pub sidechain: Option<usize>,
 }
 
 fn apply_transport(c: &mut sv::ProcessContext, t: &Transport) {
@@ -1669,6 +1671,19 @@ impl Instance {
         }
     }
 
+    /// Index of the first audio input bus after the main one that is an aux bus (a sidechain).
+    fn aux_input_bus(&self, n: i32) -> Option<i32> {
+        (1..n).find(|&i| {
+            // SAFETY: plain data; all-zero is valid.
+            let mut info: sv::BusInfo = unsafe { std::mem::zeroed() };
+            // SAFETY: valid component; index below the bus count; `info` is writable.
+            let got = unsafe {
+                self.component.getBusInfo(sv::MediaTypes_::kAudio as sv::MediaType, sv::BusDirections_::kInput as sv::BusDirection, i, &mut info)
+            };
+            ok(got) && info.busType == sv::BusTypes_::kAux as sv::BusType
+        })
+    }
+
     /// Stops processing, deactivates, negotiates the bus layout (main buses mono or stereo as
     /// asked, falling back to stereo and then to the plugin's own choice), activates the main
     /// buses, sets up 32-bit processing and activates the component.
@@ -1685,11 +1700,20 @@ impl Instance {
         let want = if mono { sv::SpeakerArr::kMono } else { sv::SpeakerArr::kStereo };
         let p = self.processor().ok_or_else(|| Vst3Error::Process("no audio processor".into()))?.clone();
         let mut tried_ok = false;
-        for main in [want, sv::SpeakerArr::kStereo] {
+        let aux = self.aux_input_bus(nin);
+        // Try the sidechain as stereo first, then leave it as the plugin has it.
+        let mut attempts = vec![(want, true), (want, false)];
+        if want != sv::SpeakerArr::kStereo {
+            attempts.extend([(sv::SpeakerArr::kStereo, true), (sv::SpeakerArr::kStereo, false)]);
+        }
+        for (main, aux_stereo) in attempts {
             let mut ins = current(self, din, nin);
             let mut outs = current(self, dout, nout);
             if let Some(a) = ins.first_mut() {
                 *a = main;
+            }
+            if let (true, Some(a)) = (aux_stereo, aux.and_then(|i| ins.get_mut(usize::try_from(i).unwrap_or(usize::MAX)))) {
+                *a = sv::SpeakerArr::kStereo;
             }
             if let Some(a) = outs.first_mut() {
                 *a = main;
@@ -1700,9 +1724,6 @@ impl Instance {
                 tried_ok = true;
                 break;
             }
-            if main == sv::SpeakerArr::kStereo {
-                break;
-            }
         }
         if !tried_ok {
             log::debug!("vst3: plugin refused mono/stereo bus arrangements; using its own");
@@ -1711,14 +1732,18 @@ impl Instance {
             inputs: (0..nin).map(|i| self.bus_channels(din, i)).collect(),
             outputs: (0..nout).map(|i| self.bus_channels(dout, i)).collect(),
             event_input: self.bus_count(event, din) > 0,
+            sidechain: aux.filter(|&i| self.bus_channels(din, i) > 0).and_then(|i| usize::try_from(i).ok()),
         };
-        // Main buses on, aux buses off (VST3 still gets buffers for every bus).
+        // Main buses on, the first aux input (the sidechain) on, other aux buses off (VST3 still
+        // gets buffers for every bus).
         for (dir, n) in [(din, nin), (dout, nout)] {
             for i in 0..n {
+                let on = i == 0 || (dir == din && layout.sidechain == usize::try_from(i).ok());
                 // SAFETY: valid component; index below the bus count.
-                unsafe { self.component.activateBus(audio as sv::MediaType, dir as sv::BusDirection, i, u8::from(i == 0)) };
+                unsafe { self.component.activateBus(audio as sv::MediaType, dir as sv::BusDirection, i, u8::from(on)) };
             }
         }
+        log::debug!("vst3: audio inputs {:?}, sidechain bus {:?}", layout.inputs, layout.sidechain);
         if layout.event_input {
             // SAFETY: valid component; event input bus 0 exists.
             unsafe { self.component.activateBus(event as sv::MediaType, din as sv::BusDirection, 0, 1) };
@@ -2197,7 +2222,7 @@ impl EditorLink {
         if let Some(pos) = g.pos {
             win.move_to(pos);
         }
-        win.set_header(EditorHeaderState { scale: g.scale, native_scaling: native, can_resize: resizable, ..g.header });
+        win.set_header(EditorHeaderState { scale: g.scale, native_scaling: native, can_resize: resizable, ..g.header.clone() });
         let frame = ComWrapper::new(PlugFrame::new(win.frame_window(), size.0, size.1));
         if let Some(f) = frame.as_com_ref::<sb::IPlugFrame>() {
             // SAFETY: valid view; the frame outlives the view's attachment (kept in `g.frame`
@@ -2421,7 +2446,7 @@ impl EditorLink {
             return;
         }
         let mut g = self.lock();
-        let shown = EditorHeaderState { scale: g.scale, native_scaling: g.native.unwrap_or(false), can_resize: g.resizable, ..state };
+        let shown = EditorHeaderState { scale: g.scale, native_scaling: g.native.unwrap_or(false), can_resize: g.resizable, ..state.clone() };
         g.header = state;
         if let Some(w) = &g.window {
             w.set_header(shown);

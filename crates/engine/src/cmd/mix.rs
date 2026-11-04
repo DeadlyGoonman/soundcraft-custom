@@ -95,6 +95,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("mix.insert", "Insert Plugin", [], None, "{track?, slot?: 0..9 | a..j, plugin: id, params?: {id: value}}", has_selection, insert),
         cmd!("mix.insert_remove", "Remove Insert", [], None, "{track?, slot}", has_selection, insert_remove),
         cmd!("mix.insert_bypass", "Bypass Insert", [], None, "{track?, slot, value?: bool}", has_selection, insert_bypass),
+        cmd!("mix.insert_sidechain", "Set Insert Sidechain", [], None, "{track?, slot, bus?: id|name|null}", has_selection, insert_sidechain),
         cmd!("mix.insert_print", "Print Insert on Record", [], None, "{track?, slot, value?: bool}", has_selection, insert_print),
         cmd!(
             noundo "mix.insert_delta",
@@ -388,6 +389,28 @@ fn insert_print(e: &mut Engine, p: &Value) -> Result<Value> {
         s.track_mut(t).and_then(|tr| tr.mixer.inserts.get_mut(slot)).and_then(Option::as_mut).ok_or_else(|| bad("mix.insert_print", "empty slot"))?;
     ins.print = val.unwrap_or(!ins.print);
     Ok(json!({"print": ins.print}))
+}
+
+/// Sets (or, with no/null/"none" `bus`, clears) the bus an insert takes its sidechain from.
+fn insert_sidechain(e: &mut Engine, p: &Value) -> Result<Value> {
+    let (t, slot) = track_slot(e, p, "mix.insert_sidechain", INSERT_SLOTS)?;
+    let s = e.session_mut();
+    let bus = match p.get("bus") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(n)) if n.eq_ignore_ascii_case("none") => None,
+        Some(v) => {
+            let by_id = v.as_u64().or_else(|| v.as_str().and_then(|x| x.parse().ok())).map(soundcraft_model::BusId).filter(|b| s.bus(*b).is_some());
+            let by_name = v.as_str().and_then(|n| s.busses.iter().find(|b| b.name == n)).map(|b| b.id);
+            Some(by_id.or(by_name).ok_or_else(|| bad("mix.insert_sidechain", "unknown bus"))?)
+        }
+    };
+    let ins = s
+        .track_mut(t)
+        .and_then(|tr| tr.mixer.inserts.get_mut(slot))
+        .and_then(Option::as_mut)
+        .ok_or_else(|| bad("mix.insert_sidechain", "empty slot"))?;
+    ins.sidechain = bus;
+    Ok(json!({"sidechain": bus.map(|b| b.0)}))
 }
 
 fn insert_delta(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -977,6 +1000,24 @@ mod tests {
         assert!(e.session().bus_by_name("Verb").is_none(), "undo deletes the bus");
         assert!(!send_set(&e), "undo clears the send");
         assert!(e.session().tracks[0].mixer.sends[0].is_none());
+    }
+
+    #[test]
+    fn insert_sidechain_sets_clears_and_undoes() {
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({"count": 1, "name": "Beat", "format": "stereo"})).unwrap();
+        e.execute("mix.new_bus", &json!({"name": "Vox"})).unwrap();
+        e.execute("mix.insert", &json!({"track": "Beat", "slot": 0, "plugin": "gain"})).unwrap();
+        let sc = |e: &Engine| e.session().tracks[0].mixer.inserts[0].as_ref().unwrap().sidechain;
+        let vox = e.session().bus_by_name("Vox").unwrap().id;
+        e.execute("mix.insert_sidechain", &json!({"track": "Beat", "slot": 0, "bus": "Vox"})).unwrap();
+        assert_eq!(sc(&e), Some(vox));
+        assert!(e.execute("mix.insert_sidechain", &json!({"track": "Beat", "slot": 0, "bus": "Nope"})).is_err());
+        assert!(e.undo());
+        assert_eq!(sc(&e), None);
+        e.execute("mix.insert_sidechain", &json!({"track": "Beat", "slot": 0, "bus": vox.0})).unwrap();
+        e.execute("mix.insert_sidechain", &json!({"track": "Beat", "slot": 0, "bus": null})).unwrap();
+        assert_eq!(sc(&e), None);
     }
 
     #[test]

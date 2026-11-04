@@ -389,6 +389,10 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
         }
         y += 54.0;
     }
+    if app.ui.name_on_top {
+        strip_name(app, ui, track, Rect::from_min_size(pos2(x0, y), vec2(inner_w, 18.0)), selected);
+        y += 22.0;
+    }
     // Rec / Input / Solo / Mute.
     let bw = (inner_w - 6.0) / 2.0;
     let mut row = ui.new_child(
@@ -477,7 +481,19 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
         TrackKind::Video => "video",
     };
     ui.painter().text(pos2(vr.center().x, vr.max.y + 9.0), Align2::CENTER_CENTER, kind, regular(9.5), t.text_dim);
-    let nr = Rect::from_min_size(pos2(x0, r.max.y - 26.0), vec2(inner_w, 18.0));
+    if !app.ui.name_on_top {
+        strip_name(app, ui, track, Rect::from_min_size(pos2(x0, r.max.y - 26.0), vec2(inner_w, 18.0)), selected);
+    }
+    if app.ui.mix_views.iter().any(|v| v == "color") {
+        ui.painter().rect_filled(Rect::from_min_size(pos2(r.min.x, r.max.y - 5.0), vec2(w, 5.0)), 0.0, rgb(track.color));
+    }
+    ui.painter().line_segment([pos2(r.max.x, r.min.y), pos2(r.max.x, r.max.y)], Stroke::new(1.0, t.border));
+}
+
+/// The strip's name field: click selects, double-click renames, right-click opens the track menu.
+fn strip_name(app: &mut SoundApp, ui: &mut Ui, track: &Track, nr: Rect, selected: bool) {
+    let t = Tokens::current();
+    let id = track.id;
     ui.painter().rect(
         nr,
         CornerRadius::same(2),
@@ -494,10 +510,6 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
         app.dialogs.open_rename_track(id, &track.name);
     }
     nresp.context_menu(|ui| crate::edit_window::track_context_menu(app, ui, id));
-    if app.ui.mix_views.iter().any(|v| v == "color") {
-        ui.painter().rect_filled(Rect::from_min_size(pos2(r.min.x, r.max.y - 5.0), vec2(w, 5.0)), 0.0, rgb(track.color));
-    }
-    ui.painter().line_segment([pos2(r.max.x, r.min.y), pos2(r.max.x, r.max.y)], Stroke::new(1.0, t.border));
 }
 
 /// An instrument track's INSTRUMENT row: click opens a hosted instrument's plugin window,
@@ -779,7 +791,8 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
         return;
     }
     if occupied {
-        if ui.button("Bypass").clicked() {
+        let bypassed = app.engine.session().track(id).and_then(|t| t.mixer.inserts.get(slot)).and_then(Option::as_ref).is_some_and(|i| i.bypass);
+        if ui.checkbox(&mut { bypassed }, "Bypass").clicked() {
             run_pick(app, ui, "mix.insert_bypass", json!({"track": id.0, "slot": slot}));
         }
         let printing = app.engine.session().track(id).and_then(|t| t.mixer.inserts.get(slot)).and_then(Option::as_ref).is_some_and(|i| i.print);

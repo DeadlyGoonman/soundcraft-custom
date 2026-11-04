@@ -4,7 +4,7 @@ use crate::ffi::{AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Ins
 use soundcraft_dsp::{EditorScale, Plugin, PluginEditor, PluginInfo, Transport, Unit};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use vst3::ComWrapper;
 
 /// Largest block we set a plugin up for.
@@ -62,6 +62,14 @@ pub struct Vst3Plugin {
     has_input: bool,
     has_output: bool,
     event_input: bool,
+    /// Input bus index of the activated sidechain bus (see `Plugin::sidechain_channels`).
+    sc_bus: Option<usize>,
+    /// The sidechain signal handed over for the next block (planar, `max_block` long), and how
+    /// many of its frames are valid; `sc_len == 0` means silence.
+    sc: Vec<Vec<f32>>,
+    sc_len: usize,
+    /// Sidechain channel count, shared with the editor (the header shows the picker when > 0).
+    sc_channels: Arc<AtomicUsize>,
     held: [bool; 128],
     channels: usize,
     max_block: usize,
@@ -110,6 +118,10 @@ impl Vst3Plugin {
             has_input: false,
             has_output: false,
             event_input: false,
+            sc_bus: None,
+            sc: Vec::new(),
+            sc_len: 0,
+            sc_channels: Arc::new(AtomicUsize::new(0)),
             held: [false; 128],
             channels: 2,
             max_block: 0,
@@ -223,6 +235,11 @@ impl Plugin for Vst3Plugin {
                 self.has_input = layout.inputs.first().is_some_and(|&c| c > 0);
                 self.has_output = layout.outputs.first().is_some_and(|&c| c > 0);
                 self.event_input = layout.event_input;
+                self.sc_bus = layout.sidechain;
+                let sc_ch = layout.sidechain.and_then(|b| layout.inputs.get(b)).map_or(0, |&c| c as usize);
+                self.sc = (0..sc_ch).map(|_| vec![0.0; mb]).collect();
+                self.sc_len = 0;
+                self.sc_channels.store(sc_ch, Ordering::Relaxed);
                 self.max_block = mb;
                 self.latency = self.inst.latency() as usize;
                 self.tail = self.inst.tail() as usize;
@@ -230,6 +247,8 @@ impl Plugin for Vst3Plugin {
             }
             Err(e) => {
                 log::warn!("{}: {e}", self.info.id);
+                self.sc_bus = None;
+                self.sc_channels.store(0, Ordering::Relaxed);
                 self.latency = 0;
             }
         }
@@ -326,6 +345,25 @@ impl Plugin for Vst3Plugin {
                     }
                 }
             }
+            // The sidechain bus: the handed-over signal, silence when unrouted.
+            if let Some(b) = self.sc_bus {
+                for c in 0..self.inputs.channels(b) {
+                    let src = self.sc.get(c.min(self.sc.len().saturating_sub(1))).filter(|_| self.sc_len > start).and_then(|s| {
+                        let hi = (start + n).min(self.sc_len);
+                        s.get(start..hi)
+                    });
+                    if let Some(dst) = self.inputs.channel_mut(b, c).and_then(|d| d.get_mut(..n)) {
+                        match src {
+                            Some(src) => {
+                                let (head, tail) = dst.split_at_mut(src.len());
+                                head.copy_from_slice(src);
+                                tail.fill(0.0);
+                            }
+                            None => dst.fill(0.0),
+                        }
+                    }
+                }
+            }
             let k = self.notes.iter().position(|e| e.time() >= end).unwrap_or(self.notes.len());
             let offset = u32::try_from(start).unwrap_or(u32::MAX);
             let notes = self.notes.get(..k).unwrap_or(&[]);
@@ -369,6 +407,25 @@ impl Plugin for Vst3Plugin {
 
     fn latency(&self) -> usize {
         self.latency
+    }
+
+    fn sidechain_channels(&self) -> usize {
+        self.sc.len()
+    }
+
+    fn set_sidechain(&mut self, src: Option<&[Vec<f32>]>) {
+        let Some(src) = src.filter(|s| !s.is_empty() && !self.sc.is_empty()) else {
+            self.sc_len = 0;
+            return;
+        };
+        let len = src.iter().map(Vec::len).min().unwrap_or(0).min(self.max_block);
+        let last = src.len() - 1;
+        for (c, dst) in self.sc.iter_mut().enumerate() {
+            if let (Some(s), Some(d)) = (src.get(c.min(last)), dst.get_mut(..len)) {
+                d.copy_from_slice(s.get(..len).unwrap_or(&[]));
+            }
+        }
+        self.sc_len = len;
     }
 
     fn set_transport(&mut self, transport: &Transport) {
@@ -460,6 +517,7 @@ impl Plugin for Vst3Plugin {
             maps: self.maps.clone(),
             unsynced: Arc::clone(&self.unsynced),
             mirror: Arc::clone(&self.mirror),
+            sc_channels: Arc::clone(&self.sc_channels),
             prev_edits: Vec::new(),
         }))
     }
@@ -495,6 +553,8 @@ struct Vst3Editor {
     unsynced: Arc<[AtomicU64]>,
     /// Re-read values for the processor side (shared with the plugin).
     mirror: Arc<ValueMirror>,
+    /// The plugin's sidechain channel count (shared with the plugin).
+    sc_channels: Arc<AtomicUsize>,
     /// Ids the GUI edited in the previous `idle`: their session echo arrives after it.
     prev_edits: Vec<u32>,
 }
@@ -558,6 +618,10 @@ impl Vst3Editor {
 }
 
 impl PluginEditor for Vst3Editor {
+    fn has_sidechain(&mut self) -> bool {
+        self.sc_channels.load(Ordering::Relaxed) > 0
+    }
+
     fn open(&mut self) -> Result<(), String> {
         // Edits reported before the editor opened (e.g. during setup) are stale.
         let _ = self.host.take_edits();

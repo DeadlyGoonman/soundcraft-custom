@@ -217,6 +217,13 @@ pub trait Plugin: Send {
     fn gain_reduction_db(&self) -> f32 {
         0.0
     }
+    /// Number of sidechain input channels (0 = the plugin has no sidechain input).
+    fn sidechain_channels(&self) -> usize {
+        0
+    }
+    /// The sidechain signal for the next block, planar channels (`None` = silence). Given before
+    /// every `process`; never allocates.
+    fn set_sidechain(&mut self, _src: Option<&[Vec<f32>]>) {}
     /// The transport for the next block, given before `process`.
     fn set_transport(&mut self, _transport: &Transport) {}
     /// Instruments: note events at sample offsets within the next block.
@@ -295,6 +302,10 @@ pub trait PluginEditor: Send {
     fn set_scale(&mut self, _scale: EditorScale) -> Result<(), String> {
         Err("this editor cannot be scaled".into())
     }
+    /// True when the plugin has a sidechain input (the header then offers a source picker).
+    fn has_sidechain(&mut self) -> bool {
+        false
+    }
     /// Shows SoundCraft's state in the header strip of the editor window (bypass, delta, scale).
     /// Called by the UI every frame; a no-op for editors without a header.
     fn set_header(&mut self, _state: EditorHeaderState) {}
@@ -304,8 +315,26 @@ pub trait PluginEditor: Send {
     }
 }
 
+/// One choice of the header's sidechain picker: a bus id and the text shown for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidechainChoice {
+    pub bus: u64,
+    pub label: String,
+}
+
+/// The header's sidechain picker: shown only when the plugin has a sidechain input.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SidechainMenu {
+    /// The chosen bus id (`None` = no sidechain).
+    pub current: Option<u64>,
+    /// The button's text after "SC: " ("None" or the bus name).
+    pub label: String,
+    /// Every bus some send targets.
+    pub choices: Vec<SidechainChoice>,
+}
+
 /// What the header strip on top of a plugin editor window shows.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct EditorHeaderState {
     /// The insert is bypassed.
     pub bypass: bool,
@@ -323,6 +352,8 @@ pub struct EditorHeaderState {
     pub keys: bool,
     /// The colour of the track the editor is open on; the window's title bar takes it.
     pub color: Option<[u8; 3]>,
+    /// The sidechain picker (`None`: the plugin has no sidechain input).
+    pub sidechain: Option<SidechainMenu>,
 }
 
 /// A click in an editor window's header, for the UI to apply as a command.
@@ -337,6 +368,8 @@ pub enum EditorHeaderAction {
     /// A shortcut key pressed in the editor while Keys is on, for the app to handle as if pressed
     /// in its own window.
     Key(EditorKey),
+    /// The header's sidechain picker: the chosen bus id, `None` for no sidechain.
+    SetSidechain(Option<u64>),
 }
 
 /// A key press forwarded from a plugin editor window: an egui key name (`egui::Key::from_name`)

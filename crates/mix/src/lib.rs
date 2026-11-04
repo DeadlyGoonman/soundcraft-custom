@@ -355,6 +355,13 @@ pub struct MixEngine {
     max_block: usize,
     strips: HashMap<TrackId, Strip>,
     busses: HashMap<BusId, BusBuf>,
+    /// Sidechain sources: each bus's mix of the PREVIOUS block folded to stereo (`max_block`
+    /// capacity each, allocated in `sync`). A bus is only filled by `route_strip` after the
+    /// parallel strip phase, so a strip's sidechain input cannot see the bus of the block it is
+    /// processing: it hears the bus one block late.
+    sc_snap: HashMap<BusId, Vec<Vec<f32>>>,
+    /// Frames the busses hold from the previous render.
+    sc_frames: usize,
     main: Vec<Vec<f32>>,
     main_fmt: ChannelFormat,
     pub meters: HashMap<TrackId, StripMeter>,
@@ -447,6 +454,8 @@ impl MixEngine {
             max_block,
             strips: HashMap::new(),
             busses: HashMap::new(),
+            sc_snap: HashMap::new(),
+            sc_frames: 0,
             main: vec![vec![0.0; max_block]; MAIN_CHANNELS],
             main_fmt: ChannelFormat::Stereo,
             meters: HashMap::new(),
@@ -645,6 +654,32 @@ impl MixEngine {
             }
         }
         self.busses.retain(|id, _| s.bus(*id).is_some());
+        for b in &s.busses {
+            self.sc_snap.entry(b.id).or_insert_with(|| vec![vec![0.0; mb]; 2]);
+        }
+        self.sc_snap.retain(|id, _| s.bus(*id).is_some());
+    }
+
+    /// Copies each bus's previous-block mix, folded to stereo (mono to both sides), into
+    /// `sc_snap` for `frames` frames. Runs before the busses are cleared; never allocates
+    /// (the snapshots have `max_block` capacity).
+    fn snapshot_sidechains(&mut self, frames: usize) {
+        let have = self.sc_frames.min(frames);
+        for (id, snap) in self.sc_snap.iter_mut() {
+            let src = self.busses.get(id).map(|b| b.buf.as_slice()).unwrap_or(&[]);
+            for (c, dst) in snap.iter_mut().enumerate() {
+                dst.resize(frames, 0.0);
+                // Channel 1 of a mono bus repeats channel 0.
+                let from = src.get(c).or_else(|| src.first()).and_then(|v| v.get(..have.min(v.len())));
+                let n = from.map_or(0, <[f32]>::len);
+                if let (Some(from), Some(d)) = (from, dst.get_mut(..n)) {
+                    d.copy_from_slice(from);
+                }
+                if let Some(rest) = dst.get_mut(n..) {
+                    rest.fill(0.0);
+                }
+            }
+        }
     }
 
     /// Re-syncs plugin instances and the routing order when the session's structure changed
@@ -692,6 +727,8 @@ impl MixEngine {
         }
         self.last_end = pos.saturating_add(frames as i64);
         self.ensure_synced(s);
+        self.snapshot_sidechains(frames);
+        self.sc_frames = frames;
         for b in self.busses.values_mut() {
             for c in b.buf.iter_mut() {
                 c.iter_mut().take(frames).for_each(|x| *x = 0.0);
@@ -719,13 +756,15 @@ impl MixEngine {
             }
         }
         let busses = std::mem::take(&mut self.busses);
+        let snaps = std::mem::take(&mut self.sc_snap);
         let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
         run_strips(&mut work, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
-                process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo);
+                process_strip(s, t, st, &busses, &snaps, &live_in, pos, frames, any_solo);
             }
         });
         self.busses = busses;
+        self.sc_snap = snaps;
         // Delay compensation: align every strip to the slowest. Direct-to-main outputs also wait
         // for the slowest aux return. Aux latency has to be read before those outputs are routed,
         // or the first block (and a one-block bounce probe) still sees zero.
@@ -801,7 +840,7 @@ impl MixEngine {
                 st.scratch.resize(self.max_block, 0.0);
             }
             let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
-            process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo);
+            process_strip(s, t, &mut st, &self.busses, &self.sc_snap, &live_in, pos, frames, any_solo);
             let ch = st.buf.len();
             st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
             st.align.process(&mut st.buf, frames);
@@ -827,6 +866,7 @@ impl MixEngine {
                     {
                         apply_params(s, slot, ins, t, i, pos);
                         slot.plugin.set_transport(&transport);
+                        feed_sidechain(slot, ins, &self.sc_snap);
                         if !run_insert(slot, ins.delta, &mut strip.buf, frames) {
                             strip.failures.record(i);
                         }
@@ -968,6 +1008,7 @@ fn process_strip(
     t: &Track,
     strip: &mut Strip,
     busses: &HashMap<BusId, BusBuf>,
+    sidechains: &HashMap<BusId, Vec<Vec<f32>>>,
     live: &LiveInput<'_>,
     pos: Samples,
     frames: usize,
@@ -1097,6 +1138,7 @@ fn process_strip(
         }
         apply_params(s, slot, ins, t, i, pos);
         slot.plugin.set_transport(&transport);
+        feed_sidechain(slot, ins, sidechains);
         if !run_insert(slot, ins.delta, &mut strip.buf, frames) {
             strip.failures.record(i);
             continue;
@@ -1158,6 +1200,16 @@ fn process_strip(
 /// Processes one active, unbypassed insert in place. With `delta` the slot outputs only what the
 /// plugin changed: its output minus its input delayed by the plugin's latency. False when the
 /// plugin failed this block (its output is then silenced).
+/// Hands a plugin with a sidechain input its source for this block: the insert's bus (previous
+/// block, stereo) or silence when none is set or the bus no longer exists.
+fn feed_sidechain(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, snaps: &HashMap<BusId, Vec<Vec<f32>>>) {
+    if slot.plugin.sidechain_channels() == 0 {
+        return;
+    }
+    let src = ins.sidechain.and_then(|b| snaps.get(&b));
+    slot.plugin.set_sidechain(src.map(Vec::as_slice));
+}
+
 fn run_insert(slot: &mut PluginSlot, delta: bool, buf: &mut [Vec<f32>], frames: usize) -> bool {
     if delta {
         if slot.dry.len() < buf.len() {
@@ -2871,6 +2923,94 @@ mod tests {
         assert_eq!((t0.tempo, t0.numerator, t0.denominator, t0.samples, t0.bar), (90.0, 3, 4, 96_000, 1));
         assert!((t0.seconds - 2.0).abs() < 1e-9 && (t0.quarters - 3.0).abs() < 1e-9 && (t0.bar_start - 3.0).abs() < 1e-9);
         assert!(!seen[1].playing);
+    }
+
+    /// A gain with a stereo sidechain input that records what it was handed each block:
+    /// `None` for silence, else the first sample of each channel and the frame count.
+    struct Keyed {
+        inner: Box<dyn Plugin>,
+        heard: Arc<std::sync::Mutex<Vec<Option<(f32, f32, usize)>>>>,
+    }
+
+    impl Plugin for Keyed {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.inner.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.inner.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.inner.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.inner.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.inner.process(io, frames);
+        }
+        fn sidechain_channels(&self) -> usize {
+            2
+        }
+        fn set_sidechain(&mut self, src: Option<&[Vec<f32>]>) {
+            let seen = src.map(|b| (b[0][100], b[1][100], b[0].len()));
+            self.heard.lock().unwrap().push(seen);
+        }
+    }
+
+    #[test]
+    fn sidechain_hears_the_previous_block_of_the_chosen_bus() {
+        let mut s = Session::default();
+        let a = add_dc_track(&mut s, 0.5, 48_000);
+        let b = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let buf = AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.25; 48_000]] };
+        s.pool.insert(SourceId(901), Arc::new(SourceAudio::new(buf)));
+        let id = s.new_clip_id();
+        s.track_mut(b).and_then(|t| t.playlist_mut()).unwrap().clips.push(Clip::audio(id, "key", SourceId(901), 0, 0, 48_000));
+        let bus = s.add_bus("Vox", ChannelFormat::Stereo);
+        let other = s.add_bus("Other", ChannelFormat::Stereo);
+        {
+            let tr = s.track_mut(b).unwrap();
+            tr.mixer.output = Route::None;
+            let mut snd = soundcraft_model::SendSlot::new(Route::Bus(bus));
+            snd.level_db = 0.0;
+            tr.mixer.sends[0] = Some(snd);
+        }
+        let mut ins = Insert::new("clap:test.keyed");
+        ins.sidechain = Some(bus);
+        s.track_mut(a).unwrap().mixer.inserts[0] = Some(ins);
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let keyed = Keyed { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard) };
+        eng.adopt(vec![PreparedInstance { track: a, slot: 0, id: "clap:test.keyed".into(), ch: 1, plugin: Box::new(keyed) }]);
+        render_block(&mut eng, &s, 0);
+        render_block(&mut eng, &s, 512);
+        render_block(&mut eng, &s, 1024);
+        {
+            let h = heard.lock().unwrap();
+            assert_eq!(h.len(), 3);
+            let first = h[0].unwrap();
+            assert!(first.0.abs() < 1e-6 && first.2 == 512, "the bus was empty before the first block: {first:?}");
+            let (l, r, n) = h[1].unwrap();
+            assert!(l > 0.1 && (l - r).abs() < 1e-6 && n == 512, "block 2 hears the vocal send of block 1: {l} {r} {n}");
+        }
+        // A bus nothing sends to is silent; no choice and a deleted bus hear nothing at all.
+        heard.lock().unwrap().clear();
+        s.track_mut(a).unwrap().mixer.inserts[0].as_mut().unwrap().sidechain = Some(other);
+        render_block(&mut eng, &s, 1536);
+        render_block(&mut eng, &s, 2048);
+        s.track_mut(a).unwrap().mixer.inserts[0].as_mut().unwrap().sidechain = None;
+        render_block(&mut eng, &s, 2560);
+        s.track_mut(a).unwrap().mixer.inserts[0].as_mut().unwrap().sidechain = Some(bus);
+        s.busses.retain(|x| x.id != bus);
+        render_block(&mut eng, &s, 3072);
+        let h = heard.lock().unwrap();
+        assert!(h[0].is_some_and(|x| x.0 == 0.0) && h[1].is_some_and(|x| x.0 == 0.0), "{h:?}");
+        assert_eq!(h[2], None, "unset: silence");
+        assert_eq!(h[3], None, "a deleted bus counts as none");
     }
 
     struct Ears {

@@ -78,6 +78,8 @@ pub struct UiState {
     pub show_midi_editor: bool,
     pub show_universe: bool,
     pub narrow_mix: bool,
+    /// Mix window: the track name sits in a row above Solo/Mute instead of at the strip's foot.
+    pub name_on_top: bool,
     /// Mix window sections: inserts_ae, inserts_fj, sends_ae, sends_fj, io, comments, eq_curve, color.
     pub mix_views: Vec<String>,
     /// Edit window track-header columns: io, inserts_ae, sends_ae, comments, color.
@@ -167,6 +169,7 @@ impl Default for UiState {
             show_midi_editor: false,
             show_universe: false,
             narrow_mix: false,
+            name_on_top: false,
             mix_views: vec!["inserts_ae".into(), "sends_ae".into(), "io".into(), "color".into()],
             edit_views: vec!["color".into()],
             track_tint: 0.5,
@@ -997,6 +1000,9 @@ impl SoundApp {
                 A::SetDelta(v) => {
                     self.engine.execute("mix.insert_delta", &json!({"track": t.0, "slot": slot, "value": v})).map(drop).map_err(|e| e.to_string())
                 }
+                A::SetSidechain(bus) => {
+                    self.engine.execute("mix.insert_sidechain", &json!({"track": t.0, "slot": slot, "bus": bus})).map(drop).map_err(|e| e.to_string())
+                }
                 A::SetScale(s) => self.set_slot_editor_scale(t, slot, s),
                 A::SetKeys(on) => {
                     self.ui.editor_keys = on;
@@ -1043,6 +1049,7 @@ impl SoundApp {
                         can_resize: false,
                         keys: self.ui.editor_keys,
                         color: self.extra.editor_frame.bar_color(t.color),
+                        sidechain: (!instrument && p.editor_has_sidechain(t.id, slot)).then(|| sidechain_menu(session, ins)),
                     },
                 );
             }
@@ -2273,4 +2280,32 @@ pub fn editor_key_events(k: soundcraft_dsp::EditorKey) -> Vec<egui::Event> {
     let Some(key) = egui::Key::from_name(k.name) else { return Vec::new() };
     let modifiers = egui::Modifiers { alt: k.alt, ctrl: k.ctrl, shift: k.shift, mac_cmd: false, command: k.ctrl };
     [true, false].into_iter().map(|pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers }).collect()
+}
+
+/// The header's sidechain picker for an insert: "None" plus every bus some send targets, each
+/// named after the bus with the tracks that send to it ("Vox Verb  (Vocal, Lead)").
+fn sidechain_menu(session: &soundcraft_model::Session, ins: &soundcraft_model::Insert) -> soundcraft_dsp::SidechainMenu {
+    use soundcraft_model::Route;
+    let mut choices: Vec<soundcraft_dsp::SidechainChoice> = Vec::new();
+    for bus in &session.busses {
+        let sources: Vec<&str> = session
+            .tracks
+            .iter()
+            .filter(|t| t.mixer.sends.iter().flatten().any(|s| s.target == Route::Bus(bus.id)))
+            .map(|t| t.name.as_str())
+            .collect();
+        if sources.is_empty() {
+            continue;
+        }
+        choices.push(soundcraft_dsp::SidechainChoice { bus: bus.id.0, label: format!("{}  ({})", bus.name, sources.join(", ")) });
+    }
+    // A bus that was deleted counts as none.
+    let current = ins.sidechain.filter(|b| session.bus(*b).is_some());
+    if let Some(b) = current.and_then(|b| session.bus(b))
+        && !choices.iter().any(|c| c.bus == b.id.0)
+    {
+        choices.push(soundcraft_dsp::SidechainChoice { bus: b.id.0, label: b.name.clone() });
+    }
+    let label = current.and_then(|b| session.bus(b)).map_or_else(|| "None".to_string(), |b| b.name.clone());
+    soundcraft_dsp::SidechainMenu { current: current.map(|b| b.0), label, choices }
 }

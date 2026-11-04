@@ -1583,10 +1583,17 @@ fn io_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, r: Rect) {
         ui.painter().vline(c.x, c.y - 5.0..=c.y + 5.0, Stroke::new(1.0, t.text));
         ui.painter().rect_filled(Rect::from_center_size(c + vec2(0.0, -1.5), vec2(5.0, 2.5)), 0.5, t.text);
         crate::mix_window::route_popup(app, &resp.on_hover_text("Output"), id, false);
-        if fresp.on_hover_text("Show in the Mix window").clicked() {
-            let _ = app.run("edit.select", json!({"tracks": [id.0]}));
-            let _ = app.run("window.mix", json!({}));
-        }
+        // A small popup with just this track's volume fader (the output menu is separate).
+        let vol_db = track.mixer.volume_db;
+        egui::Popup::menu(&fresp.on_hover_text("Volume")).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.set_min_width(54.0);
+            let (fr, _) = ui.allocate_exact_size(vec2(46.0, 170.0), Sense::hover());
+            if let Some(db) = crate::widgets::fader(ui, fr, vol_db, ui.id().with(("vol_fader", id.0))) {
+                app.gesture = Some(crate::Gesture::Fader { track: id, start_db: vol_db });
+                let _ = app.engine.execute_merged("mix.volume", &json!({"track": id.0, "db": db}), &format!("fader:{}", id.0));
+            }
+            ui.label(crate::widgets::db_text(vol_db));
+        });
     }
     if let Some(vr) = row(45.0, 30.0).map(|vr| vr.shrink2(vec2(1.0, 0.0))) {
         ui.painter().rect_filled(vr, 2.0, Color32::from_gray(15));

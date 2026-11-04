@@ -33,16 +33,21 @@ pub enum Button {
     Bypass,
     /// "Δ Delta": wet minus dry.
     Delta,
+    /// "SC: <bus>": the sidechain source picker (top left; only when the plugin has a sidechain).
+    Sidechain,
 }
 
-/// Where the header's buttons are for a width and dpi: `… [Keys] [Bypass] [Δ Delta]`,
-/// right-aligned (next to the close button above them).
+/// Where the header's buttons are for a width and dpi: `[SC: bus] … [Keys] [Bypass] [Δ Delta]`,
+/// the sidechain picker at the left and the rest right-aligned (next to the close button above
+/// them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
     pub height: i32,
     pub keys: Rect,
     pub bypass: Rect,
     pub delta: Rect,
+    /// The sidechain picker, at the left edge (laid out even when not shown).
+    pub sidechain: Rect,
 }
 
 /// `dip` device-independent pixels at `dpi` (96 when unknown), rounded.
@@ -50,6 +55,9 @@ pub fn px(dip: i32, dpi: u32) -> i32 {
     let dpi = if dpi == 0 { 96 } else { dpi.min(960) } as i32;
     (dip * dpi + 48) / 96
 }
+
+/// Width of the sidechain picker at 96 dpi.
+pub const SIDECHAIN_DIP: i32 = 168;
 
 /// Header height at `dpi`.
 pub fn height(dpi: u32) -> i32 {
@@ -64,16 +72,22 @@ pub fn layout(width: i32, dpi: u32) -> Layout {
     let delta_w = px(68, dpi);
     let bypass_w = px(64, dpi);
     let keys_w = px(52, dpi);
-    let right = width.max(pad + keys_w + pad + bypass_w + pad + delta_w + pad) - pad;
+    let sc_w = px(SIDECHAIN_DIP, dpi);
+    // Never narrower than the picker plus the three buttons, so none of them overlap.
+    let right = width.max(pad + sc_w + pad + keys_w + pad + bypass_w + pad + delta_w + pad) - pad;
     let delta = Rect { left: right - delta_w, top, right, bottom };
     let bypass = Rect { left: delta.left - pad - bypass_w, top, right: delta.left - pad, bottom };
     let keys = Rect { left: bypass.left - pad - keys_w, top, right: bypass.left - pad, bottom };
-    Layout { height: h, keys, bypass, delta }
+    let sidechain = Rect { left: pad, top, right: pad + sc_w, bottom };
+    Layout { height: h, keys, bypass, delta, sidechain }
 }
 
 /// The button under a header point.
 pub fn hit(l: &Layout, x: i32, y: i32) -> Option<Button> {
-    [(l.keys, Button::Keys), (l.bypass, Button::Bypass), (l.delta, Button::Delta)].into_iter().find(|(r, _)| r.contains(x, y)).map(|(_, b)| b)
+    [(l.keys, Button::Keys), (l.bypass, Button::Bypass), (l.delta, Button::Delta), (l.sidechain, Button::Sidechain)]
+        .into_iter()
+        .find(|(r, _)| r.contains(x, y))
+        .map(|(_, b)| b)
 }
 
 /// The Keys button's tooltip.
@@ -222,6 +236,21 @@ mod tests {
     }
 
     #[test]
+    fn sidechain_picker_sits_top_left_and_never_overlaps() {
+        for dpi in [96, 120, 144, 192, 288] {
+            for width in [0, 10, 300, 640, 1200] {
+                let l = layout(width, dpi);
+                let sc = l.sidechain;
+                assert_eq!(sc.left, px(4, dpi), "top left");
+                assert!(sc.left < sc.right && sc.top >= 0 && sc.bottom <= l.height);
+                assert!(sc.right < l.keys.left, "{dpi} {width}: picker left of Keys");
+                assert!(l.keys.right < l.bypass.left && l.bypass.right < l.delta.left);
+                assert_eq!((sc.top, sc.bottom), (l.keys.top, l.keys.bottom));
+            }
+        }
+    }
+
+    #[test]
     fn which_keys_go_to_soundcraft() {
         // Transport and navigation keys, plain or with modifiers.
         assert_eq!(forward_key(0x20, false, false), Some("Space"));
@@ -254,11 +283,11 @@ mod tests {
         for dpi in [96, 144, 192] {
             let l = layout(640, dpi);
             let mid = |r: Rect| ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
-            for (r, b) in [(l.keys, Button::Keys), (l.bypass, Button::Bypass), (l.delta, Button::Delta)] {
+            for (r, b) in [(l.keys, Button::Keys), (l.bypass, Button::Bypass), (l.delta, Button::Delta), (l.sidechain, Button::Sidechain)] {
                 let (x, y) = mid(r);
                 assert_eq!(hit(&l, x, y), Some(b), "{dpi}");
             }
-            assert_eq!(hit(&l, 20, l.height / 2), None, "the left side is empty");
+            assert_eq!(hit(&l, (l.sidechain.right + l.keys.left) / 2, l.height / 2), None, "between the picker and Keys is empty");
             assert_eq!(hit(&l, l.bypass.left, 0), None, "above the buttons");
         }
     }

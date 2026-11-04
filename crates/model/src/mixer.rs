@@ -448,6 +448,10 @@ pub struct Insert {
     /// The session audio source a sample-playing instrument (the built-in Sampler) plays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<SourceId>,
+    /// Sidechain input: the bus (a send destination) whose previous-block mix feeds the plugin
+    /// when it has a sidechain input. A bus that no longer exists counts as none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidechain: Option<BusId>,
 }
 
 fn yes() -> bool {
@@ -466,6 +470,7 @@ impl Insert {
             preset: String::from("<factory default>"),
             state: None,
             sample: None,
+            sidechain: None,
         }
     }
 
@@ -649,6 +654,20 @@ mod tests {
         // A hostile state string decodes to nothing rather than failing the load.
         let bad: Insert = serde_json::from_str(r#"{"plugin":"x","state":"!!!"}"#).unwrap();
         assert_eq!(bad.state_bytes(), None);
+    }
+
+    #[test]
+    fn sidechain_round_trips_and_old_sessions_load() {
+        let mut i = Insert::new("vst3:00");
+        assert_eq!(i.sidechain, None);
+        assert!(!serde_json::to_string(&i).unwrap().contains("sidechain"), "none is not written");
+        i.sidechain = Some(BusId(42));
+        let json = serde_json::to_string(&i).unwrap();
+        assert!(json.contains("\"sidechain\":42"), "{json}");
+        let back: Insert = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sidechain, Some(BusId(42)));
+        let old: Insert = serde_json::from_str(r#"{"plugin":"eq_7band"}"#).unwrap();
+        assert_eq!(old.sidechain, None);
     }
 
     #[test]

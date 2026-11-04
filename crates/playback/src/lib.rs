@@ -1218,6 +1218,11 @@ impl Player {
         self.side().editors.get_mut(&(track, slot)).is_some_and(|e| e.native_scaling())
     }
 
+    /// True when the plugin in this slot has a sidechain input. Main thread only.
+    pub fn editor_has_sidechain(&self, track: TrackId, slot: usize) -> bool {
+        self.side().editors.get_mut(&(track, slot)).is_some_and(|e| e.has_sidechain())
+    }
+
     /// Sets the scale of the plugin's editor (applies live when it is open). Main thread only.
     /// An error says why the scale can't be used for this plugin.
     pub fn set_editor_scale(&self, track: TrackId, slot: usize, scale: EditorScale) -> Result<(), String> {
@@ -2278,8 +2283,8 @@ mod tests {
         );
         p.insert_test_editor(b, 0, Box::new(Header { seen: Arc::clone(&seen), queued: vec![EditorHeaderAction::SetScale(EditorScale::default())] }));
         let state = EditorHeaderState { bypass: true, ..EditorHeaderState::default() };
-        p.set_editor_header(a, 3, state);
-        p.set_editor_header(a, 9, state); // no editor: ignored
+        p.set_editor_header(a, 3, state.clone());
+        p.set_editor_header(a, 9, state.clone()); // no editor: ignored
         assert_eq!(*seen.lock().unwrap(), vec![state]);
         let mut got = p.take_header_actions();
         got.sort_by_key(|(t, s, _)| (t.0, *s));
