@@ -2411,7 +2411,15 @@ impl EditorLink {
         window::resize(win.raw(), fitted.0, fitted.1);
         // Remember the size the window really got (Windows may keep it above a minimum), so the
         // next idle sees no change instead of resizing the view again every frame.
-        frame.set_size(window::client_size(win.raw()).unwrap_or(fitted));
+        let actual = window::client_size(win.raw()).unwrap_or(fitted);
+        frame.set_size(actual);
+        if actual != fitted {
+            // The window ended up another size than the view was told: tell it the real one, or
+            // the plugin lays its controls out for a different size than it is drawn at.
+            let mut r = sb::ViewRect { left: 0, top: 0, right: actual.0 as i32, bottom: actual.1 as i32 };
+            // SAFETY: valid view (open, main thread); `r` is a live rect for the call.
+            unsafe { view.onSize(&mut r) };
+        }
     }
 
     /// Detaches the view like [`EditorLink::teardown`] but keeps its window in `retired`.

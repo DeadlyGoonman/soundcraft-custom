@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*", "xtask"]
 default-members = ["crates/*", "apps/*", "xtask"]
 
 [workspace.package]
-version = "0.15.1-custom.7"
+version = "0.15.1-custom.8"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.90"
@@ -77,3 +77,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 debug = 0
+
+# Dev builds for hand-testing: `cargo build --profile fast`. No LTO, many codegen units.
+[profile.fast]
+inherits = "release"
+lto = "off"
+codegen-units = 64
+incremental = true

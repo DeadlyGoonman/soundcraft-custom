@@ -279,6 +279,8 @@ pub enum Gesture {
         track: TrackId,
         anchor: Samples,
         tracks: Vec<TrackId>,
+        /// Press point's distance below the top of `track`'s row, so the box follows scrolling.
+        y_off: f32,
     },
     /// `copy` while Alt (Option) is held: copies land there and the originals stay.
     MoveClips {

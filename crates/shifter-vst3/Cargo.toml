@@ -1,0 +1,39 @@
+[package]
+name = "soundcraft-shifter-vst3"
+description = "Shifter as a standalone VST3 plugin: wraps the soundcraft-dsp Shifter (micro-pitch doubler) with its own Win32 editor (an isolated unsafe FFI crate)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+# The VST3 binary is the cdylib (renamed to Shifter.vst3 inside the bundle by
+# packaging/windows/shifter-vst3/build.ps1); the rlib is for the tests.
+[lib]
+name = "Shifter"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soundcraft-dsp.workspace = true
+vst3 = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+soundcraft-vst3-host.workspace = true
+image.workspace = true
+
+# An isolated unsafe helper crate (craftrules never-crash), like soundcraft-vst3-host: this crate
+# opts out of the workspace `unsafe_code = "forbid"` for itself only. It denies unsafe everywhere
+# and allows it solely on the COM module (`src/plugin.rs`) and the Win32 editor (`src/editor.rs`).
+# The rest mirrors `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"

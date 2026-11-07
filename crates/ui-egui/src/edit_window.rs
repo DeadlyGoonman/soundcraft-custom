@@ -1047,7 +1047,7 @@ fn auto_lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, param: 
         app.gesture = match (point_hit, tool) {
             (Some(at), _) => Some(Gesture::Breakpoint { track: track.id, param: param.clone(), at }),
             (_, Tool::Pencil) => Some(Gesture::Pencil { track: track.id, points: Vec::new(), param: Some(param.clone()) }),
-            (_, Tool::Selector | Tool::Smart) => Some(Gesture::Select { track: track.id, anchor: snap(&s, at_origin), tracks: vec![track.id] }),
+            (_, Tool::Selector | Tool::Smart) => Some(select_gesture(app, track.id, snap(&s, at_origin), origin.y)),
             (_, Tool::Scrubber) => Some(Gesture::Scrub { last: at }),
             (_, Tool::Zoom) => Some(Gesture::ZoomBox { start: origin.x }),
             _ => None,
@@ -2486,7 +2486,9 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     if resp.hovered() && gain_icon_at(p).is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
-    let selector_press = eff == Tool::Selector && fade_corner.is_none() && curve_handle.is_none() && gain_icon_at(origin).is_none();
+    // Ctrl/Cmd (with or without Shift) on a clip toggles just that clip: no box, no insertion point.
+    let multi = (mods.command || mods.ctrl) && hit.is_some() && matches!(eff, Tool::Selector | Tool::Grabber);
+    let selector_press = eff == Tool::Selector && !multi && fade_corner.is_none() && curve_handle.is_none() && gain_icon_at(origin).is_none();
     if selector_press && resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
         place_insertion(app, ui, &s, track.id, at, mods.shift);
     }
@@ -2525,9 +2527,11 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
             to: if fade_in { range.end } else { range.start },
         });
         ui.ctx().request_repaint();
+    } else if resp.drag_started() && multi {
+        // Toggling clips never starts a box.
     } else if resp.drag_started() {
         app.gesture = match eff {
-            Tool::Selector | Tool::Smart => Some(Gesture::Select { track: track.id, anchor: snap(&s, at_origin), tracks: vec![track.id] }),
+            Tool::Selector | Tool::Smart => Some(select_gesture(app, track.id, snap(&s, at_origin), origin.y)),
             Tool::Grabber => hit.as_ref().map(|c| {
                 let clips = if s.edit.selected_clips.contains(&c.id) { s.edit.selected_clips.clone() } else { vec![c.id] };
                 Gesture::MoveClips { clips, grab_at: at_origin, delta: 0, from_track: track.id, to_track: track.id, copy: mods.alt }
@@ -2573,6 +2577,18 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
             let _ =
                 app.run("automation.clear", json!({"track": track.id.0, "param": automation_id(param), "start": at, "end": at.saturating_add(1)}));
         }
+    } else if resp.clicked()
+        && multi
+        && let Some(c) = &hit
+    {
+        let mut ids: Vec<u64> = s.edit.selected_clips.iter().map(|x| x.0).collect();
+        if let Some(i) = ids.iter().position(|&x| x == c.id.0) {
+            ids.remove(i);
+        } else {
+            ids.push(c.id.0);
+        }
+        // `keep_range` plus a point selection: the clip list changes, no zone is drawn.
+        let _ = app.run("edit.select", json!({"clips": ids, "keep_range": true, "start": s.edit.selection.start}));
     } else if resp.clicked() && curve_handle.is_none() {
         match eff {
             Tool::Grabber => {
@@ -2722,6 +2738,11 @@ fn fade_curve_drag_value(fade: soundcraft_model::Fade, anchor: (f32, f32), heigh
     fade.curvature_for_midpoint_gain(anchor.1 + (anchor.0 - y) / height.max(1.0))
 }
 
+fn select_gesture(app: &SoundApp, track: TrackId, anchor: Samples, press_y: f32) -> Gesture {
+    let y_off = app.edit_layout.rows.iter().find(|(i, _)| *i == track.0).map_or(0.0, |(_, r)| press_y - r[1]);
+    Gesture::Select { track, anchor, tracks: vec![track], y_off }
+}
+
 /// Runs before anything is painted, against the last frame's layout.
 fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
     if app.gesture.is_none() || matches!(app.gesture, Some(Gesture::Fader { .. })) {
@@ -2741,10 +2762,13 @@ fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
     let to_track = rows.iter().min_by(|a, b| gap(&a.1).total_cmp(&gap(&b.1))).map(|(i, _)| TrackId(*i));
     let mut invalid_fade = false;
     match &mut app.gesture {
-        Some(Gesture::Select { track, tracks, .. }) => {
-            let row_of = |t: TrackId| rows.iter().position(|(i, _)| *i == t.0);
-            if let (Some(a), Some(b)) = (row_of(*track), to_track.and_then(row_of)) {
-                *tracks = rows.get(a.min(b)..=a.max(b)).unwrap_or_default().iter().map(|(i, _)| TrackId(*i)).collect();
+        Some(Gesture::Select { track, tracks, y_off, .. }) => {
+            // Every row the dragged box touches, not just the rows under its two corners' nearest edges.
+            if let Some(a) = rows.iter().find(|(i, _)| *i == track.0) {
+                let y0 = a.1[1] + *y_off;
+                let (lo, hi) = (y0.min(p.y), y0.max(p.y));
+                let hit: Vec<TrackId> = rows.iter().filter(|(_, r)| r[3] > lo && r[1] < hi).map(|(i, _)| TrackId(*i)).collect();
+                *tracks = if hit.is_empty() { vec![*track] } else { hit };
             }
         }
         Some(Gesture::MoveClips { clips, grab_at, delta, from_track, to_track: tt, copy }) => {
@@ -2831,9 +2855,16 @@ fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
     }
     if let Some(Gesture::Select { anchor, tracks, .. }) = &app.gesture {
         let r = Range::new(*anchor, snap(&s, at));
-        if *tracks != s.edit.selected_tracks || r != s.edit.selection {
+        // The box picks up every clip on its tracks that it overlaps, so they move together.
+        let clips: Vec<ClipId> = if r.is_empty() {
+            Vec::new()
+        } else {
+            s.tracks.iter().filter(|t| tracks.contains(&t.id)).flat_map(|t| t.clips().iter().filter(|c| c.start < r.end && c.end() > r.start).map(|c| c.id)).collect()
+        };
+        if *tracks != s.edit.selected_tracks || r != s.edit.selection || clips != s.edit.selected_clips {
             let ids: Vec<u64> = tracks.iter().map(|x| x.0).collect();
-            let _ = app.run("edit.select", json!({"tracks": ids, "start": r.start, "end": r.end}));
+            let cl: Vec<u64> = clips.iter().map(|x| x.0).collect();
+            let _ = app.run("edit.select", json!({"tracks": ids, "start": r.start, "end": r.end, "clips": cl, "keep_range": true}));
         }
     }
     let out = p - inside;
@@ -3134,6 +3165,25 @@ fn overlay(app: &mut SoundApp, ui: &mut Ui, tl: Rect, area: Rect) {
             }
         }
         ui.ctx().request_repaint_after_secs(((1.0 - phase.fract()) / 2.0) as f32);
+    }
+    // Outline the selected zone: one box per run of adjacent selected tracks.
+    if !sel.is_empty() {
+        let (x0, x1) = (x_of(s, tl, sel.start).max(tl.min.x), x_of(s, tl, sel.end).min(tl.max.x));
+        let mut run: Option<(f32, f32)> = None;
+        let rows = app.edit_layout.rows.iter().map(|(id, r)| s.edit.selected_tracks.contains(&TrackId(*id)).then_some((r[1], r[3]))).chain([None]);
+        for r in rows {
+            run = match (run, r) {
+                (Some((top, _)), Some((_, bottom))) => Some((top, bottom)),
+                (None, r) => r,
+                (Some((top, bottom)), None) => {
+                    if x1 > x0 {
+                        let zone = Rect::from_min_max(pos2(x0, top.max(tl.min.y)), pos2(x1, bottom)).shrink(0.5);
+                        painter.rect_stroke(zone, 2.0, Stroke::new(1.5, t.accent), egui::StrokeKind::Inside);
+                    }
+                    None
+                }
+            };
+        }
     }
     if app.is_playing() {
         let x = x_of(s, tl, app.position());

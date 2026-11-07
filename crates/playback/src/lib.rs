@@ -446,7 +446,10 @@ impl AudioState {
         let started = std::time::Instant::now();
         self.drain();
         let channels = channels.max(1);
-        let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
+        // Stopped, an active insert keeps rendering: tape hiss, delay/reverb tails and
+        // self-oscillating effects sound without playback.
+        let live_fx = self.session.tracks.iter().any(|t| !t.inactive && t.mixer.inserts.iter().flatten().any(|i| i.active));
+        let monitoring = live_fx || (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm));
         if !self.playing && !monitoring {
             self.mix.flush_params(&self.session, self.pos);
             out.iter_mut().for_each(|x| *x = 0.0);

@@ -8,6 +8,7 @@ pub mod modulation;
 pub mod pitch;
 pub mod reverb;
 pub mod sampler;
+pub mod shifter;
 pub mod stock;
 pub mod strip;
 pub mod synth;
@@ -40,6 +41,7 @@ pub(crate) static REGISTRY: &[&PluginInfo] = &[
     &harmonic::LOFI_INFO,
     &harmonic::RECT_INFO,
     &pitch::PITCH_INFO,
+    &shifter::SHIFTER_INFO,
     &utility::SHIFT_INFO,
     &utility::GAIN_INFO,
     &utility::TRIM_INFO,
@@ -78,6 +80,7 @@ pub(crate) fn instantiate(id: &str) -> Option<Box<dyn Plugin>> {
         "lofi" => Box::new(harmonic::LoFi::new()),
         "rectifier" => Box::new(harmonic::Rectifier::new()),
         "pitch_shifter" => Box::new(pitch::PitchShifter::new()),
+        "shifter" => Box::new(shifter::Shifter::new()),
         "time_shift" => Box::new(utility::TimeShift::new()),
         "gain" => Box::new(utility::Gain::new()),
         "trim" => Box::new(utility::Trim::new()),

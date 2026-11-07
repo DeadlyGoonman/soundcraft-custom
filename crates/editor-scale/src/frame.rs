@@ -12,6 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use soundcraft_dsp::{EditorHeaderAction, EditorHeaderState, EditorKey, EditorScale};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -41,7 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetClientRect, GetForegroundWindow, GetParent, GetSystemMenu, GetWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, MF_BYCOMMAND, MINMAXINFO, MoveWindow,
     RegisterClassW, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DPICHANGED,
+    PostMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DPICHANGED,
     WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT, WM_SIZE, WM_SIZING, WM_TIMER, WNDCLASSW, WS_CAPTION,
     WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
@@ -257,6 +258,8 @@ fn place_tooltip(header: HWND, f: &Frame, keys: header::Rect) {
 thread_local! {
     /// This thread's keyboard hook (installed once, with the first editor window).
     static KEY_HOOK: Cell<bool> = const { Cell::new(false) };
+    /// When a text key last went to a plugin: it is probably in a text field.
+    static TYPED: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// Installs a keyboard hook for this (the UI) thread. It sees each key before the focused window
@@ -270,8 +273,8 @@ fn install_key_hook() {
     KEY_HOOK.with(|h| h.set(hook.is_ok()));
 }
 
-/// The frame whose window (or a child of it) has the keyboard focus.
-fn focused_frame<'a>() -> Option<&'a Frame> {
+/// The frame (and its top window) whose window (or a child of it) has the keyboard focus.
+fn focused_frame<'a>() -> Option<(HWND, &'a Frame)> {
     // SAFETY: plain queries on this thread's focus window.
     let root = unsafe {
         let focus = GetFocus();
@@ -284,9 +287,9 @@ fn focused_frame<'a>() -> Option<&'a Frame> {
         // A plugin child of the upscaler's hidden source window: its frame is noted on the source.
         // SAFETY: the source's user data is 0 or its frame's handle (set by the upscaler).
         let top = HWND(unsafe { GetWindowLongPtrW(root, GWLP_USERDATA) } as *mut c_void);
-        return frame_of(top);
+        return frame_of(top).map(|f| (top, f));
     }
-    frame_of(root)
+    frame_of(root).map(|f| (root, f))
 }
 
 unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -301,7 +304,7 @@ unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
 /// Decides whether a key event goes to SoundCraft (true: the plugin doesn't get it) and queues
 /// the press for the app. `lp` bit 31 is set on release, bit 30 on auto-repeat.
 fn route_key(code: u32, vk: u32, lp: u32) -> bool {
-    let Some(f) = focused_frame() else { return false };
+    let Some((top, f)) = focused_frame() else { return false };
     let up = lp & (1 << 31) != 0;
     if up {
         let mut sw = f.swallowed.borrow_mut();
@@ -311,14 +314,31 @@ fn route_key(code: u32, vk: u32, lp: u32) -> bool {
         }
         return true;
     }
-    if !f.state.borrow().keys {
-        return false;
-    }
     // SAFETY: plain key-state queries for this thread.
     let (ctrl, shift, alt) = unsafe {
         let down = |k: VIRTUAL_KEY| GetKeyState(i32::from(k.0)) < 0;
         (down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU))
     };
+    // Alt+F4 closes the editor window (not SoundCraft), whether or not Keys is on.
+    if vk == 0x73 && alt && !ctrl {
+        if code == HC_ACTION {
+            if lp & (1 << 30) == 0 {
+                // SAFETY: posts to our own live frame window.
+                let _ = unsafe { PostMessageW(Some(top), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            }
+            let mut sw = f.swallowed.borrow_mut();
+            if !sw.contains(&vk) {
+                sw.push(vk);
+            }
+        }
+        return true;
+    }
+    if !f.state.borrow().keys {
+        return false;
+    }
+    if code == HC_ACTION && plugin_owns_key(vk, ctrl, alt) {
+        return false;
+    }
     let Some(name) = header::forward_key(vk, ctrl, alt) else { return false };
     if code == HC_ACTION {
         let repeat = lp & (1 << 30) != 0;
@@ -331,6 +351,32 @@ fn route_key(code: u32, vk: u32, lp: u32) -> bool {
         }
     }
     true
+}
+
+/// How long after a text key the plugin is assumed to still be in a text field.
+const TYPING_WINDOW: Duration = Duration::from_secs(4);
+
+/// Keys that belong to a plugin's text field, not SoundCraft, while Keys is on: select/copy/
+/// paste/cut (Ctrl+A/C/V/X) always, and Space, Enter, Home, End and the keypad while the user is
+/// typing (a text key went to the plugin in the last few seconds). Enter and Escape end that.
+fn plugin_owns_key(vk: u32, ctrl: bool, alt: bool) -> bool {
+    let typing = TYPED.with(Cell::get).is_some_and(|t| t.elapsed() < TYPING_WINDOW);
+    let text = !ctrl && !alt && matches!(vk, 0x30..=0x39 | 0x41..=0x5A | 0xBC..=0xBE);
+    if text || (ctrl && !alt && matches!(vk, 0x41 | 0x43 | 0x56 | 0x58)) {
+        TYPED.with(|t| t.set(Some(Instant::now())));
+        return ctrl || header::forward_key(vk, false, false).is_none();
+    }
+    if !typing {
+        return false;
+    }
+    match vk {
+        0x0D | 0x1B => {
+            TYPED.with(|t| t.set(None));
+            vk == 0x0D
+        }
+        0x20 | 0x23 | 0x24 | 0x60..=0x6E => true,
+        _ => false,
+    }
 }
 
 /// Adds or removes the sizing border, keeping the body's size.
@@ -1063,5 +1109,17 @@ mod tests {
         click_header(header, (l.sidechain.right + l.keys.left) / 2, l.height / 2);
         click_header(header, (l.sidechain.left + l.sidechain.right) / 2, l.height / 2);
         assert!(win.take_actions().is_empty());
+    }
+
+    #[test]
+    fn typing_keeps_enter_and_space_for_the_plugin() {
+        TYPED.with(|t| t.set(None));
+        assert!(!plugin_owns_key(0x0D, false, false), "Enter with no typing goes to SoundCraft");
+        assert!(!plugin_owns_key(0x20, false, false), "Space too");
+        assert!(plugin_owns_key(0x41, true, false), "Ctrl+A is the plugin's select-all, and starts typing");
+        assert!(plugin_owns_key(0x20, false, false), "Space while typing");
+        assert!(plugin_owns_key(0x31, false, false), "a digit");
+        assert!(plugin_owns_key(0x0D, false, false), "Enter commits in the plugin");
+        assert!(!plugin_owns_key(0x0D, false, false), "and ends typing");
     }
 }

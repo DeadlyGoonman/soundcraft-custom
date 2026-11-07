@@ -452,7 +452,9 @@ fn clear(e: &mut Engine, p: &Value) -> Result<Value> {
     let sh = shuffle(e.session());
     let s = e.session_mut();
     let mut n = 0;
-    if range.is_empty() && !ids.is_empty() {
+    // Selected clips go whole; the range they sat in is not left selected.
+    let by_clip = p.get("clips").is_some() || p.get("clip").is_some() || !s.edit.selected_clips.is_empty();
+    if (range.is_empty() || by_clip) && !ids.is_empty() {
         for t in &mut s.tracks {
             if let Some(pl) = t.playlist_mut() {
                 let before = pl.clips.len();
@@ -461,6 +463,7 @@ fn clear(e: &mut Engine, p: &Value) -> Result<Value> {
             }
         }
         s.edit.selected_clips.clear();
+        s.edit.selection = soundcraft_time::Range::point(range.start);
     } else {
         for t in &tracks {
             n += ops::clear_range(s, *t, range, sh).len();
@@ -586,7 +589,8 @@ fn select(e: &mut Engine, p: &Value) -> Result<Value> {
                 }
             }
         }
-        if let Some(r) = range {
+        // `keep_range` (marquee) leaves the dragged range and tracks as given.
+        if let Some(r) = range.filter(|_| !bool_or(p, "keep_range", false)) {
             ed.selection = r;
             ed.selected_tracks = trs;
         }
