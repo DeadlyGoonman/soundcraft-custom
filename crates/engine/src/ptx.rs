@@ -618,7 +618,10 @@ pub fn parse(b: &[u8]) -> Ptx {
             let position = uint(b, p + 16, 8)?;
             let playlist = names.iter().rev().find(|(q, end, _)| *q < p && p < *end).map(|(_, _, n)| n.clone())?;
             // The flags byte after the position: bit 1 is set on clips that play, clear on muted ones.
-            let muted = b.get(p + 24).is_some_and(|f| f & 0x02 == 0);
+            // A clip muted with Mute Clip can keep that bit: in the 37-byte placement (modern sessions)
+            // its first payload byte is 1, or the byte after the block is 1.
+            let modern = b.get(p + 3..p + 7) == Some(&[0x25, 0, 0, 0][..]);
+            let muted = b.get(p + 24).is_some_and(|f| f & 0x02 == 0) || modern && (b.get(p + 9).is_some_and(|&v| v & 1 != 0) || b.get(p + 44) == Some(&1));
             Some(PtxPlacement { playlist, clip, position, muted })
         })
         .collect();
@@ -1088,6 +1091,13 @@ fn loose(s: &str) -> String {
     s.trim().to_lowercase().replace(' ', "_")
 }
 
+/// `Beat.2.L` -> `Beat.L`: the name without a `.<digits>` that sits before the `.L`/`.R` side.
+fn unnumbered(name: &str) -> Option<String> {
+    let (rest, side) = name.rsplit_once('.').filter(|(_, x)| *x == "L" || *x == "R")?;
+    let (base, num) = rest.rsplit_once('.')?;
+    (!num.is_empty() && num.bytes().all(|c| c.is_ascii_digit())).then(|| format!("{base}.{side}"))
+}
+
 /// The `.<take>_<file number>` that ends a recorded file's name (`Vox.191_464` -> `.191_464`). It
 /// outlives renaming the track the take was recorded on.
 fn take_tag(name: &str) -> Option<&str> {
@@ -1101,8 +1111,9 @@ fn take_tag(name: &str) -> Option<&str> {
 /// (`listed`); else the one file in `entries` (the folder's file names) matching either [`loose`]ly;
 /// else the one ending with the same [`take_tag`] (the take was recorded on a track since renamed).
 fn find_audio(dir: &Path, entries: &[String], stem: &str, listed: Option<&str>) -> Option<PathBuf> {
-    let listed = listed.map(|l| sound_base(l).unwrap_or(l));
-    if let Some(p) = audio_file(dir, stem).or_else(|| listed.and_then(|l| audio_file(dir, l))) {
+    // A listed name with control characters is a folder record that holds other names, not a file name.
+    let listed = listed.filter(|l| !l.chars().any(char::is_control)).map(|l| sound_base(l).unwrap_or(l));
+    if let Some(p) = audio_file(dir, stem) {
         return Some(p);
     }
     let bases: Vec<(&str, &str)> = entries.iter().filter_map(|e| sound_base(e).map(|b| (e.as_str(), b))).collect();
@@ -1110,9 +1121,21 @@ fn find_audio(dir: &Path, entries: &[String], stem: &str, listed: Option<&str>) 
         [one] => Some(dir.join(one)).filter(|p| file_found(p)),
         _ => None,
     };
+    // The clip's own name before the listed file: some sessions' file lists are shifted (the list's
+    // first record is a folder holding several names), so a listed name can be another take's file.
+    if let Some(p) = only(bases.iter().filter(|(_, b)| loose(b) == loose(stem)).map(|(e, _)| *e).collect()) {
+        return Some(p);
+    }
+    if let Some(p) = listed.and_then(|l| audio_file(dir, l)) {
+        return Some(p);
+    }
     let names: Vec<&str> = listed.into_iter().chain([stem]).collect();
+    // Last resort: a playlist copy's `.2` before the side (`Beat.2.L`) is not in the file's name (`Beat.L`).
+    let alts: Vec<String> = names.iter().filter_map(|n| unnumbered(n)).collect();
     names
         .iter()
+        .copied()
+        .chain(alts.iter().map(String::as_str))
         .find_map(|n| only(bases.iter().filter(|(_, b)| loose(b) == loose(n)).map(|(e, _)| *e).collect()))
         .or_else(|| names.iter().find_map(|n| take_tag(n.trim()).and_then(|t| only(bases.iter().filter(|(_, b)| b.ends_with(t)).map(|(e, _)| *e).collect()))))
 }
@@ -1235,10 +1258,19 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
             Some(src) => *src,
             None => {
                 let listed = clip.file.and_then(|f| ptx.files.get(f)).map(String::as_str);
-                let loaded = find_audio(&dir, &entries, &stem, listed).and_then(|file| {
+                // `Beat.L` / `Beat.R` with no such file: the two sides of one stereo file `Beat`.
+                let side = stem.rsplit_once('.').filter(|(_, x)| *x == "L" || *x == "R");
+                let found = find_audio(&dir, &entries, &stem, listed).map(|f| (f, None)).or_else(|| side.and_then(|(base, x)| find_audio(&dir, &entries, base, None).map(|f| (f, Some(usize::from(x == "R"))))));
+                let loaded = found.and_then(|(file, pick)| {
                     let bytes = read_file(&file).ok()?;
                     let ext = file.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
-                    let (info, buf) = soundcraft_audio_io::decode(&bytes, ext.as_deref()).ok()?;
+                    let (info, mut buf) = soundcraft_audio_io::decode(&bytes, ext.as_deref()).ok()?;
+                    if let Some(ch) = pick {
+                        if buf.channels.len() < 2 {
+                            return None;
+                        }
+                        buf.channels = vec![buf.channels.swap_remove(ch)];
+                    }
                     if !rate_set {
                         // The first file sets the session rate; Pro Tools positions count at that rate.
                         if let Ok(r) = SampleRate::new(info.sample_rate) {

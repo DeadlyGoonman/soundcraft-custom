@@ -123,8 +123,16 @@ const MAX_UI_BYTES: u64 = 4 * 1024 * 1024;
 /// Write settings atomically. Preserve an unreadable or malformed existing file for recovery.
 pub fn save_ui(path: &std::path::Path, ui: &soundcraft_ui_egui::UiState) -> Result<(), String> {
     use std::io::Write as _;
-    // Loading can recover a future layout for this session, but saving must preserve its source.
-    read_ui(path, false)?;
+    // A file that is only unreadable because of a layout from another build still loads (the layout
+    // is dropped), so refusing to save would lose every preference change for good: keep the
+    // original beside it once, then save.
+    if let Err(error) = read_ui(path, false) {
+        read_ui(path, true).map_err(|_| error)?;
+        let backup = path.with_extension("json.future-layout.bak");
+        if !backup.exists() {
+            std::fs::copy(path, &backup).map_err(|e| format!("Settings backup failed: {e}"))?;
+        }
+    }
     ui.docking.validate()?;
     ui.mix_docking.validate_mix()?;
     let mut saved = ui.clone();
@@ -186,8 +194,9 @@ mod config_tests {
         assert_eq!(recovered.theme, app.ui.theme);
         assert_eq!(serde_json::to_value(recovered.docking).unwrap(), serde_json::to_value(&app.ui.docking).unwrap());
         recovered.mix_docking.validate_mix().unwrap();
-        assert!(save_ui(&path, &app.ui).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), invalid_bytes);
+        save_ui(&path, &app.ui).unwrap();
+        assert_eq!(std::fs::read(path.with_extension("json.future-layout.bak")).unwrap(), invalid_bytes);
+        assert!(load_ui(&path).unwrap().is_some());
         std::fs::write(&path, b"damaged settings").unwrap();
         assert!(load_ui(&path).is_err());
         assert!(save_ui(&path, &app.ui).is_err());
@@ -196,7 +205,7 @@ mod config_tests {
     }
 
     #[test]
-    fn future_edit_and_mix_layouts_preserve_other_preferences_and_the_original_file() {
+    fn future_edit_and_mix_layouts_keep_other_preferences_and_a_backup_of_the_original_file() {
         use soundcraft_ui_egui::{Services, SoundApp};
         let directory = std::env::temp_dir().join(format!("soundcraft-future-dock-prefs-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -219,8 +228,9 @@ mod config_tests {
                 recovered.mix_docking.validate_mix().unwrap();
                 let other = if field == "docking" { "mix_docking" } else { "docking" };
                 assert_eq!(serde_json::to_value(&recovered).unwrap()[other], saved[other]);
-                assert!(save_ui(&path, &recovered).is_err());
-                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                let _ = std::fs::remove_file(path.with_extension("json.future-layout.bak"));
+                save_ui(&path, &recovered).unwrap();
+                assert_eq!(std::fs::read(path.with_extension("json.future-layout.bak")).unwrap(), bytes);
             }
         }
         std::fs::remove_dir_all(directory).unwrap();

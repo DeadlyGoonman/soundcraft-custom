@@ -1918,7 +1918,9 @@ enum OpenStep {
 }
 
 /// How long a third-party plugin's instance may take to appear before its editor is given up on.
-const OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// A shell plugin (Waves) can take several seconds to load the first time; giving up early left its
+/// empty parameter window up instead of the editor.
+const OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The step for a picked plugin: a third-party plugin opens its editor (waiting up to `OPEN_WAIT`
 /// for the instance to exist), anything else, or one without an editor, its parameter window.
@@ -1941,7 +1943,7 @@ mod open_step_tests {
         assert_eq!(open_step(true, true, Duration::ZERO), OpenStep::Editor);
         assert_eq!(open_step(true, false, Duration::ZERO), OpenStep::Wait, "the instance is not there yet");
         assert_eq!(open_step(true, false, OPEN_WAIT - Duration::from_millis(1)), OpenStep::Wait);
-        assert_eq!(open_step(true, false, OPEN_WAIT), OpenStep::Parameters, "no editor after a second: the parameter window");
+        assert_eq!(open_step(true, false, OPEN_WAIT), OpenStep::Parameters, "no editor after the wait: the parameter window");
     }
 
     #[test]
