@@ -8,7 +8,7 @@
   SoundCraft, and SoundCraft offered under "Open with" for WAV/AIFF/FLAC/MP3 and MIDI files
   (without taking over the user's default player for them).
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
       Name="SoundCraft (DeadlyGoonman fork)"
       Manufacturer="DeadlyGoonman"
@@ -26,6 +26,10 @@
     <MajorUpgrade AllowSameVersionUpgrades="yes"
         DowngradeErrorMessage="A newer version of this fork is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Wizard (licence, folder, progress, finish) so a double-click shows an installer, not a flash. -->
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
 
     <Icon Id="SoundcraftIcon.ico" SourceFile="$(var.IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="SoundcraftIcon.ico" />

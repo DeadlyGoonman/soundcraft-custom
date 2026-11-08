@@ -101,6 +101,7 @@ $Msi = Join-Path $Dist "soundcraft-$Version-windows-$Arch.msi"
 Invoke-Native 'wix build' {
   wix build (Join-Path $PSScriptRoot 'soundcraft.wxs') -arch $Arch `
     -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "IconPath=$(Join-Path $Root 'assets\app-icon\soundcraft.ico')" `
+    -d "LicenseRtf=$(Join-Path $PSScriptRoot 'license.rtf')" -ext WixToolset.UI.wixext `
     -o $Msi
 }
 # wix writes its debug symbols (.wixpdb) next to the MSI; keep them out of the release assets.
