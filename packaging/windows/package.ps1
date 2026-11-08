@@ -44,6 +44,10 @@ if (-not $Version) {
 if (-not $Version) { throw 'could not read [workspace.package] version from Cargo.toml' }
 # MSI ProductVersion is numeric (major.minor.build); pre-release tags are dropped there.
 $MsiVersion = ($Version -split '-')[0]
+# Windows Installer ignores a 4th field when comparing versions, but the auto-generated ProductCode
+# includes it. Without it every custom.N shares one ProductCode and msiexec treats a newer MSI as an
+# already-installed product (maintenance mode: finishes instantly, installs nothing).
+if ($Version -match '-custom\.(\d+)$') { $MsiVersion = "$MsiVersion.$($Matches[1])" }
 
 $Target = switch ($Arch) { 'x64' { 'x86_64-pc-windows-msvc' } 'x86' { 'i686-pc-windows-msvc' } 'arm64' { 'aarch64-pc-windows-msvc' } }
 $Dist = if ($env:DIST) { $env:DIST } else { Join-Path $Root 'dist\release' }
