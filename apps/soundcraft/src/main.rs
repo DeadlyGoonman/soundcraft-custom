@@ -16,6 +16,8 @@ mod control_server;
 #[cfg(any(target_os = "windows", test))]
 mod graphics;
 mod logging;
+mod tabs;
+mod web;
 #[cfg(target_os = "macos")]
 mod native_menu;
 
@@ -24,7 +26,7 @@ use soundcraft_ui_egui::data_dirs::DataDirs;
 use soundcraft_ui_egui::{Services, SoundApp, UiState, dialogs};
 use std::sync::Arc;
 
-struct App(SoundApp, Option<&'static logging::AppLogger>, #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>);
+struct App(tabs::Tabs, Option<&'static logging::AppLogger>, #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>);
 
 /// Sends the title only when it changes, remembered here as X11 and Wayland can't read it back.
 fn set_title(ctx: &egui::Context, title: String) {
@@ -42,67 +44,85 @@ impl eframe::App for App {
             logger.report_audio_thread();
         }
         #[cfg(target_os = "macos")]
-        if let Some(menu) = &mut self.2 {
-            menu.process(&mut self.0);
+        if let (Some(menu), Some(app)) = (&mut self.2, self.0.prefs_app()) {
+            menu.process(app);
         }
-        self.0.guarded(|app| app.logic(ctx));
+        self.0.step(ctx);
         #[cfg(target_os = "macos")]
-        if let Some(menu) = &mut self.2 {
-            menu.sync(&self.0);
+        if let (Some(menu), Some(app)) = (&mut self.2, self.0.prefs_app()) {
+            menu.sync(app);
         }
         // Files dropped on the window: audio on an instrument track or a Sampler window loads
         // the sampler; otherwise sessions open and audio/MIDI import.
-        let dropped: Vec<String> =
-            self.0.take_dropped_files(ctx).iter().map(|f| f.path().to_string_lossy().into_owned()).filter(|s| !s.is_empty()).collect();
-        for p in dropped {
-            open_path(&mut self.0, &p);
+        if let Some(app) = self.0.app() {
+            let dropped: Vec<String> =
+                app.take_dropped_files(ctx).iter().map(|f| f.path().to_string_lossy().into_owned()).filter(|s| !s.is_empty()).collect();
+            for p in dropped {
+                open_path(app, &p);
+            }
         }
-        if self.0.quit_requested {
+        if self.0.quit_step(ctx) {
             // Unloading plugins at exit can take seconds: hide the window first so it closes at once.
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if ctx.input(|i| i.viewport().close_requested()) {
-            if dialogs::ask_to_save(&mut self.0, "app.quit", &serde_json::json!({})) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            }
         }
         soundcraft_ui_egui::fit_window_to_screen(ctx);
         let (inner, maximized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().maximized.unwrap_or(false)));
-        self.0.ui.window_maximized = maximized;
-        if let Some(r) = inner.filter(|_| !maximized) {
-            self.0.ui.window_size = (r.size() * ctx.zoom_factor()).round().into();
-        }
-        self.0.ui.ui_scale = self.0.extra.ui_scale;
-        // Saved now rather than at exit: the recent list matters most after a crash.
-        if self.0.take_recent_changed() {
-            save_prefs(&self.0.ui);
+        if let Some(app) = self.0.prefs_app() {
+            app.ui.window_maximized = maximized;
+            if let Some(r) = inner.filter(|_| !maximized) {
+                app.ui.window_size = (r.size() * ctx.zoom_factor()).round().into();
+            }
+            app.ui.ui_scale = app.extra.ui_scale;
+            // Saved now rather than at exit: the recent list matters most after a crash.
+            if app.take_recent_changed() {
+                save_prefs(&app.ui);
+            }
         }
         // With the system menu bar there is no egui bar showing the window and dirty state, so the
         // title carries them; elsewhere the egui menu bar already does.
-        let title = if self.0.native_menu_bar {
-            format!(
+        let title = match self.0.app() {
+            Some(app) if app.native_menu_bar => format!(
                 "{}{} — SoundCraft — {}",
-                self.0.engine.session().name,
-                if self.0.engine.is_dirty() { " *" } else { "" },
-                if self.0.ui.window == soundcraft_ui_egui::MainWindow::Edit { "Edit" } else { "Mix" }
-            )
-        } else {
-            format!("{} — SoundCraft", self.0.engine.session().name)
+                app.engine.session().name,
+                if app.engine.is_dirty() { " *" } else { "" },
+                if app.ui.window == soundcraft_ui_egui::MainWindow::Edit { "Edit" } else { "Mix" }
+            ),
+            _ => self.0.title(),
         };
         set_title(ctx, title);
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        self.0.raw_input_hook(raw);
+        self.0.take_shortcuts(raw);
+        if let Some(app) = self.0.prefs_app() {
+            app.raw_input_hook(raw);
+        }
     }
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.0.guarded(|app| app.ui(ui));
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.0.show(ui, frame);
     }
     fn on_exit(&mut self) {
         let t = std::time::Instant::now();
-        self.0.close_autosave();
-        save_prefs(&self.0.ui);
+        // Whatever blocks below (a plugin, a driver), the process ends and the audio with it.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            log::warn!("exit: not done after 3 s, ending the process");
+            soundcraft_engine::terminate_process_now();
+        });
+        // Silence first: every transport stops before anything slow runs.
+        for app in self.0.sessions() {
+            if let Some(p) = &app.player {
+                p.stop();
+            }
+        }
+        log::info!("exit: closing {} session(s)", self.0.session_count());
+        for app in self.0.sessions() {
+            app.close_autosave();
+        }
+        log::info!("exit: autosave closed ({:?})", t.elapsed());
+        if let Some(app) = self.0.prefs_app() {
+            save_prefs(&app.ui);
+        }
         if let Some(logger) = self.1 {
             logger.report_audio_thread();
         }
@@ -111,15 +131,20 @@ impl eframe::App for App {
         let before_plugins = t.elapsed();
         // Unloading every plugin instance takes tens of seconds and lags the whole PC with a big
         // session. All is saved: stop the audio, leave the plugins to the OS and end the process.
-        if let Some(p) = self.0.player.take() {
-            p.close_editors();
-            let live = p.take_plugins();
-            drop(p);
+        let mut players = Vec::new();
+        for app in self.0.sessions() {
+            if let Some(p) = app.player.take() {
+                p.close_editors();
+                let live = p.take_plugins();
+                players.push((p, live));
+            }
+        }
+        if !players.is_empty() {
+            let lives: Vec<_> = players.into_iter().map(|(p, live)| (drop(p), live)).collect();
             log::info!("exit: audio closed, plugins left to the OS ({:?})", t.elapsed());
-            std::mem::forget(live);
+            std::mem::forget(lives);
             soundcraft_engine::terminate_process_now();
         }
-        self.0.player = None;
         soundcraft_engine::shutdown_plugin_hosts();
         log::info!("exit: autosave+prefs {before_plugins:?}, plugin teardown {:?}", t.elapsed() - before_plugins);
     }
@@ -127,7 +152,7 @@ impl eframe::App for App {
 
 fn open_path(app: &mut SoundApp, p: &str) {
     let lower = p.to_ascii_lowercase();
-    let r = if lower.ends_with(".scraft") || lower.ends_with(".ptx") || lower.ends_with(".flp") {
+    let r = if is_session_path(p) {
         dialogs::run_or_ask(app, "session.open", serde_json::json!({"path": p}))
     } else if lower.ends_with(".mid") || lower.ends_with(".midi") || lower.ends_with(".smf") {
         app.run("file.import_midi", serde_json::json!({"path": p}))
@@ -137,6 +162,25 @@ fn open_path(app: &mut SoundApp, p: &str) {
     };
     if let Err(e) = r {
         log::warn!("{p}: {e}");
+    }
+}
+
+fn is_session_path(p: &str) -> bool {
+    let lower = p.to_ascii_lowercase();
+    lower.ends_with(".scraft") || lower.ends_with(".ptx") || lower.ends_with(".flp")
+}
+
+/// The folders and plugin scan every session tab shares: set on each tab's app as it is made.
+fn configure(app: &mut SoundApp, dirs: Option<&DataDirs>) {
+    app.autosave_dir = dirs.map(|d| d.autosave.clone()).or_else(|| prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave"))));
+    app.preset_dir = dirs.map(|d| d.presets.clone()).or_else(|| prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets"))));
+    app.template_dir = dirs.map(|d| d.templates.clone());
+    app.data_dirs = dirs.cloned();
+    app.extra.plugin_scanner = plugin_scanner(dirs);
+    if prefs_enabled()
+        && let Some(d) = dirs
+    {
+        app.extra.editor_frame = soundcraft_ui_egui::editor_frame::EditorFrameSettings::load(&d.settings);
     }
 }
 
@@ -365,18 +409,9 @@ fn main() -> eframe::Result {
             let player =
                 if no_audio { None } else { Some(soundcraft_playback::Player::with_config(Arc::new(engine.session().clone()), &prefs.audio)) };
             let mut app = SoundApp::new(engine, player, services(cc.egui_ctx.clone()));
-            app.autosave_dir = dirs.as_ref().map(|d| d.autosave.clone()).or_else(|| prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave"))));
+            configure(&mut app, dirs.as_ref());
             app.leftovers = app.autosave_dir.as_deref().map(soundcraft_engine::autosave::leftovers).unwrap_or_default();
-            app.preset_dir = dirs.as_ref().map(|d| d.presets.clone()).or_else(|| prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets"))));
-            app.template_dir = dirs.as_ref().map(|d| d.templates.clone());
-            app.data_dirs = dirs.clone();
             app.extra.ui_scale = prefs.ui_scale;
-            app.extra.plugin_scanner = plugin_scanner(dirs.as_ref());
-            if prefs_enabled()
-                && let Some(d) = dirs.as_ref()
-            {
-                app.extra.editor_frame = soundcraft_ui_egui::editor_frame::EditorFrameSettings::load(&d.settings);
-            }
             // Runs without preferences (tests, agents) make no network calls.
             if prefs_enabled() {
                 app.extra.update = soundcraft_ui_egui::extra_windows::update::UpdateChecker::start();
@@ -390,8 +425,14 @@ fn main() -> eframe::Result {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
                 app = app.with_control(rx);
             }
-            for f in &files {
-                open_path(&mut app, f);
+            // The first file opens in the first tab; more sessions get tabs of their own.
+            let mut extra_sessions = Vec::new();
+            for (n, f) in files.iter().enumerate() {
+                if n > 0 && is_session_path(f) {
+                    extra_sessions.push(f.clone());
+                } else {
+                    open_path(&mut app, f);
+                }
             }
             // If the system menu bar cannot be built, keep the egui menu bar rather than fail to start.
             #[cfg(target_os = "macos")]
@@ -405,8 +446,23 @@ fn main() -> eframe::Result {
                     None
                 }
             };
+            let make: tabs::SessionFactory = {
+                let (dirs, ctx) = (dirs.clone(), cc.egui_ctx.clone());
+                Box::new(move |_| {
+                    let mut app = SoundApp::new(Engine::default(), None, services(ctx.clone()));
+                    configure(&mut app, dirs.as_ref());
+                    app
+                })
+            };
+            let web_data = config_dir().filter(|_| prefs_enabled()).map(|d| d.join("WebView2")).or_else(|| Some(std::env::temp_dir().join("SoundCraft-WebView2")));
+            let mut tabs = tabs::Tabs::new(app, make, web_data);
+            for f in extra_sessions {
+                let mut tab = tabs.new_session(&cc.egui_ctx);
+                open_path(&mut tab, &f);
+                tabs.push(tabs::Tab::Session(Box::new(tab)));
+            }
             Ok(Box::new(App(
-                app,
+                tabs,
                 logger,
                 #[cfg(target_os = "macos")]
                 menu,

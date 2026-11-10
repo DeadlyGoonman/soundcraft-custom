@@ -141,6 +141,27 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
                 Err(e) => err(e),
             }
         }
+        "ui.tab.list" => ok(json!({
+            "active": app.tab_strip.active,
+            "tabs": app.tab_strip.tabs.iter().map(|t| json!({"title": t.title, "kind": if t.icon == crate::tab_strip::TabIcon::Web { "web" } else { "session" }, "playing": t.playing})).collect::<Vec<_>>(),
+        })),
+        "ui.tab.new" => {
+            use crate::tab_strip::TabAction;
+            match p.get("kind").and_then(Value::as_str).unwrap_or("session") {
+                "web" => app.tab_strip.actions.push(TabAction::NewWeb(p.get("url").and_then(Value::as_str).map(str::to_string))),
+                "session" => app.tab_strip.actions.push(TabAction::NewSession),
+                other => return Some(err(format!("unknown tab kind {other:?} (session or web)"))),
+            }
+            ok(json!({}))
+        }
+        "ui.tab.switch" | "ui.tab.close" => {
+            let Some(i) = p.get("index").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok()).filter(|i| *i < app.tab_strip.tabs.len()) else {
+                return Some(err("index out of range"));
+            };
+            use crate::tab_strip::TabAction;
+            app.tab_strip.actions.push(if req.method == "ui.tab.close" { TabAction::Close(i) } else { TabAction::Switch(i) });
+            ok(json!({}))
+        }
         "ui.inspect" => {
             let mut v = app.inspect(ctx);
             v["edit_layout"] = json!(app.edit_layout);

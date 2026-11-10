@@ -233,6 +233,8 @@ impl SoundApp {
     /// at startup, for the Untitled session the app opens with.
     pub fn apply_saved_edit_views(&mut self) {
         let Some(saved) = self.ui.preferences.edit_views.clone() else { return };
+        // A fresh session starting with the saved views is not a change the user made.
+        let was_dirty = self.engine.is_dirty();
         let edit = &mut self.engine.session_mut().edit;
         let on: Vec<String> = edit.flags.iter().filter(|f| f.starts_with(VIEW_PREFIX)).cloned().collect();
         for f in on.iter().filter(|f| !saved.contains(f)) {
@@ -240,6 +242,9 @@ impl SoundApp {
         }
         for f in saved.iter().filter(|f| f.starts_with(VIEW_PREFIX)) {
             edit.set_flag(f, true);
+        }
+        if !was_dirty {
+            self.engine.mark_clean();
         }
     }
 }

@@ -30,6 +30,7 @@ pub mod sampler_window;
 pub mod score_editor;
 pub mod shortcuts;
 pub mod spot;
+pub mod tab_strip;
 pub mod theme;
 pub mod toolbar;
 pub mod video_track;
@@ -442,6 +443,14 @@ pub struct SoundApp {
     /// When Record last found nothing to record on, and why: the Record buttons show it for a moment.
     record_hint: Option<(f64, &'static str)>,
     pub quit_requested: bool,
+    /// The open tabs, shown in the Edit window's header gap; the host fills it and carries out
+    /// what it queues (see [`tab_strip`]).
+    pub tab_strip: tab_strip::TabStrip,
+    /// The audio device must be reopened for every session tab at once (it is shared); the host
+    /// does it. Set by [`SoundApp::apply_audio_config`] when other tabs play through the device.
+    pub audio_reopen: bool,
+    /// This session is not the one on screen: its frame step skips the theme and repaint pacing.
+    pub background: bool,
     /// Set when a different session takes over: the next frame clears the old one's view state.
     reset_view: bool,
     /// Copy or Cut ran: put a note on the system clipboard, without which egui-winit sends no
@@ -559,6 +568,9 @@ impl SoundApp {
             sim: None,
             record_hint: None,
             quit_requested: false,
+            tab_strip: tab_strip::TabStrip::default(),
+            audio_reopen: false,
+            background: false,
             reset_view: false,
             claim_clipboard: false,
             arrange_request: false,
@@ -1206,6 +1218,12 @@ impl SoundApp {
             return Err("stop recording before changing the audio device".into());
         }
         self.ui.audio = cfg;
+        if self.player.as_ref().is_some_and(|p| p.device_sessions() > 1) {
+            // Other tabs play through the same device, and an ASIO driver opens once: the host
+            // reopens it for all of them (see `detach_player`).
+            self.audio_reopen = true;
+            return Ok(());
+        }
         let at = self.position();
         let started = std::time::Instant::now();
         let mut plugins = None;
@@ -1236,6 +1254,30 @@ impl SoundApp {
         self.player = Some(player);
         self.report_fallback();
         Ok(())
+    }
+
+    /// Stops this session and takes its player out, with its live plugins and the transport
+    /// position, so the device can be reopened for every tab at once. Drop every detached player
+    /// before opening the new device, then give each session its new player with
+    /// [`SoundApp::attach_player`].
+    pub fn detach_player(&mut self) -> Option<(Player, Option<soundcraft_playback::LivePlugins>, Samples)> {
+        if self.is_playing() || self.engine.transport.recording {
+            self.stop_play();
+        }
+        let at = self.position();
+        let p = self.player.take()?;
+        p.stop();
+        p.close_editors();
+        let plugins = p.take_plugins();
+        self.recorder = None;
+        self.recorder_failed = false;
+        Some((p, plugins, at))
+    }
+
+    pub fn attach_player(&mut self, p: Player, at: Samples) {
+        p.locate(at);
+        self.player = Some(p);
+        self.report_fallback();
     }
 
     /// Open the input device once (for recording and input monitoring) and feed the player. An
@@ -1377,6 +1419,10 @@ impl SoundApp {
     pub fn reconnect_audio(&mut self) {
         if self.is_playing() || self.engine.transport.recording {
             self.stop_play();
+        }
+        if self.player.as_ref().is_some_and(|p| p.device_sessions() > 1) {
+            self.audio_reopen = true;
+            return;
         }
         if let Some(p) = &self.player {
             // Its plugin editors go with it; closed here, on the main thread (see `apply_audio_config`).
@@ -1679,6 +1725,27 @@ impl SoundApp {
 
     /// Per-frame logic: control channel, transport, document sync.
     pub fn logic(&mut self, ctx: &egui::Context) {
+        self.background = false;
+        self.logic_inner(ctx);
+    }
+
+    /// [`SoundApp::logic`] for a session tab that is not on screen: transport, autosave, output
+    /// watching and document sync go on, but the theme and repaint pacing are the visible tab's.
+    pub fn logic_background(&mut self, ctx: &egui::Context) {
+        self.background = true;
+        self.logic_inner(ctx);
+    }
+
+    /// The control channel, handed to another session tab (the host keeps it on the visible one).
+    pub fn take_control(&mut self) -> Option<Receiver<ControlRequest>> {
+        self.control_rx.take()
+    }
+
+    pub fn set_control(&mut self, rx: Option<Receiver<ControlRequest>>) {
+        self.control_rx = rx;
+    }
+
+    fn logic_inner(&mut self, ctx: &egui::Context) {
         if ctx.current_pass_index() > 0 {
             return;
         }
@@ -1693,7 +1760,7 @@ impl SoundApp {
             }
         }
         let palette = theme::palette_for(ctx, self.ui.theme, self.ui.custom_bg);
-        if self.theme_applied != Some(palette) || theme::active_palette() != palette {
+        if !self.background && (self.theme_applied != Some(palette) || theme::active_palette() != palette) {
             theme::apply_palette(ctx, palette);
             self.theme_applied = Some(palette);
         }
@@ -1751,7 +1818,9 @@ impl SoundApp {
         // egui takes its predicted frame time off every delay, so add it back.
         // Files dragged in from another app move without events on Windows: poll the pointer.
         let editors = self.player.as_ref().is_some_and(Player::any_editor_open) || ctx.input(|i| !i.raw.hovered_files.is_empty());
-        ctx.request_repaint_after_secs(if editors { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt));
+        if !self.background {
+            ctx.request_repaint_after_secs(if editors { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt));
+        }
         control::collect_screenshots(self, ctx);
     }
 
@@ -1817,6 +1886,10 @@ impl SoundApp {
         self.audio_drop_lanes.clear();
         if !self.native_menu_bar {
             menus::menu_bar(self, ui);
+        }
+        // The Edit window shows the tab list in its header gap; the Mix window gets a side panel.
+        if !self.ui.mix_separate && self.ui.window == MainWindow::Mix {
+            tab_strip::side_panel(ui, &mut self.tab_strip);
         }
         // With the Mix window in its own native window, the main window keeps Edit.
         match if self.ui.mix_separate { MainWindow::Edit } else { self.ui.window } {
@@ -1976,6 +2049,18 @@ mod tests {
         let edit = &app.engine.session().edit;
         assert!(edit.flag("edit_view.sends_ae") && edit.flag("edit_view.inserts_ae") && edit.flag("edit_view.io"));
         assert!(!edit.flag("edit_view.comments"));
+    }
+
+    #[test]
+    fn a_fresh_session_given_the_saved_views_is_not_unsaved_work() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        app.run("view.edit_comments", json!({})).unwrap();
+        app.remember_edit_views();
+        let mut fresh = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        fresh.ui.preferences.edit_views = app.ui.preferences.edit_views.clone();
+        fresh.apply_saved_edit_views();
+        assert!(fresh.engine.session().edit.flag("edit_view.comments"));
+        assert!(!fresh.engine.is_dirty(), "closing it must not ask to save");
     }
 
     #[test]

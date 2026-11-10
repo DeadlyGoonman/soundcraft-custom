@@ -278,6 +278,17 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
                                 instrument_menu(app, ui);
                             }
                         }
+                        if root.label == "File" {
+                            ui.separator();
+                            if ui.button("New Session Tab").clicked() {
+                                app.tab_strip.actions.push(crate::tab_strip::TabAction::NewSession);
+                                ui.close();
+                            }
+                            if ui.button("Open Session in New Tab…").clicked() {
+                                app.tab_strip.actions.push(crate::tab_strip::TabAction::OpenSessionInNewTab);
+                                ui.close();
+                            }
+                        }
                         if root.label == "AudioSuite" {
                             ui.separator();
                             ui.label(egui::RichText::new("Processes selected clips offline").small().color(t.text_dim));

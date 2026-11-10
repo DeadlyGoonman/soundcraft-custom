@@ -233,7 +233,7 @@ impl Dialogs {
 /// When `id` would close a session with unsaved changes, ask first; true when the question is
 /// open instead. A take in progress is stopped first, so it counts as a change.
 pub fn ask_to_save(app: &mut SoundApp, id: &str, params: &Value) -> bool {
-    if !matches!(id, "session.new" | "session.new_from_template" | "session.open" | "session.close" | "session.revert" | "app.quit" | OPEN_PENDING)
+    if !matches!(id, "session.new" | "session.new_from_template" | "session.open" | "session.close" | "session.revert" | "app.quit" | CLOSE_TAB | OPEN_PENDING)
         || soundcraft_engine::find_command(id).is_some_and(|c| (c.enabled)(&app.engine).is_err())
     {
         return false;
@@ -258,6 +258,10 @@ pub fn run_or_ask(app: &mut SoundApp, id: &str, params: Value) -> Result<Value, 
 
 /// `session.open` of a path opens behind the progress window; anything else runs at once.
 fn run_or_open(app: &mut SoundApp, id: &str, params: Value) -> Result<Value, String> {
+    if id == CLOSE_TAB {
+        app.tab_strip.actions.push(crate::tab_strip::TabAction::CloseActiveNow);
+        return Ok(Value::Null);
+    }
     if id == "session.open"
         && let Some(path) = params.get("path").and_then(Value::as_str)
     {
@@ -266,6 +270,9 @@ fn run_or_open(app: &mut SoundApp, id: &str, params: Value) -> Result<Value, Str
     }
     app.run(id, params)
 }
+
+/// What `SaveChanges` carries on with to close the session's tab (see `tab_strip`).
+pub const CLOSE_TAB: &str = "ui.close_tab";
 
 /// What `SaveChanges` carries on with to open the session the browser read.
 const OPEN_PENDING: &str = "ui.open_pending_session";
@@ -433,6 +440,16 @@ pub fn join_save_path(dir: &str, name: &str, ext: &str) -> String {
 
 /// Opens the session picked in the file picker: asks to save a modified one first, else opens it
 /// behind a progress window ([`start_open`]).
+/// Picks a session file with the system dialog and opens it (the question about unsaved changes
+/// comes first). False when there is no file picker.
+pub fn pick_and_open_session(app: &mut SoundApp) -> bool {
+    let Some(picked) = app.services.pick_open.as_ref().map(|pick| pick("session.open", &[])) else { return false };
+    if let Some(file) = picked {
+        open_session_with_progress(app, file);
+    }
+    true
+}
+
 pub fn open_session_with_progress(app: &mut SoundApp, path: String) {
     if ask_to_save(app, "session.open", &json!({ "path": path })) {
         return;

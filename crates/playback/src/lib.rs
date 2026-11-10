@@ -543,6 +543,128 @@ impl AudioState {
     }
 }
 
+/// Most sessions one device renders at once (room is reserved up front so adding never allocates
+/// on the audio thread).
+const MAX_SLOTS: usize = 16;
+
+/// Frames of the largest block the device callback renders at once (the scratch buffers are sized
+/// for it; longer device buffers are rendered in pieces).
+const HUB_SCRATCH: usize = 8192;
+
+/// One session's renderer inside the device callback.
+struct Slot {
+    id: u64,
+    state: AudioState,
+}
+
+/// Slot changes for the device callback.
+enum HubCmd {
+    Add(Box<Slot>),
+    Remove(u64),
+}
+
+/// What the device callback owns: every session slot, rendered one after another and summed.
+/// Slots that are stopped and have no live effects render silence at almost no cost (see
+/// [`AudioState::fill`]). With one slot the block goes straight into the device buffer.
+struct Hub {
+    slots: Vec<Slot>,
+    ctl: Receiver<HubCmd>,
+    /// Removed slots go back to the UI thread to be dropped there (they own plugins).
+    retired: Sender<Box<Slot>>,
+    scratch: Vec<f32>,
+    fault: Arc<Fault>,
+    /// Held by the [`Core`]; the silent clock thread ends when it is the only holder.
+    token: Arc<()>,
+}
+
+/// The UI side of a [`Hub`].
+struct HubLink {
+    ctl: Sender<HubCmd>,
+    retired: Receiver<Box<Slot>>,
+    _token: Arc<()>,
+}
+
+impl Hub {
+    /// A hub with `first` as its only slot; `scratch` is the largest block (in samples) a slot
+    /// beyond the first renders at once.
+    fn new(first: AudioState, fault: Arc<Fault>, scratch: usize) -> (Hub, HubLink) {
+        let (ctl_tx, ctl) = channel();
+        let (retired, retired_rx) = channel();
+        let token = Arc::new(());
+        let mut slots = Vec::with_capacity(MAX_SLOTS);
+        slots.push(Slot { id: 0, state: first });
+        let hub = Hub { slots, ctl, retired, scratch: vec![0.0; scratch.max(2)], fault, token: Arc::clone(&token) };
+        (hub, HubLink { ctl: ctl_tx, retired: retired_rx, _token: token })
+    }
+
+    fn drain(&mut self) {
+        while let Ok(c) = self.ctl.try_recv() {
+            match c {
+                HubCmd::Add(slot) => {
+                    if self.slots.len() < MAX_SLOTS {
+                        self.slots.push(*slot);
+                    } else {
+                        let _ = self.retired.send(slot);
+                    }
+                }
+                HubCmd::Remove(id) => {
+                    if let Some(i) = self.slots.iter().position(|s| s.id == id) {
+                        let _ = self.retired.send(Box::new(self.slots.swap_remove(i)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fill an interleaved device buffer with the sum of every slot.
+    fn fill(&mut self, out: &mut [f32], channels: usize) {
+        self.drain();
+        if let [only] = self.slots.as_mut_slice() {
+            guarded_block(&self.fault, &only.state.shared.clone(), out, |d| only.state.fill(d, channels));
+            return;
+        }
+        let step = (self.scratch.len() / channels.max(1) * channels.max(1)).max(1);
+        for chunk in out.chunks_mut(step) {
+            let mut first = true;
+            for slot in &mut self.slots {
+                if first {
+                    guarded_block(&self.fault, &slot.state.shared.clone(), chunk, |d| slot.state.fill(d, channels));
+                    first = false;
+                    continue;
+                }
+                let Some(tmp) = self.scratch.get_mut(..chunk.len()) else { continue };
+                guarded_block(&self.fault, &slot.state.shared.clone(), tmp, |d| slot.state.fill(d, channels));
+                for (o, x) in chunk.iter_mut().zip(tmp.iter()) {
+                    *o = (*o + *x).clamp(-1.0, 1.0);
+                }
+            }
+            if first {
+                chunk.fill(0.0);
+            }
+        }
+    }
+}
+
+/// The audio device, shared by every [`Player`] (one per open session) that plays through it. The
+/// device closes when the last one is dropped.
+struct Core {
+    link: HubLink,
+    next_id: std::sync::atomic::AtomicU64,
+    #[cfg(not(target_arch = "wasm32"))]
+    _stream: Option<cpal::Stream>,
+    #[cfg(target_arch = "wasm32")]
+    _stream: Option<cpal::Stream>,
+    /// The native ASIO stream, when the output is an ASIO driver.
+    #[cfg(all(windows, feature = "asio"))]
+    asio: Option<soundcraft_asio::AsioStream>,
+}
+
+impl Core {
+    fn drop_retired(&self) {
+        self.link.retired.try_iter().for_each(drop);
+    }
+}
+
 /// UI-thread bookkeeping of the third-party instances the audio thread holds.
 struct Side {
     /// What was last created for each slot: (plugin id, channels, created ok).
@@ -661,7 +783,7 @@ impl Side {
     }
 }
 
-/// The transport and audio device.
+/// The transport of one session, playing through the (shared) audio device.
 pub struct Player {
     shared: Arc<Shared>,
     fault: Arc<Fault>,
@@ -670,13 +792,9 @@ pub struct Player {
     watch: Mutex<Option<(u64, std::time::Instant)>>,
     tx: Sender<Cmd>,
     side: Mutex<Side>,
-    #[cfg(not(target_arch = "wasm32"))]
-    _stream: Option<cpal::Stream>,
-    #[cfg(target_arch = "wasm32")]
-    _stream: Option<cpal::Stream>,
-    /// The native ASIO stream, when the output is an ASIO driver.
-    #[cfg(all(windows, feature = "asio"))]
-    asio: Option<soundcraft_asio::AsioStream>,
+    /// The device, shared with the players of the other open sessions, and this player's slot in it.
+    core: std::rc::Rc<Core>,
+    slot: u64,
     /// The ASIO input that recorders attach to (`None` for cpal devices).
     input_tap: Option<Arc<record::InputTap>>,
     /// Frames a take is placed earlier by (see [`Player::record_offset`]).
@@ -740,15 +858,69 @@ impl Player {
         let mut note = None;
         let mut p = Player::open(Arc::clone(&session), cfg, &mut note);
         p.fallback_note = note;
-        p.side().return_old_sessions(&p.tx);
+        p.start_session(session, plugins);
+        p
+    }
+
+    fn start_session(&self, session: Arc<Session>, plugins: Option<LivePlugins>) {
+        self.side().return_old_sessions(&self.tx);
         let sr = session.sample_rate.as_f64() as f32;
         if let Some(plugins) = plugins.filter(|l| (l.rate - sr).abs() <= 0.5) {
-            let instances = p.side().install(plugins);
-            let _ = p.tx.send(Cmd::Session(Arc::clone(&session), instances));
+            let instances = self.side().install(plugins);
+            let _ = self.tx.send(Cmd::Session(Arc::clone(&session), instances));
         }
         // Hand the session's (remaining) third-party plugins over.
-        p.update_session(session);
+        self.update_session(session);
+    }
+
+    /// A player for another session on the same audio device: both play at once and are summed
+    /// into the output. The device closes when the last player is dropped.
+    pub fn sibling(&self, session: Arc<Session>) -> Player {
+        self.sibling_with_plugins(session, None)
+    }
+
+    /// [`Player::sibling`], taking over `plugins` taken from a player of the same session.
+    pub fn sibling_with_plugins(&self, session: Arc<Session>, plugins: Option<LivePlugins>) -> Player {
+        self.core.drop_retired();
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let (gtx, grx) = channel();
+        let id = self.core.next_id.fetch_add(1, Ordering::Relaxed);
+        let state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(self.device_rate), gtx);
+        let _ = self.core.link.ctl.send(HubCmd::Add(Box::new(Slot { id, state })));
+        let p = Player {
+            shared,
+            fault: Arc::clone(&self.fault),
+            #[cfg(not(target_arch = "wasm32"))]
+            watch: Mutex::new(None),
+            tx,
+            side: Mutex::new(Side::new(session.sample_rate.as_f64() as f32, grx)),
+            core: std::rc::Rc::clone(&self.core),
+            slot: id,
+            input_tap: self.input_tap.clone(),
+            offset: self.offset,
+            input_channels: self.input_channels,
+            reset_reported: AtomicBool::new(false),
+            device_name: self.device_name.clone(),
+            device_rate: self.device_rate,
+            device_channels: self.device_channels,
+            device_buffer: self.device_buffer,
+            device_latency: self.device_latency,
+            silent: self.silent,
+            fallback_note: None,
+        };
+        p.start_session(session, plugins);
         p
+    }
+
+    /// Players sharing this player's device (this one included).
+    pub fn device_sessions(&self) -> usize {
+        std::rc::Rc::strong_count(&self.core)
     }
 
     /// Takes the live third-party plugins out of this player, for the one that replaces it
@@ -784,11 +956,11 @@ impl Player {
     /// stopped asking for audio while playing.
     pub fn trouble(&self) -> Option<OutputTrouble> {
         #[cfg(all(windows, feature = "asio"))]
-        let reset = self.asio.as_ref().is_some_and(|s| s.reset_requested());
+        let reset = self.core.asio.as_ref().is_some_and(|s| s.reset_requested());
         #[cfg(not(all(windows, feature = "asio")))]
         let reset = false;
         #[cfg(all(windows, feature = "asio"))]
-        if self.asio.as_ref().is_some_and(|s| s.failed()) {
+        if self.core.asio.as_ref().is_some_and(|s| s.failed()) {
             // A panic escaped the driver callback: the stream plays silence from now on.
             self.fault.failed.store(true, Ordering::Relaxed);
             self.shared.playing.store(false, Ordering::Relaxed);
@@ -797,7 +969,7 @@ impl Player {
             return Some(OutputTrouble::Reset);
         }
         #[cfg(all(windows, feature = "asio"))]
-        let asio = self.asio.is_some();
+        let asio = self.core.asio.is_some();
         #[cfg(not(all(windows, feature = "asio")))]
         let asio = false;
         #[cfg(not(target_arch = "wasm32"))]
@@ -873,17 +1045,18 @@ impl Player {
                         let (gtx, grx) = channel();
                         let state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx);
                         let fault = Arc::new(Fault::default());
+                        let (hub, link) = Hub::new(state, Arc::clone(&fault), HUB_SCRATCH * channels.max(1));
                         let stream = match format {
-                            cpal::SampleFormat::I32 => build_output::<i32>(&device, config, state, channels, &fault, &shared),
-                            cpal::SampleFormat::I16 => build_output::<i16>(&device, config, state, channels, &fault, &shared),
-                            _ => build_output::<f32>(&device, config, state, channels, &fault, &shared),
+                            cpal::SampleFormat::I32 => build_output::<i32>(&device, config, hub, channels),
+                            cpal::SampleFormat::I16 => build_output::<i16>(&device, config, hub, channels),
+                            _ => build_output::<f32>(&device, config, hub, channels),
                         }?;
-                        Ok(Opened { stream, tx, grx, fault })
+                        Ok(Opened { stream, tx, grx, fault, link })
                     },
                     |opened| start_stream(&opened.stream),
                 );
                 match opened {
-                    Some((config, Opened { stream, tx, grx, fault })) => {
+                    Some((config, Opened { stream, tx, grx, fault, link })) => {
                         let rate = config.sample_rate.0;
                         let channels = usize::from(config.channels);
                         let buffer = match config.buffer_size {
@@ -901,9 +1074,14 @@ impl Player {
                             watch: Mutex::new(None),
                             tx,
                             side: new_side(grx),
-                            _stream: Some(stream),
-                            #[cfg(all(windows, feature = "asio"))]
-                            asio: None,
+                            core: std::rc::Rc::new(Core {
+                                link,
+                                next_id: 1.into(),
+                                _stream: Some(stream),
+                                #[cfg(all(windows, feature = "asio"))]
+                                asio: None,
+                            }),
+                            slot: 0,
                             input_tap: None,
                             offset: 0,
                             input_channels: 0,
@@ -956,23 +1134,22 @@ impl Player {
         gtx: Sender<Vec<Box<dyn Plugin>>>,
     ) -> Player {
         let rate = session.sample_rate.hz();
-        let mut state = AudioState::new(rx, Arc::clone(&shared), session, f64::from(rate), gtx);
+        let state = AudioState::new(rx, Arc::clone(&shared), session, f64::from(rate), gtx);
         let fault = Arc::new(Fault::default());
-        let failed = Arc::clone(&fault);
+        let (mut hub, link) = Hub::new(state, Arc::clone(&fault), 4096);
         let spawn = std::thread::Builder::new().name("soundcraft-clock".into()).spawn(move || {
             let mut buf = vec![0.0f32; 4096];
             let mut last = std::time::Instant::now();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 let now = std::time::Instant::now();
-                let frames = ((now - last).as_secs_f64() * state.device_rate) as usize;
+                let frames = ((now - last).as_secs_f64() * f64::from(rate)) as usize;
                 last = now;
                 let n = (frames * 2).min(buf.len());
                 if let Some(b) = buf.get_mut(..n) {
-                    let shared = Arc::clone(&state.shared);
-                    guarded_block(&failed, &shared, b, |b| state.fill(b, 2));
+                    hub.fill(b, 2);
                 }
-                if Arc::strong_count(&state.shared) <= 1 {
+                if Arc::strong_count(&hub.token) <= 1 {
                     break;
                 }
             }
@@ -986,9 +1163,14 @@ impl Player {
             watch: Mutex::new(None),
             tx,
             side,
-            _stream: None,
-            #[cfg(all(windows, feature = "asio"))]
-            asio: None,
+            core: std::rc::Rc::new(Core {
+                link,
+                next_id: 1.into(),
+                _stream: None,
+                #[cfg(all(windows, feature = "asio"))]
+                asio: None,
+            }),
+            slot: 0,
             input_tap: None,
             offset: 0,
             input_channels: 0,
@@ -1017,7 +1199,8 @@ impl Player {
             fault: Arc::default(),
             tx,
             side,
-            _stream: None,
+            core: std::rc::Rc::new(Core { link: Hub::new(AudioState::new(_rx, Arc::clone(&shared), Arc::clone(&session), 48_000.0, _gtx), Arc::new(Fault::default()), 2).1, next_id: 1.into(), _stream: None }),
+            slot: 0,
             input_tap: None,
             offset: 0,
             input_channels: 0,
@@ -1050,7 +1233,8 @@ impl Player {
         let fault = Arc::new(Fault::default());
         let tap = Arc::new(record::InputTap::default());
         let state = AudioState::new(rx, Arc::clone(shared), Arc::clone(session), f64::from(asked_rate), gtx);
-        let callback = AsioCallback { state, fault: Arc::clone(&fault), shared: Arc::clone(shared), tap: Arc::clone(&tap) };
+        let (hub, link) = Hub::new(state, Arc::clone(&fault), HUB_SCRATCH * 64);
+        let callback = AsioCallback { hub, tap: Arc::clone(&tap) };
         let stream = soundcraft_asio::AsioStream::open(&stream_cfg, Box::new(callback)).map_err(|e| e.to_string())?;
         let rate = stream.sample_rate();
         if rate != asked_rate {
@@ -1071,8 +1255,8 @@ impl Player {
             watch: Mutex::new(None),
             tx,
             side: Mutex::new(Side::new(session.sample_rate.as_f64() as f32, grx)),
-            _stream: None,
-            asio: Some(stream),
+            core: std::rc::Rc::new(Core { link, next_id: 1.into(), _stream: None, asio: Some(stream) }),
+            slot: 0,
             input_tap: Some(tap),
             offset,
             input_channels: inputs,
@@ -1102,7 +1286,7 @@ impl Player {
     pub fn input_names(&self) -> Vec<String> {
         #[cfg(all(windows, feature = "asio"))]
         {
-            if let Some(s) = &self.asio {
+            if let Some(s) = &self.core.asio {
                 return s.caps().inputs.iter().take(s.input_channels()).cloned().collect();
             }
         }
@@ -1119,7 +1303,7 @@ impl Player {
     pub fn control_panel(&self) -> Result<(), String> {
         #[cfg(all(windows, feature = "asio"))]
         {
-            if let Some(s) = &self.asio {
+            if let Some(s) = &self.core.asio {
                 return s.control_panel().map_err(|e| e.to_string());
             }
         }
@@ -1189,6 +1373,7 @@ impl Player {
     /// Per-UI-frame housekeeping: drops retired instances and services plugin editors. Returns
     /// the parameter edits made in open editors since the last call.
     pub fn idle(&self) -> Vec<EditorEdit> {
+        self.core.drop_retired();
         let mut side = self.side();
         side.collect_garbage();
         let mut out = Vec::new();
@@ -1366,6 +1551,13 @@ impl Player {
     }
 }
 
+impl Drop for Player {
+    fn drop(&mut self) {
+        let _ = self.core.link.ctl.send(HubCmd::Remove(self.slot));
+        self.core.drop_retired();
+    }
+}
+
 fn copy_meter_snapshot(source: &MeterSnapshot, out: &mut MeterSnapshot) {
     out.tracks.retain(|id, _| source.tracks.contains_key(id));
     for (id, meter) in &source.tracks {
@@ -1500,6 +1692,7 @@ struct Opened {
     tx: Sender<Cmd>,
     grx: Receiver<Vec<Box<dyn Plugin>>>,
     fault: Arc<Fault>,
+    link: HubLink,
 }
 
 /// Build and start the attempts in order; the first that builds and starts wins. A build error or
@@ -1525,26 +1718,24 @@ fn first_started<A: std::fmt::Debug, S, E: std::fmt::Display>(
 fn build_output<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    mut state: AudioState,
+    mut hub: Hub,
     channels: usize,
-    fault: &Arc<Fault>,
-    shared: &Arc<Shared>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
     use cpal::traits::DeviceTrait;
     let frame = channels.max(1);
-    let mut scratch = vec![0.0f32; 8192 * frame];
+    let mut scratch = vec![0.0f32; HUB_SCRATCH * frame];
     let chunk = scratch.len();
-    let (failed, guard, gone) = (Arc::clone(fault), Arc::clone(shared), Arc::clone(fault));
+    let gone = Arc::clone(&hub.fault);
     device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             mark_audio_thread();
             for out in data.chunks_mut(chunk) {
                 let Some(s) = scratch.get_mut(..out.len()) else { return };
-                guarded_block(&failed, &guard, s, |d| state.fill(d, channels));
+                hub.fill(s, channels);
                 for (o, x) in out.iter_mut().zip(s.iter()) {
                     *o = T::from_sample(*x);
                 }
@@ -1625,9 +1816,7 @@ fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<(cpal:
 /// its output. It runs on the driver's thread, so it only `try_lock`s and never allocates.
 #[cfg(all(windows, feature = "asio"))]
 struct AsioCallback {
-    state: AudioState,
-    fault: Arc<Fault>,
-    shared: Arc<Shared>,
+    hub: Hub,
     tap: Arc<record::InputTap>,
 }
 
@@ -1638,7 +1827,7 @@ impl soundcraft_asio::Callback for AsioCallback {
         self.tap.feed(input);
         // The driver hands over `frames` frames of `channels` interleaved samples each.
         let channels = output.len().checked_div(frames).unwrap_or(1).max(1);
-        guarded_block(&self.fault, &self.shared, output, |out| self.state.fill(out, channels));
+        self.hub.fill(output, channels);
     }
 }
 
@@ -1839,6 +2028,45 @@ mod tests {
         st.declick_len = 0;
         tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         st
+    }
+
+    #[test]
+    fn a_hub_sums_its_slots_and_drops_removed_ones_on_the_ui_side() {
+        use soundcraft_model::ChannelFormat;
+        let level = 0.3 * soundcraft_dsp::db_to_gain(-3.0);
+        let mut a = audio_output_state(ChannelFormat::Mono, vec![vec![0.3; 48_000]]);
+        a.declick_len = 0;
+        let b_state = audio_output_state(ChannelFormat::Mono, vec![vec![0.3; 48_000]]);
+        let (mut hub, link) = Hub::new(a, Arc::new(Fault::default()), 256);
+        let mut out = [0.0f32; 64];
+        hub.fill(&mut out, 1);
+        assert!(out.iter().all(|x| (x - level).abs() < 1e-5), "one slot passes straight through");
+        let mut b = b_state;
+        b.declick_len = 0;
+        link.ctl.send(HubCmd::Add(Box::new(Slot { id: 7, state: b }))).unwrap();
+        // Longer than the scratch: rendered in pieces.
+        let mut out = [0.0f32; 600];
+        hub.fill(&mut out, 1);
+        assert_eq!(hub.slots.len(), 2);
+        assert!(out.iter().all(|x| (x - 2.0 * level).abs() < 1e-5), "two slots add: {:?}", &out[..4]);
+        link.ctl.send(HubCmd::Remove(7)).unwrap();
+        hub.fill(&mut out, 1);
+        assert!(out.iter().all(|x| (x - level).abs() < 1e-5), "back to one");
+        assert_eq!(link.retired.try_iter().count(), 1, "the removed slot comes back to be dropped here");
+    }
+
+    #[test]
+    fn sibling_players_share_one_device_and_play_independently() {
+        let s = Arc::new(Session::default());
+        let a = Player::silent(Arc::clone(&s));
+        let b = a.sibling(Arc::clone(&s));
+        assert_eq!(a.device_sessions(), 2);
+        a.play(0, None, None);
+        assert!(a.is_playing() && !b.is_playing());
+        drop(a);
+        assert_eq!(b.device_sessions(), 1);
+        b.play(0, None, None);
+        assert!(b.is_playing());
     }
 
     #[test]

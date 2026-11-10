@@ -261,6 +261,7 @@ fn main_area_content(app: &mut SoundApp, ui: &mut Ui) {
     scroll_and_zoom(app, ui, full, tl);
     draw_rulers(app, ui, rulers_rect, tl, &rulers);
     views_button(app, ui, rulers_rect);
+    tab_list(app, ui, rulers_rect, &rulers, titles_h, &cols);
     column_titles(ui, rulers_rect, &cols);
     // Tracks.
     let mut y = tl.min.y - app.edit_layout.scroll_y;
@@ -871,6 +872,35 @@ fn column_titles(ui: &Ui, rulers: Rect, cols: &[Column]) {
         ui.painter().text(pos2(x + w / 2.0, row.center().y), Align2::CENTER_CENTER, title, bold(10.0), t.section_label);
         x += w;
     }
+}
+
+/// The open tabs, stacked in the blank part of the ruler header: under the Views button and left
+/// of the ruler names (which are right-aligned, so their longest name sets the width left over).
+fn tab_list(app: &mut SoundApp, ui: &mut Ui, rulers: Rect, ids: &[String], titles_h: f32, cols: &[Column]) {
+    if app.tab_strip.tabs.is_empty() {
+        return;
+    }
+    // With header columns showing, the empty block above their titles (right of the ruler names)
+    // takes the tabs, in a grid; otherwise they stack in the gap under the Views button.
+    if !cols.is_empty() {
+        let left = rulers.min.x + HEADER_W + 4.0;
+        let right = rulers.min.x + header_width(cols) - 4.0;
+        let (top, bottom) = (rulers.min.y + 3.0, rulers.max.y - titles_h - 5.0);
+        if right - left >= 60.0 && bottom - top >= 20.0 {
+            crate::tab_strip::grid(ui, Rect::from_min_max(pos2(left, top), pos2(right, bottom)), &mut app.tab_strip);
+            return;
+        }
+    }
+    let widest = ids
+        .iter()
+        .map(|id| ui.painter().layout_no_wrap(ruler_label(id).to_owned(), bold(11.0), Color32::WHITE).size().x)
+        .fold(0.0f32, f32::max);
+    // The names end 12 px short of the header's right edge.
+    let right = rulers.min.x + HEADER_W - 12.0 - widest - 6.0;
+    let top = rulers.min.y + 5.0 + 18.0 + 3.0;
+    let bottom = rulers.max.y - titles_h - 3.0;
+    let r = Rect::from_min_max(pos2(rulers.min.x + 6.0, top), pos2(right.max(rulers.min.x + 40.0), bottom.max(top + 20.0)));
+    crate::tab_strip::list(ui, r, &mut app.tab_strip, true);
 }
 
 /// The Edit window view selector: which columns sit beside the track headers.
