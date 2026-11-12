@@ -422,6 +422,10 @@ pub struct SoundApp {
     pub(crate) xpitch_ask: Option<String>,
     /// That answer, kept for the open that follows it.
     pub(crate) xpitch_choice: Option<bool>,
+    /// A Pro Tools session with stock plugins (path, names) waiting for "use SoundCraft's versions?".
+    pub(crate) stock_ask: Option<(String, Vec<String>)>,
+    /// That answer, kept for the open that follows it.
+    pub(crate) stock_choice: Option<bool>,
     pub(crate) drop_preview: file_drop::DropPreview,
     sample_reads: Vec<sampler_window::SampleRead>,
     synthetic_grace: u32,
@@ -553,6 +557,8 @@ impl SoundApp {
             opening: None,
             xpitch_ask: None,
             xpitch_choice: None,
+            stock_ask: None,
+            stock_choice: None,
             drop_preview: file_drop::DropPreview::default(),
             sample_reads: Vec::new(),
             synthetic_grace: 0,

@@ -787,6 +787,30 @@ pub fn xpitch_installed() -> bool {
     installed_match("Xpitch", &installed_plugins(), true).is_some()
 }
 
+/// Whether Pro Tools stock plugins (not the two EQs, which match) import as SoundCraft built-ins
+/// (the user's choice when a session with them is opened).
+static STOCK_AS_BUILTIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Imports the stock plugins besides EQ3 as built-ins (`true`) or leaves them out as missing.
+pub fn set_stock_as_builtin(on: bool) {
+    STOCK_AS_BUILTIN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A stock plugin whose built-in stand-in sounds different (all of them but the EQ3s).
+fn inexact_stock(name: &str) -> bool {
+    crate::ptx_stock::is_stock(name) && !name.starts_with("EQ3 ")
+}
+
+/// Names of the stock plugins in the session at `path` whose built-in stand-in sounds different,
+/// sorted, once each.
+pub fn inexact_stock_plugins(path: &str) -> Vec<String> {
+    let Ok(raw) = crate::io::read_file(path) else { return Vec::new() };
+    let mut names: Vec<String> = parse(&decode(&raw)).inserts.iter().filter(|i| inexact_stock(&i.plugin)).map(|i| i.plugin.clone()).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Whether the Pro Tools session at `path` has an Auto-Tune Live insert.
 pub fn uses_autotune_live(path: &str) -> bool {
     let Ok(raw) = crate::io::read_file(path) else { return false };
@@ -913,7 +937,8 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
         let variant = crate::ptx_settings::is_autotune_variant(&ins.plugin);
         // Pro Tools' own EQ3 and Dyn3 become SoundCraft's built-in EQ and dynamics, with the
         // session's settings.
-        if let Some((builtin, params)) = ins.state.as_deref().and_then(|d| crate::ptx_stock::stock_plugin(&ins.plugin, d)) {
+        let use_stock = STOCK_AS_BUILTIN.load(std::sync::atomic::Ordering::Relaxed) || !inexact_stock(&ins.plugin);
+        if let Some((builtin, params)) = ins.state.as_deref().filter(|_| use_stock).and_then(|d| crate::ptx_stock::stock_plugin(&ins.plugin, d)) {
             for (track, slot) in targets {
                 let Some(t) = s.track_mut(track) else { continue };
                 let slots = &mut t.mixer.inserts;

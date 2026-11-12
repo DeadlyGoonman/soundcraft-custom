@@ -495,16 +495,19 @@ pub fn start_open(app: &mut SoundApp, path: String) {
     #[cfg(not(target_arch = "wasm32"))]
     if path.to_ascii_lowercase().ends_with(".ptx") {
         use soundcraft_engine::ptx;
-        match app.xpitch_choice.take() {
-            Some(use_xpitch) => ptx::set_live_as_xpitch(use_xpitch),
-            None => {
-                ptx::set_live_as_xpitch(false);
-                if ptx::xpitch_installed() && ptx::uses_autotune_live(&path) {
-                    app.xpitch_ask = Some(path);
-                    return;
-                }
+        if app.xpitch_choice.is_none() && ptx::xpitch_installed() && ptx::uses_autotune_live(&path) {
+            app.xpitch_ask = Some(path);
+            return;
+        }
+        if app.stock_choice.is_none() {
+            let names = ptx::inexact_stock_plugins(&path);
+            if !names.is_empty() {
+                app.stock_ask = Some((path, names));
+                return;
             }
         }
+        ptx::set_live_as_xpitch(app.xpitch_choice.take().unwrap_or(false));
+        ptx::set_stock_as_builtin(app.stock_choice.take().unwrap_or(true));
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -556,6 +559,46 @@ fn xpitch_window(app: &mut SoundApp, ctx: &egui::Context) {
         if choice.is_some() {
             app.xpitch_choice = choice;
             start_open(app, path);
+        } else {
+            app.xpitch_choice = None;
+            app.stock_choice = None;
+        }
+    }
+}
+
+/// Warns that Pro Tools stock plugins (besides the EQs) sound different as SoundCraft's
+/// built-ins, and asks whether to use them or leave them out, then opens the session.
+fn stock_window(app: &mut SoundApp, ctx: &egui::Context) {
+    let Some((path, names)) = app.stock_ask.clone() else { return };
+    let file = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut answer: Option<Option<bool>> = None;
+    egui::Modal::new(egui::Id::new("stock_ask")).show(ctx, |ui| {
+        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+        ui.set_width(380.0);
+        ui.label(egui::RichText::new("Pro Tools plugins").font(bold(13.0)));
+        ui.label(&file);
+        ui.label("This session uses Pro Tools plugins that SoundCraft only approximates. They will not sound identical:");
+        ui.label(names.join(", "));
+        ui.horizontal(|ui| {
+            if ui.button("Use SoundCraft versions").clicked() {
+                answer = Some(Some(true));
+            }
+            if ui.button("Leave them out").clicked() {
+                answer = Some(Some(false));
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(None);
+            }
+        });
+    });
+    if let Some(choice) = answer {
+        app.stock_ask = None;
+        if choice.is_some() {
+            app.stock_choice = choice;
+            start_open(app, path);
+        } else {
+            app.xpitch_choice = None;
+            app.stock_choice = None;
         }
     }
 }
@@ -634,6 +677,7 @@ fn opening_window(app: &mut SoundApp, ctx: &egui::Context) {
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     opening_window(app, ctx);
     xpitch_window(app, ctx);
+    stock_window(app, ctx);
     audiosuite_window(app, ctx);
     crate::bounce::show(app, ctx);
     let Some(mut d) = app.dialogs.open.take() else { return };
