@@ -75,6 +75,9 @@ pub struct EditLayout {
     /// A Ctrl+Shift+wheel swipe is still smoothing out: the timeline ignores it until egui settles.
     #[serde(skip)]
     wave_wheel: bool,
+    /// Middle-button autoscroll: where the button went down; the pointer's distance from it sets the speed.
+    #[serde(skip)]
+    autoscroll: Option<Pos2>,
 }
 
 impl EditLayout {
@@ -430,6 +433,7 @@ fn scroll_and_zoom(app: &mut SoundApp, ui: &Ui, area: Rect, tl: Rect) {
             return;
         }
     }
+    autoscroll(app, ui, area, tl);
     let (delta, zoom, pointer, scrolling) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos(), i.is_scrolling()));
     let mut swipe = if scrolling { app.edit_layout.swipe } else { egui::Vec2::ZERO };
     if swipe.max_elem() < 6.0 {
@@ -447,6 +451,44 @@ fn scroll_and_zoom(app: &mut SoundApp, ui: &Ui, area: Rect, tl: Rect) {
     if !horizontal && delta.y != 0.0 {
         app.edit_layout.scroll_by(-delta.y, tl.height());
     }
+}
+
+/// Autoscroll speed in points per second for a pointer `dist` points from the anchor; the same up and down.
+fn autoscroll_speed(dist: f32) -> f32 {
+    let d = (dist.abs() - 8.0).max(0.0);
+    (6.0 * d + 0.02 * d * d).min(2000.0)
+}
+
+/// Middle-button hold-to-autoscroll over the track area: the further the pointer is below (above) the anchor, the faster the tracks scroll down (up).
+fn autoscroll(app: &mut SoundApp, ui: &Ui, area: Rect, tl: Rect) {
+    let (pressed, down, pointer, esc, dt) = ui.input(|i| {
+        (
+            i.pointer.button_pressed(egui::PointerButton::Middle),
+            i.pointer.middle_down(),
+            i.pointer.hover_pos(),
+            i.key_pressed(egui::Key::Escape),
+            i.stable_dt.clamp(0.0, 0.1),
+        )
+    });
+    if pressed && app.edit_layout.autoscroll.is_none() && app.gesture.is_none() && tl.is_positive() && ui.rect_contains_pointer(area) {
+        app.edit_layout.autoscroll = pointer;
+    }
+    let Some(anchor) = app.edit_layout.autoscroll else { return };
+    let Some(p) = pointer.filter(|_| down && !esc) else {
+        app.edit_layout.autoscroll = None;
+        return;
+    };
+    let dy = p.y - anchor.y;
+    app.edit_layout.scroll_by(dy.signum() * autoscroll_speed(dy) * dt, tl.height());
+    let t = Tokens::current();
+    let painter = ui.painter();
+    painter.circle(anchor, 11.0, t.panel_bg, Stroke::new(1.5, t.accent));
+    painter.circle_filled(anchor, 2.0, t.accent);
+    for s in [-1.0_f32, 1.0] {
+        let tip = anchor + vec2(0.0, s * 8.0);
+        painter.add(Shape::convex_polygon(vec![tip, tip - vec2(3.5, s * 4.0), tip + vec2(3.5, -s * 4.0)], t.accent, Stroke::NONE));
+    }
+    ui.ctx().request_repaint();
 }
 
 fn pan(app: &mut SoundApp, px: f64) {
@@ -4383,6 +4425,39 @@ mod tests {
         h.step();
         assert!(h.state().gesture.is_none());
         assert_eq!(h.state().engine.undo_history().len(), undo_len);
+    }
+
+    fn middle(h: &mut Harness<SoundApp>, pos: Pos2, pressed: bool) {
+        h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Middle, pressed, modifiers: Default::default() });
+    }
+
+    /// Scroll gained by holding the middle button `off` points below the anchor (negative: above) for 30 frames.
+    fn autoscrolled(off: f32, start_y: f32) -> f32 {
+        let mut h = harness(40);
+        h.state_mut().edit_layout.scroll_y = start_y;
+        h.step();
+        let a = pos2(timeline(&h).min.x + 100.0, timeline(&h).center().y);
+        h.hover_at(a);
+        middle(&mut h, a, true);
+        h.step();
+        h.hover_at(a + vec2(0.0, off));
+        h.run_steps(30);
+        let got = h.state().edit_layout.scroll_y - start_y;
+        middle(&mut h, a + vec2(0.0, off), false);
+        h.step();
+        let after = h.state().edit_layout.scroll_y;
+        h.run_steps(10);
+        assert_eq!(h.state().edit_layout.scroll_y, after, "kept scrolling after the release");
+        got
+    }
+
+    #[test]
+    fn middle_hold_autoscroll_is_symmetric() {
+        let down = autoscrolled(80.0, 400.0);
+        let up = autoscrolled(-80.0, 400.0);
+        assert!(down > 50.0, "down {down}");
+        assert!(up < -50.0, "up {up}");
+        assert!((down + up).abs() < down * 0.1, "down {down} up {up}");
     }
 
     #[test]
