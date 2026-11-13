@@ -359,7 +359,12 @@ impl Plugin for Vst3Plugin {
                                 head.copy_from_slice(src);
                                 tail.fill(0.0);
                             }
-                            None => dst.fill(0.0),
+                            // Unrouted: the plugin's own input is its key, as with an internal detector. Silence here
+                            // makes a gate or compressor with the aux bus active (Waves C1) see a dead key and stay shut.
+                            None => match io.get(c.min(ch.saturating_sub(1))).and_then(|s| s.get(start..start + n)) {
+                                Some(main) => dst.copy_from_slice(main),
+                                None => dst.fill(0.0),
+                            },
                         }
                     }
                 }
