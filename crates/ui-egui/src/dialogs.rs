@@ -506,6 +506,14 @@ pub fn start_open(app: &mut SoundApp, path: String) {
                 return;
             }
         }
+        if app.soundtoys_choice.is_none() {
+            let found = ptx::soundtoys_parity_plugins(&path);
+            if !found.is_empty() {
+                app.soundtoys_ask = Some((path, found));
+                return;
+            }
+        }
+        ptx::set_soundtoys_as_parity(app.soundtoys_choice.take().unwrap_or(false));
         ptx::set_live_as_xpitch(app.xpitch_choice.take().unwrap_or(false));
         ptx::set_stock_as_builtin(app.stock_choice.take().unwrap_or(true));
     }
@@ -562,6 +570,7 @@ fn xpitch_window(app: &mut SoundApp, ctx: &egui::Context) {
         } else {
             app.xpitch_choice = None;
             app.stock_choice = None;
+            app.soundtoys_choice = None;
         }
     }
 }
@@ -599,6 +608,45 @@ fn stock_window(app: &mut SoundApp, ctx: &egui::Context) {
         } else {
             app.xpitch_choice = None;
             app.stock_choice = None;
+            app.soundtoys_choice = None;
+        }
+    }
+}
+
+/// Asks whether Soundtoys plugins that aren't installed should become their Bent Signal parity
+/// plugins, then opens the session.
+fn soundtoys_window(app: &mut SoundApp, ctx: &egui::Context) {
+    let Some((path, found)) = app.soundtoys_ask.clone() else { return };
+    let file = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut answer: Option<Option<bool>> = None;
+    egui::Modal::new(egui::Id::new("soundtoys_ask")).show(ctx, |ui| {
+        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+        ui.set_width(380.0);
+        ui.label(egui::RichText::new("Soundtoys plugins").font(bold(13.0)));
+        ui.label(&file);
+        ui.label("This session uses Soundtoys plugins that are not installed. Open the parity plugins instead? They start from their default settings; the session's own settings cannot be read.");
+        ui.label(found.iter().map(|(from, to)| format!("{from} -> {to}")).collect::<Vec<_>>().join(", "));
+        ui.horizontal(|ui| {
+            if ui.button("Use parity plugins").clicked() {
+                answer = Some(Some(true));
+            }
+            if ui.button("Leave them out").clicked() {
+                answer = Some(Some(false));
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(None);
+            }
+        });
+    });
+    if let Some(choice) = answer {
+        app.soundtoys_ask = None;
+        if choice.is_some() {
+            app.soundtoys_choice = choice;
+            start_open(app, path);
+        } else {
+            app.xpitch_choice = None;
+            app.stock_choice = None;
+            app.soundtoys_choice = None;
         }
     }
 }
@@ -678,6 +726,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     opening_window(app, ctx);
     xpitch_window(app, ctx);
     stock_window(app, ctx);
+    soundtoys_window(app, ctx);
     audiosuite_window(app, ctx);
     crate::bounce::show(app, ctx);
     let Some(mut d) = app.dialogs.open.take() else { return };

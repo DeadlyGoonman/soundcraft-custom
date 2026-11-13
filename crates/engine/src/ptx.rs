@@ -787,6 +787,41 @@ pub fn xpitch_installed() -> bool {
     installed_match("Xpitch", &installed_plugins(), true).is_some()
 }
 
+/// Soundtoys plugins and the installed Bent Signal plugin that stands in for each.
+const SOUNDTOYS_PARITY: &[(&str, &str)] = &[("MicroShift", "Shifter"), ("Little MicroShift", "Shifter"), ("Decapitator", "Grit")];
+
+/// Whether Soundtoys plugins that are not installed import as their parity plugins (the user's
+/// choice when a session with them is opened).
+static SOUNDTOYS_AS_PARITY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Imports Soundtoys plugins that are not installed as their parity plugins.
+pub fn set_soundtoys_as_parity(on: bool) {
+    SOUNDTOYS_AS_PARITY.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The parity plugin's name for a Soundtoys plugin (`None` for other plugins).
+fn soundtoys_parity(name: &str) -> Option<&'static str> {
+    SOUNDTOYS_PARITY.iter().find(|(from, _)| *from == name).map(|(_, to)| *to)
+}
+
+/// Soundtoys plugins in the session at `path` that aren't installed but whose parity plugin is,
+/// as (plugin, parity plugin), sorted, once each.
+pub fn soundtoys_parity_plugins(path: &str) -> Vec<(String, String)> {
+    let Ok(raw) = crate::io::read_file(path) else { return Vec::new() };
+    let installed = installed_plugins();
+    let mut found: Vec<(String, String)> = parse(&decode(&raw))
+        .inserts
+        .iter()
+        .filter_map(|i| {
+            let to = soundtoys_parity(&i.plugin)?;
+            (installed_match(&i.plugin, &installed, true).is_none() && installed_match(to, &installed, true).is_some()).then(|| (i.plugin.clone(), to.to_string()))
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
 /// Whether Pro Tools stock plugins (not the two EQs, which match) import as SoundCraft built-ins
 /// (the user's choice when a session with them is opened).
 static STOCK_AS_BUILTIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -952,7 +987,14 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
             }
             continue;
         }
-        let matched = installed_match(if variant { "Auto-Tune Pro" } else { &ins.plugin }, &installed, stereo);
+        // A Soundtoys plugin that isn't installed becomes its parity plugin when the user chose that
+        // (its settings are not readable, so it starts from its defaults).
+        let parity = SOUNDTOYS_AS_PARITY
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| soundtoys_parity(&ins.plugin))
+            .flatten()
+            .filter(|_| installed_match(&ins.plugin, &installed, stereo).is_none());
+        let matched = installed_match(if variant { "Auto-Tune Pro" } else { parity.unwrap_or(&ins.plugin) }, &installed, stereo);
         match matched {
             Some(id) => {
                 let (state, params) = if variant {
@@ -961,6 +1003,8 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
                     let params = ins.state.as_deref().map(crate::ptx_settings::autotune_params).unwrap_or_default();
                     // Written into the state too, so the editor opens on them (they are also sent to the plugin).
                     (fresh.as_deref().and_then(|f| crate::ptx_settings::autotune_state(f, &params)), params)
+                } else if parity.is_some() {
+                    (None, Default::default())
                 } else {
                     (ins.state.as_deref().and_then(|c| crate::ptx_settings::convert(&id, c, &mut templates)), Default::default())
                 };
@@ -972,7 +1016,7 @@ fn place_plugins(s: &mut Session, inserts: &[PtxInsert], tracks: &HashMap<String
                         let mut insert = soundcraft_model::Insert::new(id.clone());
                         insert.state = state.as_deref().map(soundcraft_model::b64::encode);
                         insert.params.clone_from(&params);
-                        if variant {
+                        if variant || parity.is_some() {
                             insert.preset = format!("from {}", ins.plugin);
                         }
                         *cell = Some(insert);
@@ -1385,6 +1429,14 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn soundtoys_plugins_map_to_their_parity_plugins() {
+        assert_eq!(soundtoys_parity("MicroShift"), Some("Shifter"));
+        assert_eq!(soundtoys_parity("Little MicroShift"), Some("Shifter"));
+        assert_eq!(soundtoys_parity("Decapitator"), Some("Grit"));
+        assert_eq!(soundtoys_parity("EchoBoy"), None);
+    }
+
     use super::*;
 
     #[test]

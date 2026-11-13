@@ -12,6 +12,8 @@ fn main() {
     if let Some(c) = PluginCache::load(&dir.join(CACHE_FILE)) {
         c.apply_to_hosts();
     }
+    // `SC_PARITY=1`: Soundtoys plugins that aren't installed import as their parity plugins.
+    ptx::set_soundtoys_as_parity(std::env::var("SC_PARITY").is_ok());
     let mut e = Engine::new(Default::default());
     let missing = ptx::open_ptx(&mut e, file).expect("import");
     println!("missing files: {}", missing.len());
