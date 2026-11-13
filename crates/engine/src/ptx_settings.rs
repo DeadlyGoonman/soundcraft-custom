@@ -56,7 +56,11 @@ pub fn convert(id: &str, data: &[u8], templates: &mut HashMap<String, Option<Vec
     }
     let comp = component(template)?;
     if data.starts_with(AAX_PARAMS) {
-        return comp.starts_with(b"FabF").then(|| fabfilter_state(template, data)).flatten();
+        if comp.starts_with(b"FabF") {
+            return fabfilter_state(template, data);
+        }
+        let state = juce_xml_state(template, data)?;
+        return state_loads_in_child(id, &state).then_some(state);
     }
     if data.starts_with(FFBS) && comp.starts_with(FFBS) {
         return ffbs_state(template, data);
@@ -112,6 +116,59 @@ fn waves_state(template: &[u8], xml: &[u8]) -> Option<Vec<u8>> {
     }
     c.extend_from_slice(xml.get(..xml_end)?);
     c.extend_from_slice(comp.get(fresh_end..)?);
+    Some(container(&c))
+}
+
+/// The settings XML of a JUCE plugin's `VC2!` block (Valhalla): its length (little-endian u32),
+/// then the XML. The block starts at the returned offset.
+fn vc2_xml(b: &[u8]) -> Option<(usize, &[u8])> {
+    const TAG: &[u8] = b"VC2!";
+    let at = b.windows(TAG.len()).position(|w| w == TAG)?;
+    let n = usize::try_from(u32::from_le_bytes(b.get(at + 4..at + 8)?.try_into().ok()?)).ok()?;
+    let xml = b.get(at + 8..at.checked_add(8)?.checked_add(n)?)?;
+    xml.contains(&b'<').then_some((at, xml))
+}
+
+/// The name of an XML document's root element (past any `<?xml ...?>` declaration).
+fn xml_root(xml: &[u8]) -> Option<&[u8]> {
+    let mut rest = xml;
+    loop {
+        let open = rest.iter().position(|&c| c == b'<')?;
+        rest = rest.get(open + 1..)?;
+        if !rest.starts_with(b"?") && !rest.starts_with(b"!") {
+            let end = rest.iter().position(|&c| c == b' ' || c == b'>' || c == b'/')?;
+            return rest.get(..end);
+        }
+    }
+}
+
+/// Pro Tools' chunk for a JUCE plugin keeps the plugin's `VC2!` settings XML (Valhalla): it goes
+/// into the fresh VST3 state's block, and the two sizes that count it (the VST preset chunk's and
+/// the chunk's own, both big-endian) follow. Only when both name the same plugin.
+fn juce_xml_state(template: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    const CCNK: usize = 16;
+    const FBCH: usize = 24;
+    let comp = component(template)?;
+    let (at, fresh_xml) = vc2_xml(comp)?;
+    let (_, xml) = vc2_xml(data)?;
+    if xml_root(xml)? != xml_root(fresh_xml)? || comp.get(CCNK..CCNK + 4)? != b"CcnK" || comp.get(FBCH..FBCH + 4)? != b"FBCh" {
+        return None;
+    }
+    let chunk_at = at.checked_sub(4)?;
+    let chunk_len = usize::try_from(u32::from_be_bytes(comp.get(chunk_at..at)?.try_into().ok()?)).ok()?;
+    let body = u32::from_be_bytes(comp.get(CCNK + 4..FBCH)?.try_into().ok()?);
+    if chunk_len != comp.len() - at {
+        return None;
+    }
+    let delta = i64::try_from(xml.len()).ok()? - i64::try_from(fresh_xml.len()).ok()?;
+    let shift = |v: u32| u32::try_from(i64::from(v) + delta).ok();
+    let mut c = comp.get(..chunk_at)?.to_vec();
+    c.get_mut(CCNK + 4..FBCH)?.copy_from_slice(&shift(body)?.to_be_bytes());
+    c.extend_from_slice(&shift(u32::try_from(chunk_len).ok()?)?.to_be_bytes());
+    c.extend_from_slice(b"VC2!");
+    c.extend_from_slice(&u32::try_from(xml.len()).ok()?.to_le_bytes());
+    c.extend_from_slice(xml);
+    c.extend_from_slice(comp.get(at + 8 + fresh_xml.len()..)?);
     Some(container(&c))
 }
 
@@ -659,6 +716,44 @@ mod tests {
     fn unverified_formats_are_dropped_without_a_check_process() {
         // No probe exe in tests: same-magic and JUCE data are not passed on.
         assert!(!state_loads_in_child("vst3:nothing", b"FFBS\x01\0\0\0"));
+    }
+
+    /// A Valhalla-style VST3 component: VST header, `CcnK`/`FBCh` preset chunk holding a `VC2!` block.
+    fn vc2_component(xml: &[u8]) -> Vec<u8> {
+        let tail: &[u8] = b"\0\0\0\0\0\0\0\0\0JUCEPrivateData\0\x01\x01Bypass\0\x01\x01\x03\0\x1d\0\0\0\0\0\0\0JUCEPrivateData";
+        let mut chunk = b"VC2!".to_vec();
+        chunk.extend_from_slice(&u32::try_from(xml.len()).unwrap_or(0).to_le_bytes());
+        chunk.extend_from_slice(xml);
+        chunk.extend_from_slice(tail);
+        let mut c = b"VstW".to_vec();
+        c.extend_from_slice(&[0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 0]);
+        c.extend_from_slice(b"CcnK\0\0\0\0FBCh");
+        c.extend_from_slice(&[0; 144]);
+        c.extend_from_slice(&u32::try_from(chunk.len()).unwrap_or(0).to_be_bytes());
+        c.extend_from_slice(&chunk);
+        let body = u32::try_from(c.len() - 24).unwrap_or(0).to_be_bytes();
+        c[20..24].copy_from_slice(&body);
+        c
+    }
+
+    #[test]
+    fn valhalla_settings_replace_the_fresh_xml_and_fix_the_sizes() {
+        let fresh = b"<?xml version=\"1.0\"?> <ValhallaVintageVerb Mix=\"0.5\"/>";
+        let session = b"<ValhallaVintageVerb pluginVersion=\"1.5.0\" Mix=\"0.172\" Decay=\"0.4\"/>";
+        let template = container(&vc2_component(fresh));
+        // Pro Tools' chunk: its typed parameter list, a header, then the plugin's `VC2!` block.
+        let mut data = b"\x01\x01\x01\x01d_0\0\0\0\0\0\0\0\0\0\0\0junk".to_vec();
+        data.extend_from_slice(b"VC2!");
+        data.extend_from_slice(&u32::try_from(session.len()).unwrap_or(0).to_le_bytes());
+        data.extend_from_slice(session);
+        let out = juce_xml_state(&template, &data).expect("converts");
+        assert_eq!(component(&out), Some(vc2_component(session).as_slice()));
+        // Another plugin's XML is refused.
+        let mut other = data.clone();
+        other.extend_from_slice(b"VC2!\x0b\0\0\0<Other a=\"1\"/>");
+        let at = other.windows(4).position(|w| w == b"VC2!").unwrap_or(0);
+        other.drain(at..at + 8 + session.len());
+        assert_eq!(juce_xml_state(&template, &other), None);
     }
 
     #[test]
