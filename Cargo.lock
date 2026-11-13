@@ -4238,7 +4238,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "eframe",
  "egui",
@@ -4257,7 +4257,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-asio"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "log",
  "windows-sys 0.61.2",
@@ -4265,7 +4265,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-au-host"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "log",
  "serde",
@@ -4275,7 +4275,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-audio-io"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "log",
  "proptest",
@@ -4287,7 +4287,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-automation"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "log",
  "serde_json",
@@ -4297,7 +4297,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-clap-host"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "clap-sys",
  "libloading",
@@ -4311,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-cli"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "serde_json",
  "soundcraft-audio-io",
@@ -4322,7 +4322,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-dsp"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "log",
  "proptest",
@@ -4333,7 +4333,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-editor-scale"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "log",
  "soundcraft-dsp",
@@ -4342,7 +4342,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-engine"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "craft-docpath",
  "log",
@@ -4365,7 +4365,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-midi"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "proptest",
  "serde",
@@ -4375,7 +4375,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-mix"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "log",
  "rayon",
@@ -4391,7 +4391,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-model"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "proptest",
  "serde",
@@ -4404,7 +4404,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-playback"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "cpal",
  "log",
@@ -4420,7 +4420,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-shifter-vst3"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "image",
  "soundcraft-dsp",
@@ -4431,7 +4431,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-time"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "proptest",
  "serde",
@@ -4441,7 +4441,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-ui-egui"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "craft-ui",
  "egui",
@@ -4468,7 +4468,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-video"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "image",
  "proptest",
@@ -4479,7 +4479,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-vst3-host"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "libloading",
  "log",
@@ -4496,7 +4496,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-web"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "eframe",
  "egui",
@@ -6474,7 +6474,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.15.1-custom.12"
+version = "0.15.1-custom.13"
 dependencies = [
  "serde_json",
 ]

@@ -1229,6 +1229,7 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     // Track name -> the track and the playlist it holds.
     let mut tracks: HashMap<String, (TrackId, String)> = HashMap::new();
     let mut missing = Vec::new();
+    let mut blank: Vec<String> = Vec::new();
     let mut rate_set = false;
     // Which playlists load: the ones tracks play, in track order, when the session lists them;
     // else one per family of takes. Unused takes are not loaded.
@@ -1277,6 +1278,11 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     }
     for p in placements {
         let Some(clip) = ptx.clips.get(p.clip) else { continue };
+        // A clip group: its offset slot holds a timeline tick, and it has no audio file of its own
+        // (the name fallback would pick an unrelated file and start it past the file's end).
+        if clip.offset >= PT_TICK_ZERO {
+            continue;
+        }
         let stem = file_stem(&clip.name);
         let key = (stem.clone(), clip.file);
         let src = match sources.get(&key) {
@@ -1289,7 +1295,17 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
                 let loaded = found.and_then(|(file, pick)| {
                     let bytes = read_file(&file).ok()?;
                     let ext = file.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
-                    let (info, mut buf) = soundcraft_audio_io::decode(&bytes, ext.as_deref()).ok()?;
+                    let (rate, format, mut buf) = match soundcraft_audio_io::decode(&bytes, ext.as_deref()) {
+                        Ok((info, buf)) => (info.sample_rate, info.format, buf),
+                        // A file whose bytes are all zero (a damaged copy: no header, no audio): keep its
+                        // clips as silence, 24-bit mono, so the takes and comps still show.
+                        Err(_) if !bytes.is_empty() && bytes.iter().all(|&x| x == 0) => {
+                            let rate = if rate_set { s.sample_rate.hz() } else { 48_000 };
+                            blank.push(file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()));
+                            (rate, soundcraft_audio_io::FileFormat::Wav, soundcraft_audio_io::AudioBuffer::new(rate, 1, bytes.len() / 3))
+                        }
+                        Err(_) => return None,
+                    };
                     if let Some(ch) = pick {
                         if buf.channels.len() < 2 {
                             return None;
@@ -1298,12 +1314,12 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
                     }
                     if !rate_set {
                         // The first file sets the session rate; Pro Tools positions count at that rate.
-                        if let Ok(r) = SampleRate::new(info.sample_rate) {
+                        if let Ok(r) = SampleRate::new(rate) {
                             s.sample_rate = r;
                         }
                         rate_set = true;
                     }
-                    Some(add_source(&mut s, &stem, buf, Some(&file.to_string_lossy()), info.format))
+                    Some(add_source(&mut s, &stem, buf, Some(&file.to_string_lossy()), format))
                 });
                 if loaded.is_none() {
                     missing.push(format!("{stem} (clip {})", clip.name));
@@ -1360,6 +1376,9 @@ pub fn open_ptx(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     e.message(format!("Pro Tools {} session, read with the {} profile, {tempo_note}", ptx.version.as_deref().unwrap_or("(version not written)"), ptx.profile.label()));
     for m in &missing {
         e.message(format!("missing media: {m}"));
+    }
+    if !blank.is_empty() {
+        e.message(format!("{} audio files are all zero bytes (damaged copy), imported as silence", blank.len()));
     }
     Ok(missing)
 }

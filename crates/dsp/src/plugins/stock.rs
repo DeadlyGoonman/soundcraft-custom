@@ -271,7 +271,7 @@ static FLANGER_PARAMS: [ParamInfo; 11] = [
     lin("feedback", "Feedback", -100.0, 100.0, 0.0, Unit::Percent),
     toggle("invert", "Phase Invert", false),
     log("low_cut", "Low Cut", 20.0, 1000.0, 20.0, Unit::Hz),
-    choice("wave", "Waveform", &["Sine", "Triangle"], 0),
+    lin("wave", "LFO Wave", 0.0, 100.0, 0.0, Unit::Percent),
     lin("phase", "L/R Offset", -180.0, 180.0, 0.0, Unit::None),
     lin("mix", "Mix", 0.0, 100.0, 50.0, Unit::Percent),
 ];
@@ -297,15 +297,22 @@ struct ModIdx {
     mix: usize,
     invert: Option<usize>,
     low_cut: Option<usize>,
+    /// Waveform value at full triangle: 1 for the chorus switch, 100 for the flanger's blend.
+    wave_max: f32,
 }
 
-const CHORUS_IDX: ModIdx = ModIdx { rate: 0, depth: 1, pre: 2, fb: 3, wave: 4, phase: 5, mix: 6, invert: None, low_cut: None };
-const FLANGER_IDX: ModIdx = ModIdx { rate: 2, depth: 3, pre: 4, fb: 5, wave: 8, phase: 9, mix: 10, invert: Some(6), low_cut: Some(7) };
+const CHORUS_IDX: ModIdx = ModIdx { rate: 0, depth: 1, pre: 2, fb: 3, wave: 4, phase: 5, mix: 6, invert: None, low_cut: None, wave_max: 1.0 };
+const FLANGER_IDX: ModIdx =
+    ModIdx { rate: 2, depth: 3, pre: 4, fb: 5, wave: 8, phase: 9, mix: 10, invert: Some(6), low_cut: Some(7), wave_max: 100.0 };
 
-/// An LFO value in -1..1 for a phase in 0..1.
+/// An LFO value in -1..1 for a phase in 0..1: sine at `tri` 0, triangle at 1, a linear blend between.
 #[inline]
-fn wave(phase: f32, triangle: bool) -> f32 {
-    if triangle { 1.0 - 4.0 * (phase - 0.5).abs() } else { Lfo::sin_at(phase) }
+fn wave(phase: f32, tri: f32) -> f32 {
+    let sine = Lfo::sin_at(phase);
+    if tri <= 0.0 {
+        return sine;
+    }
+    sine + (1.0 - 4.0 * (phase - 0.5).abs() - sine) * tri.min(1.0)
 }
 
 #[inline]
@@ -380,7 +387,7 @@ impl Plugin for StockMod {
         let (depth, pre) = (self.p.v(i.depth), self.p.v(i.pre));
         let fb = (self.p.v(i.fb) / 100.0).clamp(-0.95, 0.95);
         let mix = self.p.v(i.mix) / 100.0;
-        let tri = self.p.on(i.wave);
+        let tri = self.p.v(i.wave) / i.wave_max;
         let offset = self.p.v(i.phase) / 360.0;
         let sign = if i.invert.is_some_and(|k| self.p.on(k)) { -1.0 } else { 1.0 };
         let cut = i.low_cut.map_or(0.0, |k| 1.0 - (-std::f32::consts::TAU * self.p.v(k) / self.sr).exp());
@@ -584,7 +591,7 @@ impl Plugin for Phaser {
         let poles = ((self.p.choice(6) + 1) * 2).min(MAX_POLES);
         let (depth, fb) = (self.p.v(2) / 100.0, (self.p.v(3) / 100.0).clamp(0.0, 0.95));
         let centre = self.p.v(5);
-        let tri = self.p.on(7);
+        let tri = self.p.v(7);
         let offset = self.p.v(8) / 360.0;
         let mix = self.p.v(9) / 100.0;
         let cut = 1.0 - (-std::f32::consts::TAU * self.p.v(4) / self.sr).exp();

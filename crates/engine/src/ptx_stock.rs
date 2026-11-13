@@ -288,7 +288,8 @@ fn chorus(x: &[f64], out: &mut BTreeMap<String, f32>) {
 }
 
 /// Flanger, eleven 0..1 values: retrigger, sync, rate, depth (0-12 ms), pre delay (0-12 ms),
-/// feedback (-100 to 100 %), phase invert, low cut, waveform, left/right offset, mix.
+/// feedback (-100 to 100 %), phase invert, low cut, LFO wave (0-100 %, sine to triangle blend;
+/// the AIR table types it as a percent, the blend shape is assumed linear), left/right offset, mix.
 fn flanger(x: &[f64], out: &mut BTreeMap<String, f32>) {
     let Some(x) = x.get(..11) else { return };
     put(out, "trigger", (x[0] >= 0.5).into(), 0.0, 1.0);
@@ -299,7 +300,7 @@ fn flanger(x: &[f64], out: &mut BTreeMap<String, f32>) {
     put(out, "feedback", lin(x[5], -100.0, 100.0), -100.0, 100.0);
     put(out, "invert", (x[6] >= 0.5).into(), 0.0, 1.0);
     put(out, "low_cut", exp_range(x[7], 20.0, 1000.0), 20.0, 1000.0);
-    put(out, "wave", (x[8] >= 0.5).into(), 0.0, 1.0);
+    put(out, "wave", x[8] * 100.0, 0.0, 100.0);
     put(out, "phase", lin(x[9], -180.0, 180.0), -180.0, 180.0);
     put(out, "mix", x[10] * 100.0, 0.0, 100.0);
 }
@@ -457,6 +458,9 @@ mod tests {
         let (_, p) = stock_plugin("AIR Flanger", &unnamed(&[0.0, 0.0, 0.5, 0.5, 0.25, 0.135, 0.0, 0.0, 0.0, 0.5, 0.265])).unwrap();
         assert!((p["feedback"] + 73.0).abs() < 1e-3);
         assert!((p["low_cut"] - 20.0).abs() < 1e-3);
+        assert_eq!(p["wave"], 0.0);
+        let (_, p) = stock_plugin("AIR Flanger", &unnamed(&[0.0, 0.0, 0.5, 0.5, 0.25, 0.135, 0.0, 0.0, 0.75, 0.5, 0.265])).unwrap();
+        assert!((p["wave"] - 75.0).abs() < 1e-3, "wave {}", p["wave"]);
         let (_, p) = stock_plugin("AIR Phaser", &unnamed(&[0.0, 0.5, 0.575, 0.595, 0.0, 0.5, 0.6667, 0.0, 0.5, 0.5])).unwrap();
         assert!((p["center"] - 1000.0).abs() < 0.5);
         assert_eq!(p["poles"], 2.0);
