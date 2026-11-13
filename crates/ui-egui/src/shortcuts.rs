@@ -63,12 +63,12 @@ pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
     if ctx.egui_wants_keyboard_input() || app.dialogs.open.is_some() {
         return;
     }
-    let events: Vec<(Key, Modifiers)> = ctx.input(|i| {
-        let mut keys: Vec<(Key, Modifiers)> = i
+    let events: Vec<(Key, Modifiers, bool)> = ctx.input(|i| {
+        let mut keys: Vec<(Key, Modifiers, bool)> = i
             .events
             .iter()
             .filter_map(|e| match e {
-                egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => Some((*key, *modifiers)),
+                egui::Event::Key { key, pressed: true, repeat, modifiers, .. } => Some((*key, *modifiers, *repeat)),
                 _ => None,
             })
             .collect();
@@ -82,8 +82,8 @@ pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
                 _ => continue,
             };
             let mods = if i.modifiers.command { i.modifiers } else { Modifiers::COMMAND };
-            if !keys.iter().any(|(k, m)| *k == key && m.command) {
-                keys.push((key, mods));
+            if !keys.iter().any(|(k, m, _)| *k == key && m.command) {
+                keys.push((key, mods, false));
             }
         }
         keys
@@ -91,7 +91,15 @@ pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
     // Cmd and Ctrl are separate keys only on macOS (asked at runtime so the web build in a Mac browser agrees).
     let mac = ctx.os() == egui::os::OperatingSystem::Mac;
     let roll = over_piano_roll(app, ctx);
-    for (key, mods) in events {
+    for (key, mods, repeat) in events {
+        // A host auto-repeat only runs a zoom command, so holding a zoom key keeps zooming (upstream #1377);
+        // every other repeat is dropped, so a held Cmd+Z undoes once.
+        if repeat {
+            if let Some((id, params)) = repeating_zoom(app, key, mods, mac, roll) {
+                let _ = app.run(id, params);
+            }
+            continue;
+        }
         if fixed(app, key, mods, mac, roll) {
             continue;
         }
@@ -108,6 +116,20 @@ pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
     }
     // Tab moves the insertion point here, so egui must not also hand focus to the first widget: that would block every shortcut.
     ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+}
+
+/// The zoom command an auto-repeat of this chord runs, if any: T / R, Cmd+[ / ] and Cmd+Alt+[ / ].
+fn repeating_zoom(app: &SoundApp, key: Key, m: Modifiers, mac: bool, over_roll: bool) -> Option<(&'static str, serde_json::Value)> {
+    let plain = !m.command && !m.alt && !m.ctrl && !m.shift;
+    match key {
+        Key::OpenBracket | Key::CloseBracket if mods_match(Modifiers::COMMAND | Modifiers::ALT, m, mac) => {
+            Some(("view.waveform_zoom", json!({"factor": if key == Key::CloseBracket { 2.0 } else { 0.5 }})))
+        }
+        Key::R | Key::T if plain && app.ui.window == MainWindow::Edit && !over_roll => {
+            Some((if key == Key::T { "view.zoom_in" } else { "view.zoom_out" }, json!({})))
+        }
+        _ => command_for(key, m, mac).filter(|id| matches!(*id, "view.zoom_in" | "view.zoom_out")).map(|id| (id, json!({}))),
+    }
 }
 
 fn command_for(key: Key, mods: Modifiers, mac: bool) -> Option<&'static str> {
@@ -171,14 +193,13 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool, over_roll: bool)
             true
         }
         Key::F5 | Key::F6 | Key::F7 | Key::F8 | Key::F9 | Key::F10 if plain => {
-            let tool = match key {
-                Key::F5 => "zoom",
-                Key::F6 => "trim",
-                Key::F7 => "selector",
-                Key::F8 => "grabber",
-                Key::F9 => "scrubber",
-                _ => "pencil",
-            };
+            let _ = app.run("edit.tool", json!({"tool": tool_key(app, key)}));
+            true
+        }
+        // Cmd+6 / Cmd+7 (Ctrl off macOS) are Pencil and the Smart Tool. Cmd+1–5 keep their window and Session
+        // keys: egui reports the numeric keypad's digits as the main keyboard's, so the two can't be told apart.
+        Key::Num6 | Key::Num7 if mods_match(Modifiers::COMMAND, m, mac) => {
+            let tool = if key == Key::Num6 { "pencil" } else { "smart" };
             let _ = app.run("edit.tool", json!({"tool": tool}));
             true
         }
@@ -244,6 +265,11 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool, over_roll: bool)
             let _ = app.run("clip.move_to_adjacent_track", json!({"direction": direction}));
             true
         }
+        // With an edit selection (a selected clip makes one), Left/Right centre the Edit window on its start/end.
+        // Over the piano roll the arrows move its notes instead.
+        Key::ArrowLeft | Key::ArrowRight if plain && app.ui.window == MainWindow::Edit && !over_roll => {
+            centre_on_selection(app, key == Key::ArrowRight)
+        }
         // Commands Keyboard Focus: single-key editing (Edit window only).
         k if !m.command
             && !m.alt
@@ -264,10 +290,41 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool, over_roll: bool)
     }
 }
 
+/// Scroll the Edit window so the edit selection's start (or `end`) is in its middle. Returns false, leaving
+/// the key unhandled, when there is only an insertion point.
+fn centre_on_selection(app: &mut SoundApp, end: bool) -> bool {
+    let s = app.engine.session();
+    let sel = s.edit.selection;
+    if sel.start >= sel.end {
+        return false;
+    }
+    let [x0, _, x1, _] = app.edit_layout.timeline;
+    let half = f64::from((x1 - x0).max(0.0)) / 2.0 * s.edit.zoom.samples_per_px.max(0.01);
+    let at = if end { sel.end } else { sel.start };
+    let _ = app.run("view.scroll", json!({"to": at.saturating_sub(soundcraft_time::to_samples(half)).max(0)}));
+    true
+}
+
 /// Whether the pointer is over the MIDI editor's piano roll as drawn in the last pass or two.
 fn over_piano_roll(app: &SoundApp, ctx: &egui::Context) -> bool {
     let Some((roll, pass)) = app.midi.roll else { return false };
     ctx.cumulative_pass_nr().saturating_sub(pass) <= 2 && ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| roll.contains(p))
+}
+
+/// F5–F10 choose the Edit tools; F7 with F6 or F8 held, in either order, chooses the Smart Tool.
+fn tool_key(app: &SoundApp, pressed: Key) -> &'static str {
+    let ctx = app.docking_context.as_ref();
+    let held = |k: Key| ctx.is_some_and(|c| c.input(|i| i.key_down(k)));
+    match pressed {
+        Key::F6 | Key::F8 if held(Key::F7) => "smart",
+        Key::F7 if held(Key::F6) || held(Key::F8) => "smart",
+        Key::F5 => "zoom",
+        Key::F6 => "trim",
+        Key::F7 => "selector",
+        Key::F8 => "grabber",
+        Key::F9 => "scrubber",
+        _ => "pencil",
+    }
 }
 
 /// F1–F4 (and Alt+1–4) choose Shuffle, Slip, Spot and Grid; F4 in Grid switches between Absolute and

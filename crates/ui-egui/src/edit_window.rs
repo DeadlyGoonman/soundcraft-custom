@@ -84,6 +84,11 @@ impl EditLayout {
     pub fn scroll_by(&mut self, dy: f32, view_h: f32) {
         self.scroll_y = (self.scroll_y + dy).clamp(0.0, (self.content_h - view_h + 40.0).max(0.0));
     }
+
+    /// Clears the vertical scroll position Zoom Toggle would restore, so Cancel Zoom Toggle keeps the current scroll.
+    pub(crate) fn forget_zoom_back(&mut self) {
+        self.zoom_back = None;
+    }
 }
 
 pub fn rect([x0, y0, x1, y1]: [f32; 4]) -> Rect {
@@ -522,8 +527,13 @@ fn hscrollbar(app: &mut SoundApp, ui: &mut Ui, sb: Rect, tl: Rect) {
     }
 }
 
-/// Zoom Toggle sized to the track area on screen.
+/// Zoom Toggle sized to the track area on screen. With Alt held (an Alt-click on the button) it cancels Zoom Toggle
+/// instead and keeps the current view.
 pub fn zoom_toggle(app: &mut SoundApp) {
+    if app.docking_context.as_ref().is_some_and(|c| c.input(|i| i.modifiers.alt)) {
+        let _ = app.run("view.zoom_toggle_cancel", json!({}));
+        return;
+    }
     let [x0, y0, x1, y1] = app.edit_layout.timeline;
     let _ = app.run("view.zoom_toggle", json!({"width_px": x1 - x0, "height_px": y1 - y0}));
 }
@@ -760,7 +770,8 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
                     } else if resp.clicked()
                         && let Some(m) = hit
                     {
-                        let _ = app.run("markers.recall", json!({"number": m.number}));
+                        let command = if ui.input(|i| i.modifiers.alt) { "markers.delete" } else { "markers.recall" };
+                        let _ = app.run(command, json!({"number": m.number}));
                     }
                 }
             }
@@ -1245,6 +1256,27 @@ fn playlist_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, mai
     }
 }
 
+/// The colour strip: a click selects the track as the header does, a double click opens the Color
+/// Palette for the selected tracks. A plain click on a track that is already selected keeps the
+/// selection, so double-clicking one of several selected tracks colours them all. Registered after
+/// the header background, so it sits on top of it, and before the strip's own buttons, which stay on top (upstream #1397).
+fn color_strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, head: Rect) {
+    let strip = Rect::from_min_size(head.min, vec2(STRIP_W, head.height()));
+    let resp = ui.interact(strip, ui.id().with(("color_strip", id.0)), Sense::click());
+    let mods = ui.input(|i| i.modifiers);
+    let selected = app.engine.session().edit.selected_tracks.contains(&id);
+    if resp.double_clicked() {
+        // A Cmd click toggles, so a Cmd double click's first click deselected the track: add it back.
+        if !selected {
+            click_track(app, id, mods, in_edit_window);
+        }
+        app.ui.show_color_palette = true;
+    } else if resp.clicked() && !(selected && mods.is_none()) {
+        click_track(app, id, mods, in_edit_window);
+    }
+    resp.context_menu(|ui| track_context_menu(app, ui, id));
+}
+
 fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, selected: bool, head_bg: Color32) {
     let t = Tokens::current();
     let id = track.id;
@@ -1283,6 +1315,7 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
         click_track(app, id, ui.input(|i| i.modifiers), in_edit_window);
     }
     bg.context_menu(|ui| track_context_menu(app, ui, id));
+    color_strip(app, ui, id, head);
     let at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(pos2(head.min.x + x, head.min.y + y), vec2(w, h));
     let strip = rgb(track.color);
     let ink = shade(strip, -0.8);
@@ -4660,5 +4693,69 @@ mod tests {
             assert_eq!(volume_points(&h, track), before[..1], "{tool}");
             assert_eq!(h.state().engine.session().track(track).unwrap().clips(), clips.as_slice(), "{tool}");
         }
+    }
+
+    #[test]
+    fn alt_click_on_a_marker_deletes_it() {
+        let mut engine = soundcraft_engine::demo::demo_engine();
+        engine.session_mut().edit.rulers = vec!["markers".into()];
+        engine.execute("markers.add", &json!({"at": 48_000, "name": "Alt-delete me"})).unwrap();
+        let mut h = harness_with(engine);
+        let s = h.state().engine.session_arc();
+        let marker = s.markers.iter().find(|m| m.name == "Alt-delete me").unwrap();
+        let at = pos2(x_of(&s, timeline(&h), marker.start), timeline(&h).min.y - 11.5);
+        let before = s.markers.len();
+
+        click_with(&mut h, at, egui::Modifiers::ALT);
+
+        assert_eq!(h.state().engine.session().markers.len(), before - 1);
+        assert!(!h.state().engine.session().markers.iter().any(|m| m.name == "Alt-delete me"));
+    }
+
+    /// #1254: double-clicking a track's colour strip selects the track and opens the Color Palette;
+    /// a single click only selects it.
+    #[test]
+    fn double_clicking_the_color_strip_opens_the_color_palette() {
+        let mut h = harness(3);
+        let ids = row_ids(&h);
+        let strip = |h: &Harness<SoundApp>, i: usize| pos2(row(h, i).min.x + STRIP_W / 2.0, row(h, i).center().y);
+        h.state_mut().engine.execute("edit.select", &json!({"tracks": [ids[0].0]})).unwrap();
+        h.run_steps(2);
+        let at = strip(&h, 1);
+        click(&mut h, at);
+        assert_eq!(h.state().engine.session().edit.selected_tracks, [ids[1]]);
+        assert!(!h.state().ui.show_color_palette, "a single click on the strip doesn't open the palette");
+        h.run_steps(30);
+        let at = strip(&h, 2);
+        click(&mut h, at);
+        click(&mut h, at);
+        assert_eq!(h.state().engine.session().edit.selected_tracks, [ids[2]]);
+        assert!(h.state().ui.show_color_palette, "a double click on the strip opens the palette");
+    }
+
+    /// #1254: a double click on the strip of one of several selected tracks keeps them all selected,
+    /// so the palette colours every one; with Cmd held the double-clicked track ends selected too.
+    #[test]
+    fn double_clicking_a_selected_tracks_strip_keeps_the_selection() {
+        let mut h = harness(3);
+        let ids = row_ids(&h);
+        let strip = |h: &Harness<SoundApp>, i: usize| pos2(row(h, i).min.x + STRIP_W / 2.0, row(h, i).center().y);
+        h.state_mut().engine.execute("edit.select", &json!({"tracks": [ids[0].0, ids[2].0]})).unwrap();
+        h.run_steps(2);
+        let at = strip(&h, 2);
+        click(&mut h, at);
+        assert_eq!(h.state().engine.session().edit.selected_tracks, [ids[0], ids[2]], "a plain click on a selected strip keeps the selection");
+        assert!(!h.state().ui.show_color_palette);
+        click(&mut h, at);
+        assert_eq!(h.state().engine.session().edit.selected_tracks, [ids[0], ids[2]], "both tracks stay selected");
+        assert!(h.state().ui.show_color_palette, "a double click on the strip opens the palette");
+
+        h.state_mut().ui.show_color_palette = false;
+        h.run_steps(30);
+        let at = strip(&h, 0);
+        click_with(&mut h, at, egui::Modifiers::COMMAND);
+        click_with(&mut h, at, egui::Modifiers::COMMAND);
+        assert!(h.state().engine.session().edit.selected_tracks.contains(&ids[0]), "a Cmd double click leaves its track selected");
+        assert!(h.state().ui.show_color_palette, "a Cmd double click on the strip opens the palette");
     }
 }

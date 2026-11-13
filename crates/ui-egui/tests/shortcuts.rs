@@ -113,3 +113,80 @@ fn cmd_equals_toggles_mix_and_edit_without_zooming() {
         assert_eq!(ctx.zoom_factor(), 1.25, "{os:?}");
     }
 }
+
+/// One full app frame on a 1600×1000 screen.
+fn app_frame(ctx: &egui::Context, app: &mut SoundApp, events: Vec<egui::Event>) {
+    let screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+    ctx.run_ui(egui::RawInput { screen_rect, events, ..Default::default() }, |ui| {
+        app.logic(ui.ctx());
+        app.ui(ui);
+    })
+    .textures_delta
+    .clear();
+}
+
+fn arrow(key: Key) -> Vec<egui::Event> {
+    [true, false].map(|pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE }).to_vec()
+}
+
+/// Where `at` is drawn in the Edit window's timeline, and the timeline's middle (#1376).
+fn x_and_middle(app: &SoundApp, at: i64) -> (f32, f32) {
+    let tl = soundcraft_ui_egui::edit_window::rect(app.edit_layout.timeline);
+    (soundcraft_ui_egui::edit_window::x_of(app.engine.session(), tl, at), tl.center().x)
+}
+
+#[test]
+fn left_and_right_arrows_centre_the_edit_window_on_the_selected_clip() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    let ctx = egui::Context::default();
+    let (clip_id, clip) = app.engine.session().tracks.iter().flat_map(|t| t.clips()).find(|c| c.start > 100_000).map(|c| (c.id, c.range())).unwrap();
+    app.run("view.zoom_set", json!({"samples_per_px": 10.0})).unwrap();
+    app.run("view.scroll", json!({"to": 0})).unwrap();
+    for _ in 0..3 {
+        app_frame(&ctx, &mut app, vec![]);
+    }
+    app.run("edit.select", json!({"clips": [clip_id.0]})).unwrap();
+    assert!(x_and_middle(&app, clip.start).0 > app.edit_layout.timeline[2], "the clip starts off-screen");
+
+    app_frame(&ctx, &mut app, arrow(Key::ArrowLeft));
+    let (x, middle) = x_and_middle(&app, clip.start);
+    assert!((x - middle).abs() < 1.0, "Left: the clip start at {x}, the middle at {middle}");
+    app_frame(&ctx, &mut app, arrow(Key::ArrowRight));
+    let (x, middle) = x_and_middle(&app, clip.end);
+    assert!((x - middle).abs() < 1.0, "Right: the clip end at {x}, the middle at {middle}");
+
+    // An insertion point alone leaves the view where it is.
+    app.run("edit.select", json!({"start": clip.start})).unwrap();
+    let scroll = app.engine.session().edit.zoom.scroll;
+    app_frame(&ctx, &mut app, arrow(Key::ArrowLeft));
+    app_frame(&ctx, &mut app, arrow(Key::ArrowRight));
+    assert_eq!(app.engine.session().edit.zoom.scroll, scroll);
+}
+
+fn press_repeat(ctx: &egui::Context, app: &mut SoundApp, key: Key, modifiers: Modifiers, repeat: bool) {
+    let events = vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat, modifiers }];
+    ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| shortcuts::handle(app, ui.ctx())).textures_delta.clear();
+}
+
+#[test]
+fn holding_a_zoom_key_keeps_zooming_but_other_repeats_are_dropped() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    let ctx = egui::Context::default();
+    app.run("view.zoom_set", json!({"samples_per_px": 800.0})).unwrap();
+    let zoom = |app: &SoundApp| app.engine.session().edit.zoom.samples_per_px;
+    press_repeat(&ctx, &mut app, Key::T, Modifiers::NONE, false);
+    let once = zoom(&app);
+    assert!(once < 800.0, "the press zooms in");
+    for _ in 0..3 {
+        press_repeat(&ctx, &mut app, Key::T, Modifiers::NONE, true);
+    }
+    assert!(zoom(&app) < once * 0.2, "three repeats zoom in three more steps: {} vs {once}", zoom(&app));
+
+    // A held Cmd+Z undoes once: repeats of other commands are ignored.
+    app.run("view.zoom_set", json!({"samples_per_px": 400.0})).unwrap();
+    let undo = app.engine.undo_history().len();
+    for _ in 0..3 {
+        press_repeat(&ctx, &mut app, Key::Z, Modifiers::COMMAND, true);
+    }
+    assert_eq!(app.engine.undo_history().len(), undo, "repeats of Cmd+Z do nothing");
+}

@@ -56,15 +56,32 @@ pub fn tracks_and_groups(app: &mut SoundApp, ui: &mut Ui) {
     if crate::widgets::icon_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(plus)), plus.size(), "plus", false, &tip).clicked() {
         let _ = app.dialogs.open_for_command(&app.engine, "track.new");
     }
-    let tracks: Vec<(u64, String, bool, [u8; 3], bool)> = {
+    let tracks: Vec<(u64, String, bool, [u8; 3], bool, usize)> = {
         let s = app.engine.session();
-        s.tracks.iter().map(|x| (x.id.0, x.name.clone(), !x.hidden, x.color, s.edit.selected_tracks.contains(&x.id))).collect()
+        s.tracks
+            .iter()
+            .map(|x| {
+                let mut current = x.folder;
+                let mut depth = 0;
+                let mut seen = Vec::new();
+                while let Some(folder_id) = current {
+                    if seen.contains(&folder_id) {
+                        break;
+                    }
+                    seen.push(folder_id);
+                    let Some(folder) = s.track(folder_id) else { break };
+                    depth += 1;
+                    current = folder.folder;
+                }
+                (x.id.0, x.name.clone(), !x.hidden, x.color, s.edit.selected_tracks.contains(&x.id), depth)
+            })
+            .collect()
     };
     let hidden = egui::scroll_area::ScrollBarVisibility::AlwaysHidden;
     let lists =
         egui::ScrollArea::vertical().id_salt("tracks_scroll").max_height(total * 0.62).auto_shrink([false, false]).scroll_bar_visibility(hidden);
     let out = lists.show(ui, |ui| {
-        for (id, name, shown, color, sel) in tracks {
+        for (id, name, shown, color, sel, depth) in tracks {
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 17.0), Sense::click_and_drag());
             resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, sel, &name));
             if sel {
@@ -77,7 +94,13 @@ pub fn tracks_and_groups(app: &mut SoundApp, ui: &mut Ui) {
                 let _ = app.run("track.hide", json!({"tracks": [id], "hidden": shown}));
             }
             ui.painter().rect_filled(Rect::from_min_size(pos2(r.min.x + 20.0, r.min.y + 3.0), vec2(4.0, 11.0)), 0.0, rgb(color));
-            ui.painter().text(pos2(r.min.x + 30.0, r.center().y), Align2::LEFT_CENTER, &name, regular(11.5), if shown { t.text } else { t.text_dim });
+            ui.painter().text(
+                pos2(r.min.x + 30.0 + depth as f32 * 10.0, r.center().y),
+                Align2::LEFT_CENTER,
+                &name,
+                regular(11.5),
+                if shown { t.text } else { t.text_dim },
+            );
             if resp.clicked() {
                 crate::edit_window::click_track(app, soundcraft_model::TrackId(id), ui.input(|i| i.modifiers), |_, _| true);
             }

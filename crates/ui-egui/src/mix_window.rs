@@ -147,7 +147,12 @@ pub(crate) fn route_name(app: &SoundApp, r: &Route) -> String {
 }
 
 pub(crate) fn input_name(app: &SoundApp, track: &Track) -> String {
-    if track.kind.has_playlist() && track.mixer.input == Route::None { "In 1".to_string() } else { route_name(app, &track.mixer.input) }
+    if track.kind.has_playlist() && track.mixer.input == Route::None {
+        let channels = track.format.channels();
+        if channels == 1 { "In 1".to_string() } else { format!("In 1-{channels}") }
+    } else {
+        route_name(app, &track.mixer.input)
+    }
 }
 
 /// The input or output menu under `resp`. It closes only on a click outside, so its bus search
@@ -1531,17 +1536,25 @@ fn send_route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, cu
         let current = matches!(current, Some(Route::Bus(bus_id)) if *bus_id == visible[i].id);
         menu_row(ui, highlighted || (current && !search.typing()), &visible[i].name)
     });
+    // As in Pro Tools, a new send opens its Send window, so its fader is on screen right away.
+    let has_send = current.is_some();
     if let Some(i) = picked {
-        let _ = app.run("mix.send", json!({"track": id.0, "slot": slot, "bus": visible[i].name}));
+        let sent = app.run("mix.send", json!({"track": id.0, "slot": slot, "bus": visible[i].name})).is_ok();
+        if sent && !has_send {
+            app.ui.send_window = Some((id, slot));
+        }
         ui.close();
     }
     ui.separator();
     let bus_names: Vec<String> = busses.iter().map(|b| b.name.clone()).collect();
     if let Some(name) = new_bus_row(ui, egui::Id::new(("send-new-bus", id.0, slot)), &bus_names) {
-        let _ = app.engine.execute_as_one_step(&[
-            ("mix.new_bus", json!({"name": name.clone()})),
-            ("mix.send", json!({"track": id.0, "slot": slot, "bus": name})),
-        ]);
+        let sent = app
+            .engine
+            .execute_as_one_step(&[("mix.new_bus", json!({"name": name.clone()})), ("mix.send", json!({"track": id.0, "slot": slot, "bus": name}))])
+            .is_ok();
+        if sent && !has_send {
+            app.ui.send_window = Some((id, slot));
+        }
         ui.close();
     }
 }
@@ -1688,6 +1701,16 @@ mod tests {
         assert_eq!(stereo, ["In 1-2", "In 1", "In 2", "In 3"]);
     }
     use egui::{Event, Modifiers, PointerButton, Rect, pos2, vec2};
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn stereo_track_defaults_to_a_stereo_input_pair() {
+        let mut app = crate::SoundApp::new(soundcraft_engine::Engine::default(), None, crate::Services::default());
+        app.run("track.new", serde_json::json!({"format": "stereo"})).unwrap();
+        let track = &app.engine.session().tracks[0];
+
+        assert_eq!(super::input_name(&app, track), "In 1-2");
+    }
 
     #[test]
     fn typed_db_accepts_console_notation_and_clamps() {
@@ -1749,5 +1772,62 @@ mod tests {
         }
         frame(vec![], true);
         assert_eq!(frame(vec![], true), (true, None), "hidden, the field lost focus, so the readout is back");
+    }
+
+    /// A send slot drawn in a test harness for the track named "Kick", with "Aux" and "Other" buses to pick.
+    fn kick_send_harness(
+        send_first: bool,
+    ) -> (egui_kittest::Harness<'static, (crate::SoundApp, soundcraft_model::TrackId)>, soundcraft_model::TrackId) {
+        use serde_json::json;
+        let mut app = crate::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, crate::Services::default());
+        app.run("mix.new_bus", json!({"name": "Aux"})).unwrap();
+        app.run("mix.new_bus", json!({"name": "Other"})).unwrap();
+        let kick = app.engine.session().track_by_name("Kick").unwrap().id;
+        if send_first {
+            app.run("mix.send", json!({"track": kick.0, "slot": 0, "bus": "Other"})).unwrap();
+        }
+        let mut ready = false;
+        let h = egui_kittest::Harness::builder().with_size(vec2(600.0, 800.0)).build_ui_state(
+            move |ui, (app, kick): &mut (crate::SoundApp, soundcraft_model::TrackId)| {
+                if !ready {
+                    crate::fonts::install(ui.ctx());
+                    crate::theme::apply(ui.ctx(), false);
+                    ready = true;
+                    return;
+                }
+                let track = app.engine.session().track(*kick).cloned().unwrap();
+                let r = Rect::from_min_size(ui.max_rect().min + vec2(20.0, 20.0), vec2(120.0, 24.0));
+                super::send_slot(app, ui, &track, 0, r);
+            },
+            (app, kick),
+        );
+        (h, kick)
+    }
+
+    #[test]
+    fn creating_a_send_opens_its_send_window() {
+        let _palette = crate::theme::lock_test_palette();
+        let (mut h, kick) = kick_send_harness(false);
+        h.run();
+        h.get_by_label("Send A").click();
+        h.run();
+        h.get_by_label("Aux").click();
+        h.run();
+        let (app, _) = h.state();
+        assert!(app.engine.session().track(kick).and_then(|t| t.mixer.sends.first().cloned().flatten()).is_some(), "the send was created");
+        assert_eq!(app.ui.send_window, Some((kick, 0)), "the new send's window is open");
+    }
+
+    #[test]
+    fn changing_a_sends_destination_leaves_the_send_window_alone() {
+        let _palette = crate::theme::lock_test_palette();
+        let (mut h, _kick) = kick_send_harness(true);
+        h.run();
+        h.get_by_label("Send A").click();
+        h.run();
+        h.get_by_label("Aux").click();
+        h.run();
+        let (app, _) = h.state();
+        assert_eq!(app.ui.send_window, None, "no window opened");
     }
 }

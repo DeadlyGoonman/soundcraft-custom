@@ -269,42 +269,44 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
                 let extra = ui_aliases();
                 for root in tree().into_iter().filter(|r| has_function(r, &extra)) {
                     ui.menu_button(&root.label, |ui| {
-                        for c in &root.children {
-                            menu_node(app, ui, c, &extra);
-                            if c.path == "File > Open" {
-                                crate::recent::menu(app, ui);
+                        scrolling(ui, |ui| {
+                            for c in &root.children {
+                                menu_node(app, ui, c, &extra);
+                                if c.path == "File > Open" {
+                                    crate::recent::menu(app, ui);
+                                }
+                                if c.path == "Track > New..." {
+                                    instrument_menu(app, ui);
+                                }
                             }
-                            if c.path == "Track > New..." {
-                                instrument_menu(app, ui);
+                            if root.label == "File" {
+                                ui.separator();
+                                if ui.button("New Session Tab").clicked() {
+                                    app.tab_strip.actions.push(crate::tab_strip::TabAction::NewSession);
+                                    ui.close();
+                                }
+                                if ui.button("Open Session in New Tab…").clicked() {
+                                    app.tab_strip.actions.push(crate::tab_strip::TabAction::OpenSessionInNewTab);
+                                    ui.close();
+                                }
                             }
-                        }
-                        if root.label == "File" {
-                            ui.separator();
-                            if ui.button("New Session Tab").clicked() {
-                                app.tab_strip.actions.push(crate::tab_strip::TabAction::NewSession);
-                                ui.close();
+                            if root.label == "AudioSuite" {
+                                ui.separator();
+                                ui.label(egui::RichText::new("Processes selected clips offline").small().color(t.text_dim));
                             }
-                            if ui.button("Open Session in New Tab…").clicked() {
-                                app.tab_strip.actions.push(crate::tab_strip::TabAction::OpenSessionInNewTab);
-                                ui.close();
+                            if root.label == "Window" {
+                                ui.separator();
+                                let mut separate = app.ui.mix_separate;
+                                if ui
+                                    .checkbox(&mut separate, "Mix in Separate Window")
+                                    .on_hover_text("Show Edit and Mix at once, e.g. one per monitor")
+                                    .changed()
+                                {
+                                    let _ = run_ui_command(app, "window.mix_separate", &json!({"value": separate}));
+                                    ui.close();
+                                }
                             }
-                        }
-                        if root.label == "AudioSuite" {
-                            ui.separator();
-                            ui.label(egui::RichText::new("Processes selected clips offline").small().color(t.text_dim));
-                        }
-                        if root.label == "Window" {
-                            ui.separator();
-                            let mut separate = app.ui.mix_separate;
-                            if ui
-                                .checkbox(&mut separate, "Mix in Separate Window")
-                                .on_hover_text("Show Edit and Mix at once, e.g. one per monitor")
-                                .changed()
-                            {
-                                let _ = run_ui_command(app, "window.mix_separate", &json!({"value": separate}));
-                                ui.close();
-                            }
-                        }
+                        });
                     });
                 }
                 let title = format!(
@@ -319,6 +321,12 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
             });
         },
     );
+}
+
+/// A menu taller than the window scrolls instead of running off its bottom edge (upstream #1482).
+fn scrolling<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let max_h = (ui.ctx().content_rect().height() - 40.0).max(120.0);
+    egui::ScrollArea::vertical().max_height(max_h).show(ui, add).inner
 }
 
 /// Track › Instrument: the instrument picker for the selected instrument track (#374).
@@ -382,9 +390,11 @@ fn menu_node(app: &mut SoundApp, ui: &mut egui::Ui, n: &MenuNode, extra: &[(&str
     }
     if !n.children.is_empty() {
         ui.menu_button(&n.label, |ui| {
-            for c in &n.children {
-                menu_node(app, ui, c, extra);
-            }
+            scrolling(ui, |ui| {
+                for c in &n.children {
+                    menu_node(app, ui, c, extra);
+                }
+            });
         });
         return;
     }
